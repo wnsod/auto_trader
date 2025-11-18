@@ -1,0 +1,1939 @@
+"""
+Absolute Zero 시스템 - 통합 오케스트레이터
+모든 파이프라인 기능을 통합한 단일 시스템
+"""
+
+import sys
+import os
+import logging
+import sqlite3
+import json
+import numpy as np
+import warnings
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+
+# NumPy overflow/underflow 경고 숨김
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy')
+
+# TensorFlow Protobuf 버전 경고 숨김 (JAX 로드 시 발생하는 경고, 기능 영향 없음)
+warnings.filterwarnings('ignore', message='.*Protobuf gencode version.*', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*Sharding info not provided.*', category=UserWarning)
+
+# JAX TPU/ROCm 백엔드 방지 및 CUDA 강제 사용
+import os
+# TensorFlow 경고 완전 억제 (JAX가 TensorFlow 없이도 작동 가능)
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+# CUDA만 사용하도록 명시 (ROCm 제외)
+os.environ.setdefault('JAX_PLATFORMS', 'cuda,cpu')  # CUDA만 사용, ROCm 제외
+
+# Python warnings 필터링 (TensorFlow 관련)
+warnings.filterwarnings('ignore', category=Warning, message='.*Tensorflow.*')
+warnings.filterwarnings('ignore', category=Warning, message='.*TensorFlow.*')
+
+# JAX 로거 레벨 조정 (TensorFlow 경고 억제)
+import logging as std_logging
+std_logging.getLogger('jax._src.xla_bridge').setLevel(std_logging.ERROR)
+std_logging.getLogger('jax._src.lib').setLevel(std_logging.ERROR)
+std_logging.getLogger('absl').setLevel(std_logging.ERROR)
+
+# 모듈 경로 추가
+sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+# 🔥 logger 초기화 (import 전에 설정)
+logger = logging.getLogger(__name__)
+
+# 새로운 파이프라인 구조 import
+try:
+    # 직접 import 시도
+    import rl_pipeline.core.env as core_env
+    import rl_pipeline.core.errors as core_errors
+    import rl_pipeline.strategy.manager as strategy_manager
+    import rl_pipeline.simulation.selfplay as selfplay
+    import rl_pipeline.routing.regime_router as regime_router
+    import rl_pipeline.analysis.integrated_analyzer as integrated_analyzer
+    import rl_pipeline.db.schema as db_schema
+    import rl_pipeline.db.connection_pool as db_pool
+
+    # 🔥 디버그 시스템 import
+    from rl_pipeline.monitoring import SessionManager
+
+    config = core_env.config
+    AZError = core_errors.AZError
+    create_run_record = strategy_manager.create_run_record
+    update_run_record = strategy_manager.update_run_record
+    create_coin_strategies = strategy_manager.create_coin_strategies
+    create_global_strategies = strategy_manager.create_global_strategies
+    run_self_play_test = selfplay.run_self_play_test
+    RegimeRouter = regime_router.RegimeRouter
+    create_regime_routing_strategies = regime_router.create_regime_routing_strategies
+    IntegratedAnalyzer = integrated_analyzer.IntegratedAnalyzer
+    analyze_coin_strategies = integrated_analyzer.analyze_coin_strategies
+    analyze_global_strategies = integrated_analyzer.analyze_global_strategies
+    ensure_indexes = db_schema.ensure_indexes
+    setup_database_tables = db_schema.setup_database_tables
+    create_coin_strategies_table = db_schema.create_coin_strategies_table
+    get_optimized_db_connection = db_pool.get_optimized_db_connection
+    
+    NEW_PIPELINE_AVAILABLE = True
+    # 🔥 import 성공 시 로그 제거 (정상 동작이므로 불필요)
+    
+except ImportError as e:
+    # 🔥 import 실패 시에만 로그 출력 (logger 사용)
+    logger.error(f"새로운 파이프라인 모듈 import 실패: {e}")
+    # 기본값으로 설정
+    config = None
+    AZError = Exception
+    NEW_PIPELINE_AVAILABLE = False
+AZ_DEBUG = os.getenv('AZ_DEBUG', 'false').lower() == 'true'
+AZ_LOG_FILE = os.getenv('AZ_LOG_FILE', os.path.join(os.path.dirname(__file__), 'absolute_zero_debug.log'))
+AZ_SIMULATION_VERBOSE = os.getenv('AZ_SIMULATION_VERBOSE', 'false').lower() == 'true'
+
+# 환경변수 설명:
+# AZ_DEBUG=true: 모든 DEBUG 로그 출력 (매우 상세)
+# AZ_SIMULATION_VERBOSE=true: 시뮬레이션 상세 로그 출력 (전략별 RSI/MACD/Volume 로그)
+
+# ============================================================================
+# 통합된 파이프라인 구조
+# ============================================================================
+
+# 분리된 모듈 imports
+from rl_pipeline.pipelines.orchestrator import (
+    PipelineResult,
+    IntegratedPipelineOrchestrator,
+)
+from rl_pipeline.db.learning_results import (
+    create_learning_results_tables,
+    save_pipeline_execution_log,
+    save_regime_routing_results,
+    get_pipeline_performance_summary,
+)
+from rl_pipeline.data.candle_loader import (
+    get_available_coins_and_intervals,
+    load_candle_data_for_coin,
+)
+
+def _configure_logging():
+    try:
+        root_logger = logging.getLogger()
+        if AZ_DEBUG:
+            root_logger.setLevel(logging.DEBUG)
+        else:
+            root_logger.setLevel(logging.INFO)
+        # 기존 핸들러 중복 추가 방지
+        if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+            sh = logging.StreamHandler()
+            sh.setLevel(logging.DEBUG if AZ_DEBUG else logging.INFO)
+            fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+            sh.setFormatter(fmt)
+            root_logger.addHandler(sh)
+        if AZ_DEBUG and not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
+            try:
+                fh = logging.FileHandler(AZ_LOG_FILE, encoding='utf-8')
+                fh.setLevel(logging.DEBUG)
+                fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+                fh.setFormatter(fmt)
+                root_logger.addHandler(fh)
+                logger.debug(f"📝 디버그 로그 파일: {AZ_LOG_FILE}")
+            except Exception as e:
+                logger.warning(f"⚠️ 파일 로거 초기화 실패: {e}")
+    except Exception as e:
+        print(f"[LOGGING_INIT_ERROR] {e}")
+
+# 환경변수 파일 로드
+from dotenv import load_dotenv
+env_path = os.path.join(os.path.dirname(__file__), 'rl_pipeline_config.env')
+load_dotenv(env_path)
+
+# Docker 환경 경로 설정
+WORKSPACE_ROOT = os.getenv('WORKSPACE_ROOT', '/workspace')
+AUTO_TRADER_ROOT = os.getenv('AUTO_TRADER_ROOT', '/workspace')
+RL_PIPELINE_ROOT = os.getenv('RL_PIPELINE_ROOT', '/workspace/rl_pipeline')
+DATA_STORAGE_PATH = os.getenv('DATA_STORAGE_PATH', '/workspace/data_storage')
+
+# 실행 규모/범위 설정 (환경변수로 제어)
+AZ_INTERVALS = os.getenv('AZ_INTERVALS')  # 예: "15m,30m,240m,1d"
+AZ_CANDLE_DAYS = int(os.getenv('AZ_CANDLE_DAYS', '60'))  # 기본 60일 (신생 코인은 가능한 데이터만큼 사용)
+AZ_ALLOW_FALLBACK = os.getenv('AZ_ALLOW_FALLBACK', 'false').lower() == 'true'
+AZ_FALLBACK_PAIRS = os.getenv('AZ_FALLBACK_PAIRS', '')  # 예: "BTC:15m;ETH:15m" (가능하면 DB에서 코인/인터벌 자동 탐색)
+
+# Self-play 및 전략 풀 설정 (환경변수로 제어)
+AZ_SELFPLAY_EPISODES = int(os.getenv('AZ_SELFPLAY_EPISODES', '200'))  # Self-play 에피소드 수
+AZ_SELFPLAY_AGENTS_PER_EPISODE = int(os.getenv('AZ_SELFPLAY_AGENTS_PER_EPISODE', '4'))  # 에피소드당 에이전트 수
+AZ_STRATEGY_POOL_SIZE = int(os.getenv('AZ_STRATEGY_POOL_SIZE', '15000'))  # DB에서 로드할 최대 전략 수
+
+# 🆕 점진적 통합: 예측 실현 Self-play 비율 (0.0-1.0)
+PREDICTIVE_SELFPLAY_RATIO = float(os.getenv('PREDICTIVE_SELFPLAY_RATIO', '0.2'))  # 기본값: 20%
+
+# 데이터베이스 경로 설정
+STRATEGIES_DB_PATH = os.path.join(DATA_STORAGE_PATH, 'rl_strategies.db')
+CANDLES_DB_PATH = os.path.join(DATA_STORAGE_PATH, 'rl_candles.db')
+# learning_results.db는 이제 rl_strategies.db로 통합됨 (core/env.py 참조)
+LEARNING_RESULTS_DB_PATH = STRATEGIES_DB_PATH
+
+def _ensure_file_exists(db_path: str) -> None:
+    """DB 파일이 없으면 생성 (원천 데이터 DB는 제외)"""
+    try:
+        parent = os.path.dirname(db_path)
+        if parent and not os.path.exists(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+                logger.debug(f"📂 DB 디렉토리 생성: {parent}")
+            except Exception as dir_err:
+                # 디렉토리 생성 실패는 경고로 처리 (이미 ensure_storage_ready에서 생성했을 수 있음)
+                logger.debug(f"⚠️ DB 디렉토리 생성 시도 (무시 가능): {parent} - {dir_err}")
+        
+        # rl_candles.db는 원천 데이터 - 절대 생성하거나 수정하면 안됨
+        if 'candles' in db_path and not os.path.exists(db_path):
+            logger.debug(f"⚠️ 원천 데이터 DB가 없습니다: {db_path} (생성하지 않음)")
+            return
+            
+        if not os.path.exists(db_path):
+            # 빈 SQLite 파일 생성 (rl_candles.db 제외)
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.close()
+                logger.info(f"🗃️ DB 파일 생성: {db_path}")
+            except Exception as create_err:
+                # DB 파일 생성 실패는 경고로 처리 (connection_pool에서 자동 생성할 수 있음)
+                logger.debug(f"⚠️ DB 파일 생성 시도 실패 (무시 가능, 연결 풀에서 재시도): {db_path} - {create_err}")
+    except Exception as e:
+        # 예상치 못한 오류만 에러로 처리
+        logger.warning(f"⚠️ DB 파일 준비 중 오류 (무시 가능, 연결 풀에서 재시도): {db_path} - {e}")
+
+def ensure_storage_ready() -> None:
+    """데이터 저장소 디렉터리와 DB 파일들을 사전 보장"""
+    try:
+        logger.debug(f"📁 DATA_STORAGE_PATH={DATA_STORAGE_PATH}")
+        if not os.path.exists(DATA_STORAGE_PATH):
+            os.makedirs(DATA_STORAGE_PATH, exist_ok=True)
+            logger.info(f"📂 데이터 저장 디렉터리 생성: {DATA_STORAGE_PATH}")
+        # 권한/쓰기 가능 여부 점검
+        try:
+            test_path = os.path.join(DATA_STORAGE_PATH, '.write_test')
+            with open(test_path, 'w', encoding='utf-8') as f:
+                f.write('ok')
+            os.remove(test_path)
+            logger.debug("✅ 데이터 디렉터리 쓰기 테스트 통과")
+        except Exception as e:
+            logger.error(f"❌ 데이터 디렉터리 쓰기 불가: {DATA_STORAGE_PATH} -> {e}")
+            raise
+        # LEARNING_RESULTS_DB_PATH는 이제 STRATEGIES_DB_PATH와 동일하므로 중복 제거
+        for path in (CANDLES_DB_PATH, STRATEGIES_DB_PATH):
+            _ensure_file_exists(path)
+    except Exception as e:
+        logger.error(f"❌ 저장소 사전 준비 실패: {e}")
+
+def run_absolute_zero(coin: Optional[str] = None, interval: str = "15m", n_strategies: int = 300, intervals: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Absolute Zero 시스템 실행 - 새로운 파이프라인 구조 사용"""
+    try:
+        start_time = datetime.now()
+
+        # 🔥 디버그 세션 생성
+        session_manager = SessionManager()
+        session_id = None
+        try:
+            # 인터벌 리스트 미리 준비 (세션 생성용)
+            if intervals and len(intervals) > 0:
+                intervals_for_session = intervals
+            elif AZ_INTERVALS:
+                intervals_for_session = [i.strip() for i in AZ_INTERVALS.split(',')]
+            else:
+                intervals_for_session = [interval]
+
+            # 코인 결정 (세션 생성용)
+            coin_for_session = coin
+            if coin_for_session is None:
+                try:
+                    available = get_available_coins_and_intervals()
+                    coins = sorted(list({c for c, _ in available}))
+                    if coins:
+                        coin_for_session = coins[0]
+                except:
+                    coin_for_session = "UNKNOWN"
+
+            session_id = session_manager.create_session(
+                coins=[coin_for_session] if coin_for_session else ["UNKNOWN"],
+                intervals=intervals_for_session,
+                config={
+                    "n_strategies": n_strategies,
+                    "candle_days": AZ_CANDLE_DAYS
+                }
+            )
+            logger.info(f"✅ 디버그 세션 생성: {session_id}")
+        except Exception as session_err:
+            logger.warning(f"⚠️ 디버그 세션 생성 실패 (계속 진행): {session_err}")
+            session_id = None
+        # 다중 인터벌 지원 우선순위: 함수 인자 intervals > AZ_INTERVALS 환경변수 > 단일 interval
+        # main()에서 전달한 intervals가 우선 (DB에서 가져온 모든 인터벌)
+        if intervals and len(intervals) > 0:
+            intervals_raw = intervals
+        elif AZ_INTERVALS:
+            intervals_raw = [i.strip() for i in AZ_INTERVALS.split(',')]
+        else:
+            intervals_raw = [interval]
+        
+        # 인터벌 순서 정렬: 15m, 30m, 240m, 1d 순서로
+        def sort_intervals(interval_list):
+            """인터벌을 시간 순서로 정렬: 실제 분 단위로 변환하여 정렬"""
+            def get_order_in_minutes(iv):
+                """인터벌을 분 단위로 변환하여 정렬 키 생성"""
+                iv_lower = iv.lower().strip()
+                
+                # 분 단위로 변환
+                try:
+                    if iv_lower.endswith('m'):
+                        # 분 단위 (예: 15m, 30m, 240m)
+                        minutes = int(iv_lower[:-1])
+                        return minutes
+                    elif iv_lower.endswith('h'):
+                        # 시간 단위 (예: 1h, 4h)
+                        hours = int(iv_lower[:-1])
+                        return hours * 60  # 시간을 분으로 변환
+                    elif iv_lower.endswith('d'):
+                        # 일 단위 (예: 1d)
+                        days = int(iv_lower[:-1])
+                        return days * 1440  # 일을 분으로 변환
+                    else:
+                        # 알 수 없는 형식은 마지막으로
+                        return 999999
+                except (ValueError, AttributeError):
+                    # 파싱 실패 시 마지막으로
+                    return 999999
+            
+            # 분 단위로 정렬 (안정적 정렬: 같은 값이면 원래 순서 유지)
+            return sorted(interval_list, key=lambda x: (get_order_in_minutes(x), x))
+        
+        intervals_to_use = sort_intervals(intervals_raw)
+
+        # 코인 기본값: DB에서 사용 가능한 코인 목록 우선 사용
+        if coin is None:
+            try:
+                available = get_available_coins_and_intervals()
+                coins = sorted(list({c for c, _ in available}))
+                if not coins:
+                    raise ValueError("❌ DB에 사용 가능한 코인이 없습니다. 캔들 데이터를 먼저 수집하세요.")
+                coin = coins[0]
+            except Exception as e:
+                logger.error(f"❌ 코인 목록 조회 실패: {e}")
+                raise ValueError("❌ 코인을 지정하거나 DB에 캔들 데이터가 필요합니다.") from e
+        logger.info(f"🚀 Absolute Zero 시스템 시작: {coin} {intervals_to_use}")
+        logger.info(f"🗓️ 캔들 히스토리 일수: {AZ_CANDLE_DAYS}일")
+        
+        # 새로운 파이프라인 사용 가능 여부 확인
+        if not NEW_PIPELINE_AVAILABLE:
+            logger.error("❌ 새로운 파이프라인 모듈을 사용할 수 없습니다")
+            return {"error": "새로운 파이프라인 모듈 사용 불가"}
+        
+        # 데이터베이스는 이미 시스템 시작 시 초기화됨
+
+        # 🆕 실행 메타데이터 생성
+        run_id = f"abs_zero_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        dataset_span = f"{datetime.now().strftime('%Y-%m-%d')}"
+        regime = "mixed"  # 실제로는 시장 분석 결과에 따라 결정
+
+        # 🆕 실행 기록 생성 (테이블 생성 후) - coin, interval 포함
+        try:
+            # 여러 interval 사용 시 첫 번째 interval 사용 (또는 ','로 구분된 문자열)
+            interval_str = intervals_to_use[0] if intervals_to_use else interval
+            if len(intervals_to_use) > 1:
+                interval_str = ','.join(intervals_to_use)  # 여러 interval을 ','로 구분
+            create_run_record(run_id, "Absolute Zero System 실행", coin=coin, interval=interval_str)
+            logger.info(f"✅ 실행 기록 생성 완료: {run_id} (coin={coin}, intervals={interval_str})")
+        except Exception as e:
+            logger.warning(f"⚠️ 실행 기록 생성 실패: {e}")
+
+        # 인덱스는 이미 시스템 시작 시 생성됨
+
+        # 🆕 개선 사항 자동 실행 (환경변수로 제어)
+        # 🔥 시작 시점 검증/비교는 불필요 (전략이 아직 생성되지 않음)
+        # - 백테스트 검증: 전략이 없어 검증할 데이터 없음
+        # - 베이스라인 비교: 전략이 없어 비교할 데이터 없음
+        # - 필요시 별도 검증 스크립트로 실행 가능
+        ENABLE_STRATEGY_FILTERING = os.getenv('ENABLE_STRATEGY_FILTERING', 'false').lower() == 'true'
+        
+        # 🔥 시작 시점 검증/비교 제거
+        # - 전략 생성 전에는 의미 없는 검증/비교
+        # - 전략 생성 후 비교는 파이프라인 내부에서 수행됨
+        
+        if ENABLE_STRATEGY_FILTERING:
+            try:
+                logger.info("🔧 전략 필터링 시작...")
+                from rl_pipeline.core.strategy_filter import remove_low_grade_strategies
+                removed = remove_low_grade_strategies()
+                if removed > 0:
+                    logger.info(f"✅ {removed}개 F 등급 전략 제거")
+            except Exception as e:
+                logger.warning(f"⚠️ 전략 필터링 실패 (계속 진행): {e}")
+
+        # 🆕 캔들 데이터 로드
+        logger.info(f"📊 {coin} 캔들 데이터 로드 시작 (목표: {AZ_CANDLE_DAYS}일)...")
+        all_candle_data = load_candle_data_for_coin(coin, intervals_to_use)
+
+        if not all_candle_data:
+            logger.error(f"❌ {coin} 캔들 데이터 로드 실패")
+            return {"error": f"{coin} 캔들 데이터 로드 실패"}
+
+        # 신생 코인 체크
+        total_candles = sum(len(df) for df in all_candle_data.values())
+        if total_candles == 0:
+            logger.error(f"❌ {coin}: 사용 가능한 캔들 데이터가 없습니다")
+            return {"error": f"{coin}: 캔들 데이터 없음"}
+
+        # 데이터 충분성 체크
+        min_candles_per_interval = {
+            '15m': 672,  # 7일 최소 데이터
+            '30m': 336,
+            '240m': 42,
+            '1d': 7
+        }
+
+        insufficient_intervals = []
+        for (c, interval), df in all_candle_data.items():
+            min_required = min_candles_per_interval.get(interval, 100)
+            if len(df) < min_required:
+                insufficient_intervals.append(f"{interval}({len(df)}개)")
+
+        if insufficient_intervals:
+            logger.warning(f"⚠️ {coin}: 신생 코인 감지 - 일부 인터벌 데이터 부족: {', '.join(insufficient_intervals)}")
+            logger.info(f"📊 {coin}: 가용 데이터로 진행합니다")
+
+        # 🆕 통합된 파이프라인 실행
+        logger.info(f"🔄 {coin} 통합 파이프라인 실행 시작...")
+
+        # 파이프라인 오케스트레이터 초기화 (session_id 전달)
+        orchestrator = IntegratedPipelineOrchestrator(session_id=session_id)
+        
+        # 각 인터벌별로 통합 파이프라인 실행
+        pipeline_results = []
+        for idx, interval in enumerate(intervals_to_use):
+            try:
+                logger.info(f"📊 {coin}-{interval} 통합 파이프라인 실행...")
+                
+                candle_data = all_candle_data.get((coin, interval))
+                if candle_data is None or candle_data.empty:
+                    logger.warning(f"⚠️ {coin}-{interval} 캔들 데이터 없음, 건너뜀")
+                    continue
+                
+                # 1-2단계만 실행: 전략생성 → Self-play → 통합분석 (레짐 라우팅 제거)
+                result = orchestrator.run_partial_pipeline(coin, interval, candle_data)
+                pipeline_results.append(result)
+                
+                # 실행 결과 로깅
+                logger.info(f"✅ {coin}-{interval} 개별 인터벌 처리 완료: 전략 생성 → 예측 self-play → 롤업/등급 평가 완료")
+                logger.info(f"   💡 전체 통합 분석 및 학습은 모든 인터벌 완료 후 실행됩니다")
+                
+                # 🔥 WAL 체크포인트 강제 실행 + 잠금 해제 (다음 인터벌 준비)
+                if idx < len(intervals_to_use) - 1:  # 마지막 인터벌이 아닌 경우만
+                    import sqlite3
+                    import time
+                    import traceback
+                    from rl_pipeline.core.env import config
+                    
+                    # WAL 체크포인트 실행 (재시도 포함)
+                    wal_checkpoint_success = False
+                    for retry in range(3):  # 최대 3회 재시도
+                        try:
+                            logger.info(f"🔧 WAL 체크포인트 시도 {retry + 1}/3 ({coin}-{interval} 후)")
+                            
+                            # Connection Pool의 모든 연결 종료 (먼저 실행)
+                            try:
+                                from rl_pipeline.db.connection_pool import close_all_connections
+                                close_all_connections()
+                                logger.info(f"✅ Connection Pool 종료 완료 ({coin}-{interval} 후)")
+                                time.sleep(0.2)  # 종료 대기
+                            except Exception as pool_error:
+                                logger.warning(f"⚠️ Connection Pool 종료 실패: {pool_error}")
+                                import traceback
+                                logger.debug(f"Connection Pool 종료 실패 상세:\n{traceback.format_exc()}")
+                            
+                            # 전략 DB에 WAL 체크포인트 실행
+                            db_path = config.STRATEGIES_DB
+                            logger.debug(f"🔧 DB 경로: {db_path}")
+                            
+                            # 짧은 타임아웃으로 연결 시도
+                            conn = sqlite3.connect(db_path, timeout=5.0)
+                            cursor = conn.cursor()
+                            
+                            # WAL 체크포인트 실행 (FULL 먼저 시도)
+                            result_passive = cursor.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchone()
+                            logger.debug(f"🔧 WAL 체크포인트 PASSIVE 결과: {result_passive}")
+                            
+                            # TRUNCATE 체크포인트 실행
+                            result = cursor.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+                            logger.debug(f"🔧 WAL 체크포인트 TRUNCATE 결과: {result}")
+                            
+                            # 결과 확인: (busy, log, checkpointed)
+                            if result and result[0] == 0:  # busy=0이면 성공
+                                logger.debug(f"✅ WAL 체크포인트 성공: {result[2]}개 페이지 체크포인트됨")
+                            elif result and result[0] == 1:  # busy=1이면 다른 연결이 사용 중
+                                logger.warning(f"⚠️ WAL 체크포인트 busy: 다른 연결이 사용 중 (무시하고 계속)")
+                            
+                            conn.commit()
+                            conn.close()
+                            
+                            # 추가 대기 (WAL 파일이 실제로 줄어들도록)
+                            time.sleep(0.3)
+                            
+                            wal_checkpoint_success = True
+                            logger.info(f"✅ WAL 체크포인트 완료 ({coin}-{interval} 후, 다음 인터벌 준비)")
+                            break  # 성공 시 재시도 중단
+                            
+                        except sqlite3.OperationalError as db_error:
+                            error_msg = str(db_error)
+                            logger.warning(f"⚠️ WAL 체크포인트 실패 (시도 {retry + 1}/3): {error_msg}")
+                            if retry < 2:  # 마지막 재시도가 아니면
+                                wait_time = (retry + 1) * 0.5
+                                logger.info(f"⏳ {wait_time:.1f}초 후 재시도...")
+                                time.sleep(wait_time)
+                            else:
+                                logger.error(f"❌ WAL 체크포인트 최종 실패: {error_msg}")
+                                logger.debug(f"WAL 체크포인트 실패 상세:\n{traceback.format_exc()}")
+                        except Exception as wal_error:
+                            error_msg = str(wal_error)
+                            logger.error(f"❌ WAL 체크포인트 예외 발생 (시도 {retry + 1}/3): {error_msg}")
+                            logger.debug(f"WAL 체크포인트 예외 상세:\n{traceback.format_exc()}")
+                            if retry < 2:
+                                time.sleep(0.5)
+                            else:
+                                logger.error(f"❌ WAL 체크포인트 최종 실패: {error_msg}")
+                    
+                    # 잠금 완전히 해제될 때까지 대기
+                    if wal_checkpoint_success:
+                        time.sleep(0.3)  # 성공 시 짧은 대기
+                    else:
+                        time.sleep(1.0)  # 실패 시 더 긴 대기 (다음 인터벌을 위해)
+                        logger.warning(f"⚠️ WAL 체크포인트 실패했지만 다음 인터벌 진행 ({coin}-{interval})")
+                
+            except Exception as e:
+                logger.error(f"❌ {coin}-{interval} 파이프라인 실행 실패: {e}")
+                continue
+        
+        # 전체 인터벌 통합분석 실행
+        if pipeline_results:
+            try:
+                logger.info(f"🔍 {coin} 전체 인터벌 통합분석 시작...")
+                final_result = orchestrator.run_integrated_analysis_all_intervals(coin, pipeline_results, all_candle_data)
+                logger.info(f"✅ {coin} 전체 통합분석 완료: {final_result.signal_action} (점수: {final_result.signal_score:.3f})")
+                
+                # 최종 결과를 pipeline_results에 추가
+                pipeline_results.append(final_result)
+                
+                # 학습 결과 DB에 저장
+                try:
+                    save_pipeline_execution_log(
+                        coin=coin,
+                        interval="all_intervals",
+                        strategies_created=sum(len(result.strategies) for result in pipeline_results if hasattr(result, 'strategies')),
+                        selfplay_episodes=sum(result.selfplay_episodes for result in pipeline_results if hasattr(result, 'selfplay_episodes')),
+                        regime_detected="multi_interval",
+                        routing_results=sum(result.routing_results for result in pipeline_results if hasattr(result, 'routing_results')),
+                        signal_score=final_result.signal_score,
+                        signal_action=final_result.signal_action,
+                        execution_time=final_result.execution_time,
+                        status="success"
+                    )
+                    logger.info(f"✅ 전체 통합분석 로그 저장 완료: {coin}")
+                except Exception as log_error:
+                    logger.warning(f"⚠️ 로그 저장 실패: {log_error}")
+                
+            except Exception as e:
+                logger.error(f"❌ {coin} 전체 통합분석 실패: {e}")
+                # 기본 결과 생성
+                final_result = PipelineResult(
+                    coin=coin,
+                    interval="all",
+                    signal_action="HOLD",
+                    signal_score=0.5,
+                    execution_time=0.0,
+                    strategies_created=0,
+                    selfplay_episodes=0,
+                    regime_detected="unknown",
+                    routing_results=0,
+                    status="failed",
+                    created_at=datetime.now().isoformat()
+                )
+                pipeline_results.append(final_result)
+            
+            successful_results = [r for r in pipeline_results if r.status == "success"]
+            logger.info(f"✅ {coin} 통합 파이프라인 완료: {len(successful_results)}/{len(pipeline_results)} 성공")
+            
+            # 🆕 실행 기록 업데이트 (통계 정보 포함)
+            try:
+                # 통계 정보 계산
+                total_strategies = sum(r.strategies_created for r in pipeline_results if r.strategies_created)
+                successful_results_count = len(successful_results)
+                total_errors = len([r for r in pipeline_results if r.status == "failed"])
+                
+                update_run_record(
+                    run_id, 
+                    "completed", 
+                    f"{coin} 통합 파이프라인 성공: {successful_results_count}/{len(pipeline_results)} 성공",
+                    strategies_count=total_strategies,
+                    successful_strategies=successful_results_count,
+                    error_count=total_errors
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ 실행 기록 업데이트 실패: {e}")
+            
+            total_ms = (datetime.now() - start_time).total_seconds() * 1000.0
+
+            # 🔥 디버그 세션 종료
+            if session_id:
+                try:
+                    session_manager.end_session(
+                        session_id=session_id,
+                        summary={
+                            "status": "success",
+                            "pipeline_results": len(pipeline_results),
+                            "successful_results": len(successful_results),
+                            "elapsed_ms": round(total_ms, 2)
+                        }
+                    )
+                    logger.info(f"✅ 디버그 세션 종료: {session_id}")
+                except Exception as end_err:
+                    logger.warning(f"⚠️ 디버그 세션 종료 실패: {end_err}")
+
+            return {
+                "run_id": run_id,
+                "coin": coin,
+                "interval": ",".join(intervals_to_use),
+                "status": "success",
+                "message": f"{coin} 통합 파이프라인 성공",
+                "pipeline_results": len(pipeline_results),
+                "successful_results": len(successful_results),
+                "elapsed_ms": round(total_ms, 2),
+                "session_id": session_id
+            }
+        else:
+            logger.error(f"❌ {coin} 통합 파이프라인 실패")
+            total_ms = (datetime.now() - start_time).total_seconds() * 1000.0
+
+            # 🔥 디버그 세션 종료 (실패)
+            if session_id:
+                try:
+                    session_manager.end_session(
+                        session_id=session_id,
+                        summary={
+                            "status": "failed",
+                            "message": f"{coin} 통합 파이프라인 실패",
+                            "elapsed_ms": round(total_ms, 2)
+                        }
+                    )
+                except Exception as end_err:
+                    logger.warning(f"⚠️ 디버그 세션 종료 실패: {end_err}")
+
+            return {
+                "run_id": run_id,
+                "coin": coin,
+                "interval": ",".join(intervals_to_use),
+                "status": "failed",
+                "message": f"{coin} 통합 파이프라인 실패",
+                "elapsed_ms": round(total_ms, 2),
+                "session_id": session_id
+            }
+
+    except Exception as e:
+        logger.error(f"❌ Absolute Zero 시스템 실행 실패: {e}")
+
+        # 🔥 디버그 세션 종료 (예외)
+        if 'session_id' in locals() and session_id:
+            try:
+                if 'session_manager' in locals():
+                    session_manager.end_session(
+                        session_id=session_id,
+                        summary={
+                            "status": "error",
+                            "error": str(e)
+                        }
+                    )
+            except Exception as end_err:
+                logger.warning(f"⚠️ 디버그 세션 종료 실패: {end_err}")
+
+        return {"error": f"시스템 실행 실패: {e}"}
+
+def _calculate_global_analysis_data(all_coin_strategies: Dict[str, Any]) -> Dict[str, float]:
+    """실제 전략 데이터 기반으로 글로벌 분석 데이터 계산"""
+    try:
+        from rl_pipeline.analysis.integrated_analyzer import IntegratedAnalyzer
+        
+        # 모든 코인의 전략 데이터 수집
+        all_strategies = []
+        for coin, intervals in all_coin_strategies.items():
+            for interval, strategies in intervals.items():
+                all_strategies.extend(strategies)
+        
+        if not all_strategies:
+            return {
+                'fractal_score': 0.5,
+                'multi_timeframe_score': 0.5,
+                'indicator_cross_score': 0.5,
+                'ensemble_score': 0.5,
+                'ensemble_confidence': 0.5
+            }
+        
+        # IntegratedAnalyzer 인스턴스 생성 (session_id는 선택적)
+        # session_id가 없으면 None으로 전달
+        analyzer = IntegratedAnalyzer(session_id=None)
+        
+        # 1. Fractal 점수 계산 (전략 파라미터 분포 기반)
+        fractal_score = _calculate_fractal_score(all_strategies)
+        
+        # 2. Multi-timeframe 점수 계산 (여러 타임프레임 간 일관성)
+        multi_timeframe_score = _calculate_multi_timeframe_coherence(all_coin_strategies)
+        
+        # 3. Indicator cross-validation 점수 계산 (지표 간 교차 검증)
+        indicator_cross_score = _calculate_indicator_cross_validation(all_strategies)
+        
+        # 4. Ensemble 점수 계산
+        ensemble_score = (fractal_score + multi_timeframe_score + indicator_cross_score) / 3.0
+        ensemble_confidence = min(1.0, max(0.0, len(all_strategies) / 1000.0))
+        
+        return {
+            'fractal_score': round(fractal_score, 3),
+            'multi_timeframe_score': round(multi_timeframe_score, 3),
+            'indicator_cross_score': round(indicator_cross_score, 3),
+            'ensemble_score': round(ensemble_score, 3),
+            'ensemble_confidence': round(ensemble_confidence, 3)
+        }
+        
+    except Exception as e:
+        logger.warning(f"⚠️ 글로벌 분석 데이터 계산 실패, 기본값 사용: {e}")
+        return {
+            'fractal_score': 0.5,
+            'multi_timeframe_score': 0.5,
+            'indicator_cross_score': 0.5,
+            'ensemble_score': 0.5,
+            'ensemble_confidence': 0.5
+        }
+
+def _get_value(obj, key: str, default: Any):
+    """객체나 딕셔너리에서 값을 가져오는 헬퍼 함수"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    else:
+        # Strategy 객체인 경우
+        # 먼저 params 딕셔너리 확인
+        if hasattr(obj, 'params') and isinstance(obj.params, dict):
+            if key in obj.params:
+                return obj.params[key]
+        # 그 다음 객체 속성 확인
+        return getattr(obj, key, default)
+
+def _calculate_fractal_score(strategies: List[Dict]) -> float:
+    """Fractal 점수 계산 - 전략 파라미터 분포 기반 프랙탈 패턴 분석"""
+    if not strategies:
+        return 0.5
+    
+    try:
+        # RSI 파라미터 분포 분석
+        rsi_mins = [_get_value(s, 'rsi_min', 30.0) for s in strategies if hasattr(s, 'rsi_min') or (isinstance(s, dict) and 'rsi_min' in s)]
+        rsi_maxs = [_get_value(s, 'rsi_max', 70.0) for s in strategies if hasattr(s, 'rsi_max') or (isinstance(s, dict) and 'rsi_max' in s)]
+        
+        if rsi_mins and rsi_maxs:
+            rsi_min_std = np.std(rsi_mins) if len(rsi_mins) > 1 else 0.0
+            rsi_max_std = np.std(rsi_maxs) if len(rsi_maxs) > 1 else 0.0
+            
+            # 분산이 적절하면 높은 점수 (일관된 패턴)
+            # 너무 낮으면 단조롭고, 너무 높으면 무작위적
+            avg_std = (rsi_min_std + rsi_max_std) / 2.0
+            # 이상적인 표준편차: 5-15 사이
+            if 5.0 <= avg_std <= 15.0:
+                fractal_score = 0.8
+            elif avg_std < 5.0:
+                fractal_score = 0.5  # 너무 단조로움
+            else:
+                fractal_score = 0.6  # 너무 다양함
+        else:
+            fractal_score = 0.5
+        
+        return fractal_score
+        
+    except Exception as e:
+        logger.debug(f"⚠️ Fractal 점수 계산 실패: {e}")
+        return 0.5
+
+def _calculate_multi_timeframe_coherence(all_coin_strategies: Dict[str, Dict]) -> float:
+    """Multi-timeframe 일관성 점수 계산 - 여러 타임프레임 간 전략 일관성 분석"""
+    try:
+        coherence_scores = []
+        
+        for coin, intervals in all_coin_strategies.items():
+            if len(intervals) < 2:
+                continue  # 타임프레임이 2개 미만이면 건너뜀
+            
+            # 각 타임프레임의 평균 RSI 범위 계산
+            interval_rsi_ranges = {}
+            for interval, strategies in intervals.items():
+                if not strategies:
+                    continue
+
+                rsi_mins = [_get_value(s, 'rsi_min', 30.0) for s in strategies if hasattr(s, 'rsi_min') or (isinstance(s, dict) and 'rsi_min' in s)]
+                rsi_maxs = [_get_value(s, 'rsi_max', 70.0) for s in strategies if hasattr(s, 'rsi_max') or (isinstance(s, dict) and 'rsi_max' in s)]
+                
+                if rsi_mins and rsi_maxs:
+                    avg_min = np.mean(rsi_mins)
+                    avg_max = np.mean(rsi_maxs)
+                    interval_rsi_ranges[interval] = (avg_min, avg_max)
+            
+            # 타임프레임 간 RSI 범위 차이 계산
+            if len(interval_rsi_ranges) >= 2:
+                ranges = list(interval_rsi_ranges.values())
+                min_diffs = [abs(ranges[i][0] - ranges[j][0]) for i in range(len(ranges)) for j in range(i+1, len(ranges))]
+                max_diffs = [abs(ranges[i][1] - ranges[j][1]) for i in range(len(ranges)) for j in range(i+1, len(ranges))]
+                
+                avg_min_diff = np.mean(min_diffs) if min_diffs else 0.0
+                avg_max_diff = np.mean(max_diffs) if max_diffs else 0.0
+                
+                # 차이가 작을수록 일관성 높음 (높은 점수)
+                # 이상적인 차이: 5-10 사이 (적절한 다양성과 일관성)
+                avg_diff = (avg_min_diff + avg_max_diff) / 2.0
+                if avg_diff <= 10.0:
+                    coherence = 0.8 - (avg_diff / 25.0)  # 차이가 작을수록 높은 점수
+                else:
+                    coherence = 0.5
+                
+                coherence_scores.append(coherence)
+        
+        if coherence_scores:
+            return np.mean(coherence_scores)
+        else:
+            return 0.5
+            
+    except Exception as e:
+        logger.debug(f"⚠️ Multi-timeframe 일관성 계산 실패: {e}")
+        return 0.5
+
+def _calculate_indicator_cross_validation(strategies: List[Dict]) -> float:
+    """Indicator 교차 검증 점수 계산 - 지표 간 일관성"""
+    if not strategies:
+        return 0.5
+    
+    try:
+        # RSI와 MACD 임계값 간 상관관계 분석
+        rsi_scores = []
+        macd_scores = []
+        
+        for strategy in strategies:
+            # RSI 점수 (rsi_min, rsi_max의 적절성)
+            rsi_min = _get_value(strategy, 'rsi_min', 30.0)
+            rsi_max = _get_value(strategy, 'rsi_max', 70.0)
+            if 20.0 <= rsi_min <= 40.0 and 60.0 <= rsi_max <= 80.0:
+                rsi_scores.append(1.0)
+            else:
+                rsi_scores.append(0.5)
+
+            # MACD 점수 (macd_buy_threshold, macd_sell_threshold의 적절성)
+            macd_buy = _get_value(strategy, 'macd_buy_threshold', 0.0)
+            macd_sell = _get_value(strategy, 'macd_sell_threshold', 0.0)
+            if macd_buy > 0 and macd_sell < 0:
+                macd_scores.append(1.0)
+            else:
+                macd_scores.append(0.5)
+        
+        # 두 지표 점수의 평균 및 일관성
+        avg_rsi = np.mean(rsi_scores) if rsi_scores else 0.5
+        avg_macd = np.mean(macd_scores) if macd_scores else 0.5
+        
+        # 두 지표가 모두 높으면 높은 점수
+        cross_score = (avg_rsi + avg_macd) / 2.0
+        
+        return cross_score
+        
+    except Exception as e:
+        logger.debug(f"⚠️ Indicator 교차 검증 계산 실패: {e}")
+        return 0.5
+
+def main():
+    """메인 함수 - 모든 코인/인터벌 조합에 대해 실행"""
+    try:
+        _configure_logging()
+        logger.info("🚀 Absolute Zero 시스템 메인 실행 시작")
+        
+        # 저장 경로 및 DB 파일 사전 보장
+        ensure_storage_ready()
+        
+        # 🆕 시스템 시작 시 한 번만 데이터베이스 초기화
+        try:
+            logger.info("🔧 시스템 데이터베이스 초기화 시작...")
+            setup_database_tables()
+            create_learning_results_tables()  # 새로운 학습 결과 테이블 생성
+            
+            # 필수 테이블 보강 생성 (방어적)
+            try:
+                create_coin_strategies_table()
+            except Exception as se:
+                logger.warning(f"⚠️ coin_strategies 보강 생성 실패(무시 가능): {se}")
+            
+            # 🆕 데이터베이스 마이그레이션 실행 (누락된 컬럼 추가)
+            try:
+                from db.schema import migrate_coin_strategies_table, migrate_rl_episode_summary_table
+                migrate_coin_strategies_table()
+                migrate_rl_episode_summary_table()  # 🔥 옵션 A: source_type 컬럼 추가
+                logger.info("✅ 데이터베이스 마이그레이션 완료")
+            except Exception as me:
+                logger.warning(f"⚠️ 데이터베이스 마이그레이션 실패(무시 가능): {me}")
+            
+            # 인덱스 생성 (한 번만)
+            try:
+                logger.info("🔧 인덱스 생성 시작...")
+                ensure_indexes()
+                logger.info("✅ 인덱스 생성 완료")
+            except Exception as ie:
+                logger.warning(f"⚠️ 인덱스 생성 실패(무시 가능): {ie}")
+            
+            logger.info("✅ 시스템 데이터베이스 초기화 완료")
+        except Exception as e:
+            logger.error(f"❌ 시스템 데이터베이스 초기화 실패: {e}")
+            return {"error": f"데이터베이스 초기화 실패: {e}"}
+        
+        # 🆕 Paper Trading 오래된 세션 정리
+        try:
+            from rl_pipeline.validation.auto_paper_trading import AutoPaperTrading
+            auto_paper = AutoPaperTrading()
+            cleaned = auto_paper.cleanup_old_sessions(days_old=14)  # 14일 이상 된 세션 정리
+            if cleaned > 0:
+                logger.info(f"🧹 {cleaned}개의 오래된 Paper Trading 세션 정리 완료")
+        except Exception as cleanup_err:
+            logger.warning(f"⚠️ Paper Trading 세션 정리 실패 (계속 진행): {cleanup_err}")
+
+        # 🆕 사용 가능한 코인/인터벌 조합 가져오기
+        coin_interval_combinations = get_available_coins_and_intervals()
+        logger.info(f"📊 발견된 코인/인터벌 조합: {len(coin_interval_combinations)}개")
+        # 코인별 전체 인터벌로 그룹핑
+        coin_to_intervals: Dict[str, List[str]] = {}
+        for c, itv in coin_interval_combinations:
+            coin_to_intervals.setdefault(c, [])
+            if itv not in coin_to_intervals[c]:
+                coin_to_intervals[c].append(itv)
+        # 인터벌 정렬: 실제 분 단위로 변환하여 정렬
+        def sort_intervals_for_main(interval_list):
+            """인터벌을 시간 순서로 정렬: 실제 분 단위로 변환"""
+            def get_order_in_minutes(iv):
+                """인터벌을 분 단위로 변환하여 정렬 키 생성"""
+                iv_lower = iv.lower().strip()
+                
+                try:
+                    if iv_lower.endswith('m'):
+                        minutes = int(iv_lower[:-1])
+                        return minutes
+                    elif iv_lower.endswith('h'):
+                        hours = int(iv_lower[:-1])
+                        return hours * 60
+                    elif iv_lower.endswith('d'):
+                        days = int(iv_lower[:-1])
+                        return days * 1440
+                    else:
+                        return 999999
+                except (ValueError, AttributeError):
+                    return 999999
+            
+            # 분 단위로 정렬 (안정적 정렬)
+            return sorted(interval_list, key=lambda x: (get_order_in_minutes(x), x))
+        
+        for c in coin_to_intervals:
+            try:
+                coin_to_intervals[c] = sort_intervals_for_main(coin_to_intervals[c])
+            except Exception:
+                pass
+        
+        if not coin_interval_combinations:
+            logger.error("❌ 사용 가능한 코인/인터벌 조합이 없습니다.")
+            logger.error("❌ 캔들 데이터를 먼저 수집하세요: python rl_candles_collector.py")
+            return {"error": "no coin/interval combinations found", "message": "캔들 데이터를 먼저 수집하세요"}
+        
+        # 각 조합에 대해 실행
+        results = []
+        failed_runs = []
+        
+        # 🆕 Paper Trading 자동 실행 설정
+        ENABLE_AUTO_PAPER_TRADING = os.getenv('ENABLE_AUTO_PAPER_TRADING', 'true').lower() == 'true'
+        PAPER_TRADING_DURATION_DAYS = int(os.getenv('PAPER_TRADING_DURATION_DAYS', '30'))  # 기본 30일 (통계적 신뢰도와 피드백 속도 균형)
+        
+        for coin, intervals in coin_to_intervals.items():
+            try:
+                logger.info(f"\n🪙 {coin} {', '.join(intervals)} 처리 시작")
+                result = run_absolute_zero(coin, interval=intervals[0], n_strategies=200, intervals=intervals)
+                results.append(result)
+                
+                if result.get("status") == "success":
+                    logger.info(f"✅ {coin} 처리 성공")
+                    
+                    # 🆕 코인별 파이프라인 완료 후 즉시 Paper Trading 시작
+                    if ENABLE_AUTO_PAPER_TRADING:
+                        try:
+                            logger.info(f"\n📊 {coin} Paper Trading 자동 시작 (파이프라인 완료 후)")
+                            from rl_pipeline.validation.auto_paper_trading import (
+                                auto_start_paper_trading_after_pipeline,
+                                run_paper_trading_monitor
+                            )
+                            
+                            paper_result = auto_start_paper_trading_after_pipeline(
+                                coin=coin,
+                                intervals=intervals,
+                                duration_days=PAPER_TRADING_DURATION_DAYS
+                            )
+                            
+                            if paper_result.get('status') == 'started':
+                                logger.info(f"✅ {coin} Paper Trading 시작 완료")
+                                # 특정 코인만 모니터링 실행 (실시간 시그널로 거래 시작)
+                                try:
+                                    # 해당 코인의 세션만 모니터링
+                                    run_paper_trading_monitor(coin=coin, session_limit=5)
+                                    logger.info(f"✅ {coin} Paper Trading 모니터링 완료")
+                                except Exception as e:
+                                    logger.warning(f"⚠️ {coin} Paper Trading 모니터링 실패 (계속 진행): {e}")
+                            else:
+                                logger.warning(f"⚠️ {coin} Paper Trading 시작 실패: {paper_result.get('error', 'unknown')}")
+                        
+                        except Exception as e:
+                            logger.warning(f"⚠️ {coin} Paper Trading 자동 시작 실패 (계속 진행): {e}")
+                else:
+                    logger.error(f"❌ {coin} 처리 실패: {result.get('message', 'Unknown error')}")
+                    failed_runs.append(f"{coin}_{','.join(intervals)}")
+                    
+            except Exception as e:
+                logger.error(f"❌ {coin} 처리 중 오류: {e}")
+                failed_runs.append(f"{coin}_{','.join(intervals)}")
+                continue
+        
+        # 결과 요약
+        successful_runs = len([r for r in results if r.get("status") == "success"])
+        total_runs = len(coin_to_intervals)
+        
+        logger.info(f"\n🎉 Absolute Zero 시스템 실행 완료")
+        logger.info(f"📊 총 실행: {total_runs}개, 성공: {successful_runs}개, 실패: {len(failed_runs)}개")
+        
+        if failed_runs:
+            logger.warning(f"⚠️ 실패한 조합: {failed_runs}")
+        
+        # 🆕 Paper Trading 완료 요약 (이미 각 코인별로 실행됨)
+        if ENABLE_AUTO_PAPER_TRADING and successful_runs > 0:
+            logger.info("\n✅ 모든 코인별 Paper Trading 자동 실행 완료")
+            logger.info("   💡 Paper Trading은 주기적으로 자동 업데이트됩니다")
+            logger.info("   💡 수동 모니터링: python -m rl_pipeline.validation.auto_paper_trading monitor")
+        
+        # 🌍 글로벌 전략 생성 (모든 코인의 모든 시간대 완료 후)
+        if successful_runs > 0:
+            try:
+                logger.info("\n🌍 글로벌 전략 생성 시작 (모든 코인의 모든 시간대 완료 후)...")
+                
+                # 모든 코인의 self-play 결과(전략) 수집
+                all_coin_strategies = {}
+                total_strategies = 0
+                
+                logger.info("📊 코인별 전략 로드 상세 정보:")
+                for coin, intervals in coin_to_intervals.items():
+                    coin_strategies = {}
+                    coin_total = 0
+                    
+                    for interval in intervals:
+                        try:
+                            # self-play로 진화된 전략 로드 (모든 등급 포함)
+                            from rl_pipeline.db.reads import fetch_all
+                            from rl_pipeline.db.connection_pool import get_optimized_db_connection
+                            
+                            strategies = []
+                            with get_optimized_db_connection("strategies") as conn:
+                                cursor = conn.cursor()
+                                
+                                # 모든 등급의 상위 전략 로드 (등급 우선순위: S > A > B > C > D > F, 제한 없음)
+                                query = """
+                                    SELECT * FROM coin_strategies 
+                                    WHERE coin = ? AND interval = ?
+                                    ORDER BY 
+                                        CASE COALESCE(quality_grade, 'Z')
+                                            WHEN 'S' THEN 0
+                                            WHEN 'A' THEN 1
+                                            WHEN 'B' THEN 2
+                                            WHEN 'C' THEN 3
+                                            WHEN 'D' THEN 4
+                                            WHEN 'F' THEN 5
+                                            ELSE 6
+                                        END ASC,
+                                        profit DESC, 
+                                        win_rate DESC
+                                """
+                                cursor.execute(query, (coin, interval))
+                                results = cursor.fetchall()
+                                
+                                if results:
+                                    columns_query = "PRAGMA table_info(coin_strategies)"
+                                    columns_info = cursor.execute(columns_query).fetchall()
+                                    columns = [col[1] for col in columns_info]
+                                    
+                                    for row in results:
+                                        strategy_dict = dict(zip(columns, row))
+                                        strategies.append(strategy_dict)
+                            
+                            if strategies:
+                                coin_strategies[interval] = strategies
+                                coin_total += len(strategies)
+                                total_strategies += len(strategies)
+                                
+                                # 전략 품질 정보 표시
+                                if strategies:
+                                    # profit을 달러에서 퍼센트로 변환
+                                    avg_profit_pnl = sum(_get_value(s, 'profit', 0) or 0 for s in strategies) / len(strategies)
+                                    avg_profit_pct = (avg_profit_pnl / 10000.0) * 100  # 퍼센트로 변환
+
+                                    avg_win_rate = sum(_get_value(s, 'win_rate', 0) or 0 for s in strategies) / len(strategies)
+
+                                    # 등급 분포 계산
+                                    grade_dist = {}
+                                    for s in strategies:
+                                        grade = _get_value(s, 'quality_grade', None) or 'UNKNOWN'
+                                        grade_dist[grade] = grade_dist.get(grade, 0) + 1
+
+                                    grade_str = ', '.join([f"{k}({v})" for k, v in sorted(grade_dist.items())])
+
+                                    # 데이터 상태 확인
+                                    has_performance_data = any(_get_value(s, 'profit', 0) != 0 or _get_value(s, 'win_rate', 0) != 0 for s in strategies)
+                                    has_grades = any(_get_value(s, 'quality_grade', None) and _get_value(s, 'quality_grade', 'UNKNOWN') != 'UNKNOWN' for s in strategies)
+                                    
+                                    if not has_performance_data and not has_grades:
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 성과 데이터 없음: Self-play 비활성화 또는 롤업 데이터 없음]")
+                                    elif not has_performance_data:
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 수익/승률 데이터 없음: 롤업 데이터 없음]")
+                                    elif not has_grades:
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 등급 데이터 없음: 등급 계산 필요]")
+                                    else:
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str})")
+                            else:
+                                logger.warning(f"  ⚠️ {coin} {interval}: 전략 없음")
+                        except Exception as e:
+                            logger.warning(f"  ❌ {coin} {interval} 전략 로드 실패: {e}")
+                    
+                    if coin_strategies:
+                        all_coin_strategies[coin] = coin_strategies
+                        logger.info(f"📊 {coin}: 총 {coin_total}개 전략 로드 완료")
+                
+                logger.info(f"📊 전체 통계: {len(all_coin_strategies)}개 코인, {total_strategies}개 전략")
+                
+                if all_coin_strategies:
+                    # 글로벌 전략 생성
+                    from rl_pipeline.strategy.manager import create_global_strategies_from_results
+                    logger.info("🔧 글로벌 전략 생성 프로세스 시작...")
+                    global_strategies_count = create_global_strategies_from_results(all_coin_strategies)
+                    logger.info(f"✅ 글로벌 전략 생성 완료: {global_strategies_count}개")
+
+                    # 🔥 코인 vs 글로벌 전략 동적 가중치 계산 및 저장
+                    try:
+                        from rl_pipeline.db.writes import save_coin_global_weights
+                        from rl_pipeline.db.reads import fetch_all
+                        from rl_pipeline.db.connection_pool import get_optimized_db_connection
+
+                        logger.info("⚖️ 코인 vs 글로벌 전략 동적 가중치 계산 시작...")
+
+                        # 🔥 글로벌 전략 성능 계산 (매수/매도 그룹 분리)
+                        # 매수 그룹
+                        global_buy_strats = fetch_all(
+                            """SELECT profit, win_rate, trades_count
+                               FROM global_strategies
+                               WHERE profit IS NOT NULL AND trades_count > 0
+                                 AND (strategy_type LIKE '%_buy' OR strategy_type LIKE '%buy%')""",
+                            db_path="strategies"
+                        )
+
+                        # 매도 그룹
+                        global_sell_strats = fetch_all(
+                            """SELECT profit, win_rate, trades_count
+                               FROM global_strategies
+                               WHERE profit IS NOT NULL AND trades_count > 0
+                                 AND (strategy_type LIKE '%_sell' OR strategy_type LIKE '%sell%')""",
+                            db_path="strategies"
+                        )
+                        
+                        # 전체 (방향성 없는 전략 포함)
+                        global_all_strats = fetch_all(
+                            """SELECT profit, win_rate, trades_count
+                               FROM global_strategies
+                               WHERE profit IS NOT NULL AND trades_count > 0""",
+                            db_path="strategies"
+                        )
+
+                        # 매수 그룹 성능
+                        global_buy_avg_profit = sum(s[0] for s in global_buy_strats) / len(global_buy_strats) if global_buy_strats else 0.0
+                        global_buy_avg_win_rate = sum(s[1] for s in global_buy_strats) / len(global_buy_strats) if global_buy_strats else 0.0
+                        global_buy_score = (global_buy_avg_profit * 0.6 + global_buy_avg_win_rate * 0.4) if global_buy_strats else 0.0
+                        
+                        # 매도 그룹 성능
+                        global_sell_avg_profit = sum(s[0] for s in global_sell_strats) / len(global_sell_strats) if global_sell_strats else 0.0
+                        global_sell_avg_win_rate = sum(s[1] for s in global_sell_strats) / len(global_sell_strats) if global_sell_strats else 0.0
+                        global_sell_score = (global_sell_avg_profit * 0.6 + global_sell_avg_win_rate * 0.4) if global_sell_strats else 0.0
+                        
+                        # 전체 성능 (하위 호환성)
+                        global_avg_profit = sum(s[0] for s in global_all_strats) / len(global_all_strats) if global_all_strats else 0.0
+                        global_avg_win_rate = sum(s[1] for s in global_all_strats) / len(global_all_strats) if global_all_strats else 0.0
+                        global_strategy_count = len(global_all_strats)
+                        global_score = (global_avg_profit * 0.6 + global_avg_win_rate * 0.4) if global_all_strats else 0.0
+
+                        logger.info(f"  📊 글로벌 전략 성능 (전체): profit={global_avg_profit:.4f}, win_rate={global_avg_win_rate:.4f}, count={global_strategy_count}")
+                        if global_buy_strats:
+                            logger.info(f"  📊 글로벌 매수 전략: profit={global_buy_avg_profit:.4f}, win_rate={global_buy_avg_win_rate:.4f}, count={len(global_buy_strats)}")
+                        if global_sell_strats:
+                            logger.info(f"  📊 글로벌 매도 전략: profit={global_sell_avg_profit:.4f}, win_rate={global_sell_avg_win_rate:.4f}, count={len(global_sell_strats)}")
+
+                        # 각 코인별 가중치 계산
+                        for coin in all_coin_strategies.keys():
+                            try:
+                                # 코인 전략 성능 계산
+                                coin_strats = fetch_all(
+                                    """SELECT profit, win_rate, trades_count
+                                       FROM coin_strategies
+                                       WHERE coin = ? AND profit IS NOT NULL AND trades_count > 0""",
+                                    (coin,),
+                                    db_path="strategies"
+                                )
+
+                                if not coin_strats:
+                                    logger.debug(f"  ⚠️ {coin}: 유효한 전략 없음, 기본 가중치 사용")
+                                    continue
+
+                                coin_avg_profit = sum(s[0] for s in coin_strats) / len(coin_strats)
+                                coin_avg_win_rate = sum(s[1] for s in coin_strats) / len(coin_strats)
+                                coin_strategy_count = len(coin_strats)
+                                coin_score = (coin_avg_profit * 0.6 + coin_avg_win_rate * 0.4)
+
+                                # 데이터 품질 점수 계산 (전략 개수 기반)
+                                # 많은 전략 = 높은 품질, 적은 전략 = 낮은 품질
+                                min_required_strategies = 10
+                                data_quality_score = min(1.0, coin_strategy_count / min_required_strategies)
+
+                                # 동적 가중치 계산
+                                # 1. 데이터가 부족하면 글로벌 비중 증가
+                                # 2. 코인 성능이 좋으면 코인 비중 증가
+                                # 3. 글로벌 성능이 좋으면 글로벌 비중 증가
+
+                                base_coin_weight = 0.7
+                                base_global_weight = 0.3
+
+                                # 데이터 품질에 따른 조정 (-0.3 ~ +0.2)
+                                quality_adjustment = (data_quality_score - 0.5) * 0.5  # -0.25 ~ +0.25
+
+                                # 성능 차이에 따른 조정 (-0.2 ~ +0.2)
+                                if global_score > 0:
+                                    performance_ratio = coin_score / global_score if global_score > 0 else 1.0
+                                    performance_adjustment = (performance_ratio - 1.0) * 0.2  # 코인이 더 좋으면 +, 글로벌이 더 좋으면 -
+                                else:
+                                    performance_adjustment = 0.0
+
+                                # 최종 가중치 계산 (0.1 ~ 0.9 범위)
+                                coin_weight = base_coin_weight + quality_adjustment + performance_adjustment
+                                coin_weight = max(0.1, min(0.9, coin_weight))  # 최소 10%, 최대 90%
+                                global_weight = 1.0 - coin_weight
+
+                                # DB에 저장
+                                weights_data = {
+                                    'coin_weight': coin_weight,
+                                    'global_weight': global_weight,
+                                    'coin_score': coin_score,
+                                    'global_score': global_score,
+                                    'data_quality_score': data_quality_score,
+                                    'coin_strategy_count': coin_strategy_count,
+                                    'global_strategy_count': global_strategy_count,
+                                    'coin_avg_profit': coin_avg_profit,
+                                    'global_avg_profit': global_avg_profit,
+                                    'coin_win_rate': coin_avg_win_rate,
+                                    'global_win_rate': global_avg_win_rate
+                                }
+
+                                save_coin_global_weights(coin, weights_data)
+                                logger.info(f"  ✅ {coin}: 가중치 저장 (coin={coin_weight:.2f}, global={global_weight:.2f}, quality={data_quality_score:.2f})")
+
+                            except Exception as coin_err:
+                                logger.warning(f"  ⚠️ {coin} 가중치 계산 실패: {coin_err}")
+                                continue
+
+                        logger.info("✅ 코인 vs 글로벌 전략 동적 가중치 계산 완료")
+                    except Exception as weight_err:
+                        logger.warning(f"⚠️ 동적 가중치 계산 실패 (계속 진행): {weight_err}")
+
+                    # 🔥 글로벌 전략 레짐 라우팅 제거됨 (개별 코인과 동일하게 제거)
+
+                    # 🔥 글로벌 학습 실행 (모든 코인 self-play + 글로벌 분석 결과 활용)
+                    trained_global_model_id = None
+                    try:
+                        from rl_pipeline.hybrid.auto_trainer import auto_train_from_global_strategies
+                        from rl_pipeline.analysis.integrated_analyzer import IntegratedAnalyzer
+                        from rl_pipeline.db.connection_pool import get_optimized_db_connection
+                        import json
+                        
+                        # 모든 코인의 self-play 결과 수집 (DB에서 로드)
+                        all_coin_selfplay = {}
+                        logger.info("📊 모든 코인의 self-play 결과 수집 시작...")
+                        
+                        for coin, intervals in coin_to_intervals.items():
+                            coin_selfplay = {}
+                            
+                            for interval in intervals:
+                                try:
+                                    # selfplay_results 테이블에서 최신 결과 로드
+                                    with get_optimized_db_connection("strategies") as conn:
+                                        cursor = conn.cursor()
+                                        
+                                        # 최신 에피소드의 결과들을 수집하여 cycle_results 재구성
+                                        cursor.execute("""
+                                            SELECT episodes, results, summary, created_at
+                                            FROM selfplay_results
+                                            WHERE coin = ? AND interval = ?
+                                            ORDER BY episodes DESC
+                                            LIMIT 200
+                                        """, (coin, interval))
+
+                                        rows = cursor.fetchall()
+
+                                        if rows:
+                                            cycle_results = []
+                                            episode_map = {}
+
+                                            for row in rows:
+                                                episode_num, results_json, summary_json, created_at = row
+
+                                                try:
+                                                    results = json.loads(results_json) if results_json else {}
+                                                    summary = json.loads(summary_json) if summary_json else {}
+
+                                                    agent_id = results.get('agent_id', 'unknown')
+                                                    performance = results.get('performance', {})
+
+                                                    if episode_num not in episode_map:
+                                                        episode_map[episode_num] = {
+                                                            'episode': episode_num,
+                                                            'results': {},
+                                                            'created_at': created_at
+                                                        }
+
+                                                    # 🔥 trades 배열이 없으면 빈 배열로 초기화 (performance 메트릭으로 학습 가능)
+                                                    if 'trades' not in performance:
+                                                        performance['trades'] = []
+
+                                                    episode_map[episode_num]['results'][agent_id] = performance
+                                                except Exception as parse_err:
+                                                    logger.debug(f"⚠️ {coin}-{interval} 에피소드 {episode_num} 파싱 실패: {parse_err}")
+                                                    continue
+
+                                            cycle_results = list(episode_map.values())
+                                            
+                                            if cycle_results:
+                                                coin_selfplay[interval] = {
+                                                    'status': 'success',
+                                                    'cycle_results': cycle_results,
+                                                    'summary': {
+                                                        'total_episodes': len(cycle_results),
+                                                        'avg_win_rate': 0.0,
+                                                        'avg_total_return': 0.0
+                                                    }
+                                                }
+                                                logger.debug(f"  ✅ {coin}-{interval}: {len(cycle_results)}개 에피소드 로드")
+                                except Exception as e:
+                                    logger.debug(f"  ⚠️ {coin}-{interval} self-play 결과 로드 실패: {e}")
+                                    continue
+                            
+                            if coin_selfplay:
+                                all_coin_selfplay[coin] = coin_selfplay
+                                logger.info(f"  ✅ {coin}: {len(coin_selfplay)}개 인터벌 self-play 결과 수집 완료")
+                        
+                        # 글로벌 분석 결과 생성 (간단한 버전)
+                        # 🔥 실제 전략 데이터 기반으로 글로벌 분석 데이터 계산
+                        global_analysis_data = _calculate_global_analysis_data(all_coin_strategies)
+                        
+                        # 학습 조건 체크
+                        total_episodes = sum(
+                            len(sp_data.get(interval, {}).get('cycle_results', []))
+                            for sp_data in all_coin_selfplay.values()
+                            for interval in sp_data.keys()
+                        )
+                        
+                        if all_coin_selfplay and total_episodes >= 20:
+                            # ENABLE_AUTO_TRAINING 체크
+                            auto_train_enabled = os.getenv('ENABLE_AUTO_TRAINING', 'false').lower() == 'true'
+                            use_hybrid = os.getenv('USE_HYBRID', 'false').lower() == 'true'
+                            
+                            if auto_train_enabled and use_hybrid:
+                                config_path = os.getenv('HYBRID_CONFIG_PATH', '/workspace/rl_pipeline/hybrid/config_hybrid.json')
+                                
+                                logger.info(f"🌍 글로벌 학습 시작 (코인: {list(all_coin_selfplay.keys())}, 총 {total_episodes}개 에피소드)")
+
+                                trained_global_model_id = auto_train_from_global_strategies(
+                                    all_coin_selfplay=all_coin_selfplay,
+                                    all_coin_analysis=global_analysis_data,
+                                    config_path=config_path,
+                                    min_episodes=20,
+                                    session_id=None  # session_id는 선택적
+                                )
+                                
+                                if trained_global_model_id:
+                                    logger.info(f"🌍 글로벌 학습 완료, 모델 ID: {trained_global_model_id}")
+                                else:
+                                    logger.info(f"📊 글로벌 학습 데이터 부족 또는 학습 실패")
+                            else:
+                                if not auto_train_enabled:
+                                    logger.debug(f"📊 글로벌 학습 비활성화 (ENABLE_AUTO_TRAINING=false)")
+                                elif not use_hybrid:
+                                    logger.debug(f"📊 글로벌 학습 비활성화 (USE_HYBRID=false)")
+                        else:
+                            if not all_coin_selfplay:
+                                logger.debug(f"📊 글로벌: self-play 결과 없음, 학습 건너뜀")
+                            elif total_episodes < 20:
+                                logger.debug(f"📊 글로벌: 에피소드 수 부족 ({total_episodes} < 20), 학습 건너뜀")
+                                
+                    except ImportError:
+                        logger.debug("📊 글로벌 학습 모듈 없음 (하이브리드 시스템 미설치)")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 글로벌 학습 중 오류 (계속 진행): {e}")
+                        import traceback
+                        logger.debug(f"글로벌 학습 오류 상세:\n{traceback.format_exc()}")
+                else:
+                    logger.warning("⚠️ 글로벌 전략 생성을 위한 전략 데이터가 없습니다")
+                    
+            except Exception as e:
+                logger.error(f"❌ 글로벌 전략 생성 실패: {e}")
+        
+        # 🌍 통합된 파이프라인 결과 요약
+        if successful_runs > 0:
+            logger.info("\n🌍 통합된 파이프라인 결과 요약...")
+            
+            try:
+                # 파이프라인 성능 요약 생성
+                performance_summary = get_pipeline_performance_summary(days=1)
+                
+                if performance_summary:
+                    logger.info("✅ 파이프라인 성능 요약 완료!")
+                    logger.info(f"📊 총 실행: {performance_summary.get('total_runs', 0)}개")
+                    logger.info(f"📊 성공률: {performance_summary.get('success_rate', 0):.1f}%")
+                    logger.info(f"📊 평균 실행 시간: {performance_summary.get('avg_execution_time', 0):.2f}초")
+                    
+                    # 🆕 글로벌 전략 결과 저장
+                    try:
+                        from rl_pipeline.db.learning_results import save_global_strategy_results
+                        
+                        # 상위 성과자 추출 (성공한 결과에서)
+                        top_performers = []
+                        for r in results:
+                            # 🔥 타입 확인: 딕셔너리가 아니면 건너뛰기
+                            if not isinstance(r, dict):
+                                continue
+                            
+                            if r.get("status") == "success":
+                                top_performers.append({
+                                    'coin': r.get('coin', ''),
+                                    'interval': r.get('interval', ''),
+                                    'score': r.get('elapsed_ms', 0) / 1000.0  # 실행 시간 기반 점수
+                                })
+                        
+                        # 전체 점수 계산
+                        # 🔥 performance_summary 타입 확인
+                        if not isinstance(performance_summary, dict):
+                            logger.warning("⚠️ performance_summary가 딕셔너리가 아닙니다. 기본값 사용")
+                            overall_score = successful_runs / max(total_runs, 1)
+                            overall_confidence = min(1.0, successful_runs / max(total_runs, 1))
+                        else:
+                            overall_score = performance_summary.get('success_rate', 0) / 100.0
+                            overall_confidence = min(1.0, successful_runs / max(total_runs, 1))
+                        
+                        save_global_strategy_results(
+                            overall_score=overall_score,
+                            overall_confidence=overall_confidence,
+                            top_performers=top_performers[:20]  # 상위 20개
+                        )
+                        logger.info("✅ 글로벌 전략 결과 저장 완료")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 글로벌 전략 결과 저장 실패: {e}")
+                else:
+                    logger.warning("⚠️ 파이프라인 성능 요약 실패")
+                
+                logger.info("🎉 통합된 파이프라인 결과 요약 완료!")
+                
+            except Exception as e:
+                logger.error(f"❌ 파이프라인 결과 요약 실패: {e}", exc_info=True)
+        else:
+            logger.warning("⚠️ 성공한 코인이 없어 파이프라인 결과 요약을 건너뜁니다.")
+        
+        # 🧹 데이터베이스 정리
+        try:
+            logger.info("\n🧹 데이터베이스 정리 시작...")
+            try:
+                from rl_pipeline.db.connection_pool import cleanup_all_database_files
+                cleanup_all_database_files()
+            except ImportError:
+                # 간단한 DB 정리 (rl_candles.db는 제외 - 읽기 전용 원천 데이터)
+                logger.info("📊 간단한 DB 정리 수행...")
+                import sqlite3
+                for db_path in [STRATEGIES_DB_PATH]:  # CANDLES_DB_PATH 제외!
+                    try:
+                        conn = sqlite3.connect(db_path)
+                        conn.execute("VACUUM")
+                        conn.close()
+                        logger.info(f"✅ {db_path} 정리 완료")
+                    except Exception as db_e:
+                        logger.warning(f"⚠️ {db_path} 정리 실패: {db_e}")
+            logger.info("✅ 데이터베이스 정리 완료!")
+        except Exception as e:
+            logger.warning(f"⚠️ 데이터베이스 정리 실패: {e}")
+        
+        return {
+            "total_runs": total_runs,
+            "successful_runs": successful_runs,
+            "failed_runs": len(failed_runs),
+            "failed_combinations": failed_runs,
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 메인 실행 실패: {e}")
+        return {"error": f"메인 실행 실패: {e}"}
+
+def generate_global_strategies_only(
+    coin_filter: Optional[List[str]] = None,
+    enable_training: bool = False
+):
+    """
+    글로벌 전략만 독립적으로 생성
+
+    Args:
+        coin_filter: 특정 코인만 필터링 (None이면 모든 코인)
+        enable_training: 글로벌 학습 실행 여부 (기본값: False)
+    """
+    try:
+        _configure_logging()
+        logger.info("🌍 글로벌 전략 생성 실행 시작 (Synthesizer 방식)")
+
+        # 🔥 검증 함수 import
+        from rl_pipeline.pipelines.orchestrator import (
+            validate_global_strategy_pool,
+            validate_global_strategy_patterns,
+            validate_global_strategy_quality
+        )
+
+        # GlobalStrategySynthesizer 사용
+        from rl_pipeline.strategy.global_synthesizer import create_global_synthesizer
+        from rl_pipeline.core.env import config
+        from rl_pipeline.data.candle_loader import get_available_coins_and_intervals
+
+        # 🔥 디버그 세션 생성
+        session_manager = SessionManager()
+        session_id = session_manager.create_session(
+            coins=coin_filter or ["ALL"],
+            intervals=["global"],
+            config={"enable_training": enable_training}
+        )
+        
+        # Synthesizer 초기화
+        db_path = config.STRATEGIES_DB
+        
+        # DB에서 실제 사용 가능한 인터벌 조회 (하드코딩 제거)
+        available_combinations = get_available_coins_and_intervals()
+        intervals = sorted(list({itv for _, itv in available_combinations}))
+        
+        # 사용 가능한 인터벌이 없으면 기본값 사용
+        if not intervals:
+            intervals = config.UNIFIED_INTERVALS
+        
+        seed = 123  # 재현성을 위한 seed
+        
+        synthesizer = create_global_synthesizer(db_path, intervals, seed)
+        
+        # 코인 필터링
+        if coin_filter:
+            logger.info(f"📋 코인 필터: {coin_filter}")
+            coins = coin_filter
+        else:
+            # 사용 가능한 모든 코인 가져오기
+            coin_interval_combinations = get_available_coins_and_intervals()
+            coins = list(set([c for c, _ in coin_interval_combinations]))
+            logger.info(f"📊 발견된 코인: {len(coins)}개")
+        
+        # 7단계 Synthesizer 파이프라인 실행
+        logger.info("📊 1단계: 개별 전략 수집...")
+        # 필터 조건 완화: min_trades=1 (최소 1개 거래), max_dd=1.0 (100% 허용)
+        pool = synthesizer.load_pool(coins=coins, min_trades=1, max_dd=1.0)
+
+        # 🔥 1단계 검증: 전략 풀 검증
+        pool_validation = validate_global_strategy_pool(
+            pool=pool,
+            coins=coins,
+            intervals=intervals,
+            min_strategies_per_interval=10
+        )
+
+        logger.info(f"📊 전략 풀 검증 완료")
+        logger.info(f"   └─ 검증 통과: {pool_validation['valid']}")
+        logger.info(f"   └─ 데이터 품질 점수: {pool_validation.get('quality_score', 0)}/100")
+        logger.info(f"   └─ 총 전략 수: {pool_validation['stats'].get('total_strategies', 0)}개")
+        logger.info(f"   └─ 인터벌 커버리지: {pool_validation['stats'].get('intervals_covered', 0)}/{pool_validation['stats'].get('intervals_expected', 0)}")
+
+        if pool_validation['issues']:
+            logger.error(f"❌ 전략 풀 검증 실패:")
+            for issue in pool_validation['issues']:
+                logger.error(f"   └─ {issue}")
+
+        if pool_validation['warnings']:
+            logger.warning(f"⚠️ 전략 풀 경고:")
+            for warning in pool_validation['warnings']:
+                logger.warning(f"   └─ {warning}")
+
+        # 🔥 디버그 로그 저장
+        try:
+            from rl_pipeline.monitoring.simulation_debugger import SimulationDebugger
+            debugger = SimulationDebugger(session_id=session_id)
+            debugger.log({
+                'event': 'global_strategy_pool_validation',
+                'validation_result': {
+                    'valid': pool_validation['valid'],
+                    'quality_score': pool_validation.get('quality_score', 0),
+                    'total_strategies': pool_validation['stats'].get('total_strategies', 0),
+                    'intervals_covered': pool_validation['stats'].get('intervals_covered', 0),
+                    'num_issues': len(pool_validation['issues']),
+                    'num_warnings': len(pool_validation['warnings'])
+                },
+                'issues': pool_validation['issues'],
+                'warnings': pool_validation['warnings']
+            })
+        except Exception as debug_error:
+            logger.debug(f"⚠️ 검증 결과 디버그 로깅 실패: {debug_error}")
+
+        if not pool:
+            logger.warning("⚠️ 수집된 개별 전략 없음, 폴백만 생성")
+            final = synthesizer.apply_fallbacks({})
+            synthesizer.save(final)
+
+            # 🔥 세션 종료
+            session_manager.end_session(session_id, summary={
+                'status': 'fallback_only',
+                'strategies_generated': sum(len(s) for s in final.values())
+            })
+
+            return {"success": True, "count": sum(len(s) for s in final.values())}
+
+        logger.info("📊 2단계: 전략 표준화...")
+        std_pool = synthesizer.standardize(pool)
+
+        logger.info("📊 3단계: 공통 패턴 추출...")
+        patterns = synthesizer.extract_common_patterns(std_pool)
+
+        # 🔥 3단계 검증: 패턴 검증
+        pattern_validation = validate_global_strategy_patterns(
+            patterns=patterns,
+            min_patterns_per_interval=3
+        )
+
+        logger.info(f"📊 패턴 추출 검증 완료")
+        logger.info(f"   └─ 검증 통과: {pattern_validation['valid']}")
+        logger.info(f"   └─ 품질 점수: {pattern_validation.get('quality_score', 0)}/100")
+        logger.info(f"   └─ 총 패턴 수: {pattern_validation['stats'].get('total_patterns', 0)}개")
+
+        if pattern_validation['issues']:
+            logger.error(f"❌ 패턴 검증 실패:")
+            for issue in pattern_validation['issues']:
+                logger.error(f"   └─ {issue}")
+
+        if pattern_validation['warnings']:
+            logger.warning(f"⚠️ 패턴 경고:")
+            for warning in pattern_validation['warnings']:
+                logger.warning(f"   └─ {warning}")
+
+        # 🔥 디버그 로그 저장
+        try:
+            debugger.log({
+                'event': 'global_strategy_pattern_validation',
+                'validation_result': {
+                    'valid': pattern_validation['valid'],
+                    'quality_score': pattern_validation.get('quality_score', 0),
+                    'total_patterns': pattern_validation['stats'].get('total_patterns', 0),
+                    'num_issues': len(pattern_validation['issues']),
+                    'num_warnings': len(pattern_validation['warnings'])
+                },
+                'issues': pattern_validation['issues'],
+                'warnings': pattern_validation['warnings']
+            })
+        except Exception as debug_error:
+            logger.debug(f"⚠️ 패턴 검증 결과 디버그 로깅 실패: {debug_error}")
+        
+        logger.info("📊 4단계: 글로벌 전략 조립...")
+        assembled = synthesizer.assemble_global_strategies(patterns)
+        
+        logger.info("📊 5단계: 빠른 샌티백테스트...")
+        tested = synthesizer.quick_sanity_backtest(assembled)
+        
+        logger.info("📊 6단계: 폴백 적용...")
+        final = synthesizer.apply_fallbacks(tested)
+
+        # 🔥 7단계 전: 최종 품질 검증
+        final_validation = validate_global_strategy_quality(
+            final_strategies=final,
+            intervals=intervals,
+            min_strategies_per_interval=5
+        )
+
+        logger.info(f"📊 최종 글로벌 전략 품질 검증 완료")
+        logger.info(f"   └─ 검증 통과: {final_validation['valid']}")
+        logger.info(f"   └─ 품질 점수: {final_validation.get('quality_score', 0)}/100")
+        logger.info(f"   └─ 총 전략 수: {final_validation['stats'].get('total_strategies', 0)}개")
+        logger.info(f"   └─ 인터벌당 평균: {final_validation['stats'].get('avg_strategies_per_interval', 0)}개")
+
+        if final_validation['issues']:
+            logger.error(f"❌ 최종 품질 검증 실패:")
+            for issue in final_validation['issues']:
+                logger.error(f"   └─ {issue}")
+
+        if final_validation['warnings']:
+            logger.warning(f"⚠️ 최종 품질 경고:")
+            for warning in final_validation['warnings']:
+                logger.warning(f"   └─ {warning}")
+
+        # 🔥 인터벌별 상세 통계 로깅
+        interval_dist = final_validation['stats'].get('interval_distribution', {})
+        if interval_dist:
+            logger.info(f"📊 인터벌별 최종 전략 통계:")
+            for interval, stat in interval_dist.items():
+                logger.info(f"   └─ {interval}: {stat['strategy_count']}개 전략")
+
+        # 🔥 디버그 로그 저장
+        try:
+            debugger.log({
+                'event': 'global_strategy_quality_validation',
+                'validation_result': {
+                    'valid': final_validation['valid'],
+                    'quality_score': final_validation.get('quality_score', 0),
+                    'total_strategies': final_validation['stats'].get('total_strategies', 0),
+                    'avg_strategies_per_interval': final_validation['stats'].get('avg_strategies_per_interval', 0),
+                    'num_issues': len(final_validation['issues']),
+                    'num_warnings': len(final_validation['warnings'])
+                },
+                'issues': final_validation['issues'],
+                'warnings': final_validation['warnings'],
+                'interval_distribution': interval_dist
+            })
+        except Exception as debug_error:
+            logger.debug(f"⚠️ 최종 검증 결과 디버그 로깅 실패: {debug_error}")
+
+        logger.info("📊 7단계: 글로벌 전략 저장...")
+        synthesizer.save(final)
+
+        total_strategies = sum(len(strategies) for strategies in final.values())
+        logger.info(f"✅ 글로벌 전략 생성 완료: {total_strategies}개")
+
+        # 🔥 세션 종료
+        session_manager.end_session(session_id, summary={
+            'status': 'success',
+            'strategies_generated': total_strategies,
+            'pool_quality_score': pool_validation.get('quality_score', 0),
+            'pattern_quality_score': pattern_validation.get('quality_score', 0),
+            'final_quality_score': final_validation.get('quality_score', 0),
+            'overall_quality': round((
+                pool_validation.get('quality_score', 0) +
+                pattern_validation.get('quality_score', 0) +
+                final_validation.get('quality_score', 0)
+            ) / 3, 2)
+        })
+        
+        result = {
+            "success": True,
+            "count": total_strategies,
+            "details": {
+                "intervals": list(final.keys()),
+                "strategies_per_interval": {k: len(v) for k, v in final.items()}
+            }
+        }
+        
+        # 🔥 글로벌 학습 실행 (옵션)
+        if enable_training:
+            logger.info("🚀 글로벌 학습 실행 중...")
+            trained_model_id = None
+            
+            try:
+                from rl_pipeline.hybrid.auto_trainer import (
+                    auto_train_from_global_strategies
+                )
+                
+                # 모든 코인의 self-play 결과 수집
+                all_coin_selfplay = {}
+                coin_to_intervals = {coin: intervals for coin in coins}
+                
+                for coin, interval_list in coin_to_intervals.items():
+                    coin_selfplay = {}
+                    
+                    for interval in interval_list:
+                        try:
+                            # selfplay_results 테이블에서 최신 결과 로드
+                            with get_optimized_db_connection("strategies") as conn:
+                                cursor = conn.cursor()
+                                
+                                cursor.execute("""
+                                    SELECT episodes, results, summary, created_at
+                                    FROM selfplay_results
+                                    WHERE coin = ? AND interval = ?
+                                    ORDER BY episodes DESC
+                                    LIMIT 200
+                                """, (coin, interval))
+                                
+                                rows = cursor.fetchall()
+                                
+                                if rows:
+                                    cycle_results = []
+                                    episode_map = {}
+                                    
+                                    for row in rows:
+                                        episode_num, results_json, summary_json, created_at = row
+                                        
+                                        try:
+                                            results = json.loads(results_json) if results_json else {}
+                                            summary = json.loads(summary_json) if summary_json else {}
+                                            
+                                            agent_id = results.get('agent_id', 'unknown')
+                                            performance = results.get('performance', {})
+                                            
+                                            if episode_num not in episode_map:
+                                                episode_map[episode_num] = {
+                                                    'episode': episode_num,
+                                                    'results': {},
+                                                    'created_at': created_at
+                                                }
+                                            
+                                            episode_map[episode_num]['results'][agent_id] = performance
+                                        except Exception as parse_err:
+                                            logger.debug(f"⚠️ {coin}-{interval} 에피소드 {episode_num} 파싱 실패: {parse_err}")
+                                            continue
+                                    
+                                    cycle_results = list(episode_map.values())
+                                    
+                                    if cycle_results:
+                                        coin_selfplay[interval] = {
+                                            'status': 'success',
+                                            'cycle_results': cycle_results,
+                                            'summary': {
+                                                'total_episodes': len(cycle_results),
+                                                'avg_win_rate': 0.0,
+                                                'avg_total_return': 0.0
+                                            }
+                                        }
+                        except Exception as e:
+                            logger.debug(f"  ⚠️ {coin}-{interval} self-play 결과 로드 실패: {e}")
+                            continue
+                    
+                    if coin_selfplay:
+                        all_coin_selfplay[coin] = coin_selfplay
+                
+                # 글로벌 분석 결과 생성 (전략 성과 기반)
+                global_analysis_data = {
+                    'fractal_score': 0.5,
+                    'multi_timeframe_score': 0.5,
+                    'indicator_cross_score': 0.5,
+                    'ensemble_score': 0.5,
+                    'ensemble_confidence': 0.5
+                }
+                
+                # 전략 성과 기반으로 글로벌 점수 추정
+                if pool:
+                    total_profit = 0.0
+                    total_count = 0
+                    
+                    for interval_strategies in pool.values():
+                        for strategy in interval_strategies:
+                            if isinstance(strategy, dict) or hasattr(strategy, 'profit') or (hasattr(strategy, 'params') and isinstance(strategy.params, dict)):
+                                profit = _get_value(strategy, 'profit', 0.0) / 10000.0  # 퍼센트 변환
+                                total_profit += profit
+                                total_count += 1
+                    
+                    if total_count > 0:
+                        avg_profit = total_profit / total_count
+                        global_analysis_data['ensemble_score'] = min(1.0, max(0.0, 0.5 + avg_profit * 2.0))
+                        global_analysis_data['ensemble_confidence'] = min(1.0, max(0.0, total_count / 100.0))
+                
+                # 학습 조건 체크
+                total_episodes = sum(
+                    len(sp_data.get(interval, {}).get('cycle_results', []))
+                    for sp_data in all_coin_selfplay.values()
+                    for interval in sp_data.keys()
+                )
+                
+                if all_coin_selfplay and total_episodes >= 20:
+                    auto_train_enabled = os.getenv('ENABLE_AUTO_TRAINING', 'false').lower() == 'true'
+                    use_hybrid = os.getenv('USE_HYBRID', 'false').lower() == 'true'
+                    
+                    if auto_train_enabled and use_hybrid:
+                        config_path = os.getenv('HYBRID_CONFIG_PATH', '/workspace/rl_pipeline/hybrid/config_hybrid.json')
+                        
+                        logger.info(f"🌍 글로벌 학습 시작 (코인: {list(all_coin_selfplay.keys())}, 총 {total_episodes}개 에피소드)")
+
+                        trained_model_id = auto_train_from_global_strategies(
+                            all_coin_selfplay=all_coin_selfplay,
+                            all_coin_analysis=global_analysis_data,
+                            config_path=config_path,
+                            min_episodes=20,
+                            session_id=None  # session_id는 선택적
+                        )
+                        
+                        if trained_model_id:
+                            logger.info(f"🌍 글로벌 학습 완료, 모델 ID: {trained_model_id}")
+                            result["trained_model_id"] = trained_model_id
+                        else:
+                            logger.info(f"📊 글로벌 학습 데이터 부족 또는 학습 실패")
+                    else:
+                        if not auto_train_enabled:
+                            logger.debug(f"📊 글로벌 학습 비활성화 (ENABLE_AUTO_TRAINING=false)")
+                        elif not use_hybrid:
+                            logger.debug(f"📊 글로벌 학습 비활성화 (USE_HYBRID=false)")
+                else:
+                    if not all_coin_selfplay:
+                        logger.debug(f"📊 글로벌: self-play 결과 없음, 학습 건너뜀")
+                    elif total_episodes < 20:
+                        logger.debug(f"📊 글로벌: 에피소드 수 부족 ({total_episodes} < 20), 학습 건너뜀")
+                        
+            except ImportError:
+                logger.debug("📊 글로벌 학습 모듈 없음 (하이브리드 시스템 미설치)")
+            except Exception as e:
+                logger.warning(f"⚠️ 글로벌 학습 중 오류 (계속 진행): {e}")
+                import traceback
+                logger.debug(f"글로벌 학습 오류 상세:\n{traceback.format_exc()}")
+        
+        return result
+            
+    except Exception as e:
+        logger.error(f"❌ 글로벌 전략 생성 실패: {e}")
+        return {"success": False, "error": str(e)}
+
+if __name__ == "__main__":
+    import argparse
+    
+    # Argument parser 설정
+    parser = argparse.ArgumentParser(description='Absolute Zero System')
+    parser.add_argument('--global-only', action='store_true', 
+                        help='글로벌 전략만 생성 (self-play 결과 기반)')
+    parser.add_argument('--coins', nargs='+', default=None,
+                        help='특정 코인만 필터링 (예: --coins BTC ETH)')
+    args = parser.parse_args()
+    
+    # 로깅 설정 (간결한 형식)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
+    
+    # --global-only 플래그 확인
+    if args.global_only:
+        logger.info("🌍 글로벌 전략 생성 모드")
+        result = generate_global_strategies_only(coin_filter=args.coins)
+        
+        if result.get("success"):
+            logger.info(f"✅ 글로벌 전략 생성 완료: {result.get('count', 0)}개")
+            sys.exit(0)
+        else:
+            logger.error(f"❌ 글로벌 전략 생성 실패: {result.get('reason', 'unknown')}")
+            sys.exit(1)
+    else:
+        # 메인 실행 (전체 self-play 포함)
+        result = main()
+        
+        if "error" in result:
+            logger.error(f"❌ 실행 실패: {result['error']}")
+            sys.exit(1)
+        else:
+            logger.info(f"✅ 실행 완료: {result['successful_runs']}/{result['total_runs']} 성공")
+            sys.exit(0)
