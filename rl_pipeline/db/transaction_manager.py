@@ -49,7 +49,7 @@ class EvolutionTransactionManager:
         진화된 전략을 원자적으로 저장
         
         Args:
-            strategy: 전략 정보 (coin_strategies에 저장)
+            strategy: 전략 정보 (strategies에 저장)
             segment: 세그먼트 결과 (segment_scores에 저장)
             lineage: 계보 정보 (strategy_lineage에 저장)
         
@@ -60,7 +60,7 @@ class EvolutionTransactionManager:
             with self.transaction() as conn:
                 cursor = conn.cursor()
                 
-                # 1. coin_strategies 업데이트/삽입
+                # 1. strategies 업데이트/삽입
                 self._update_coin_strategy(cursor, strategy)
                 
                 # 2. segment_scores 삽입
@@ -110,7 +110,7 @@ class EvolutionTransactionManager:
             return 0
     
     def _update_coin_strategy(self, cursor, strategy: Dict[str, Any]):
-        """coin_strategies 테이블 업데이트/삽입"""
+        """strategies 테이블 업데이트/삽입"""
         try:
             import json
             from datetime import datetime
@@ -127,7 +127,7 @@ class EvolutionTransactionManager:
             
             # INSERT OR REPLACE
             cursor.execute("""
-                INSERT OR REPLACE INTO coin_strategies (
+                INSERT OR REPLACE INTO strategies (
                     id, coin, interval, parent_id, version,
                     strategy_type, strategy_conditions,
                     regime,
@@ -157,7 +157,7 @@ class EvolutionTransactionManager:
             ))
             
         except Exception as e:
-            logger.error(f"❌ coin_strategies 업데이트 실패: {e}")
+            logger.error(f"❌ strategies 업데이트 실패: {e}")
             raise
     
     def _insert_segment_score(self, cursor, segment: Dict[str, Any]):

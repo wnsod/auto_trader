@@ -23,7 +23,7 @@ class PipelineResult:
     status: str = "pending"
     created_at: str = ""
     selfplay_result: Optional[Dict[str, Any]] = None  # self-play 결과 저장
-    coin_strategies: Optional[List[Dict]] = None  # 코인별 전략
+    strategies: Optional[List[Dict]] = None  # 코인별 전략
     coin_analysis: Optional[Dict] = None  # 코인별 분석 결과
     regime_routing: Optional[Dict] = None  # 레짐 라우팅 결과
     error_message: Optional[str] = None  # 에러 메시지

@@ -91,3 +91,27 @@ class OptimizedCache:
             'size': len(self.cache)
         }
 
+    def __contains__(self, key: str) -> bool:
+        """캐시에 키가 있는지 확인 (in 연산자 지원)"""
+        with self.lock:
+            return key in self.cache
+
+    def __delitem__(self, key: str) -> None:
+        """캐시에서 항목 삭제 (del 연산자 지원)"""
+        with self.lock:
+            if key in self.cache:
+                del self.cache[key]
+            if key in self.timestamps:
+                del self.timestamps[key]
+
+    def items(self):
+        """캐시 항목 반환 (타임스탬프 포함)"""
+        with self.lock:
+            return [(k, (v, self.timestamps.get(k, 0))) for k, v in self.cache.items()]
+
+    def clear(self) -> None:
+        """캐시 전체 삭제"""
+        with self.lock:
+            self.cache.clear()
+            self.timestamps.clear()
+

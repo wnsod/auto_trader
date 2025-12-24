@@ -22,7 +22,7 @@ from rl_pipeline.strategy.rollback_manager import StrategyRollbackManager
 from rl_pipeline.monitoring.evolution_logger import EvolutionLogger
 from rl_pipeline.simulation.risk_controller import RiskController
 from rl_pipeline.simulation.overfitting_prevention import OverfittingPrevention
-from rl_pipeline.db.schema import create_coin_strategies_table
+from rl_pipeline.db.schema import create_strategies_table
 
 logging.basicConfig(level=logging.WARNING)  # 경고만 출력
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ def test_rollback_manager():
     """롤백 관리자 테스트"""
     print("\n[테스트 2] 롤백 관리자")
     try:
-        create_coin_strategies_table()
+        create_strategies_table()
         
         manager = StrategyRollbackManager()
         print("  ✅ StrategyRollbackManager 생성 성공")

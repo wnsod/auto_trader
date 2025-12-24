@@ -29,6 +29,15 @@ except ImportError:
     DEBUG_AVAILABLE = False
     SimulationDebugger = None
 
+# 🔥 인터벌 프로필 import (보상 계산용)
+try:
+    from rl_pipeline.core.interval_profiles import calculate_reward
+    INTERVAL_PROFILES_AVAILABLE = True
+except ImportError:
+    logger.debug("interval_profiles 모듈을 찾을 수 없습니다. 기본 보상 계산 사용")
+    INTERVAL_PROFILES_AVAILABLE = False
+    calculate_reward = None
+
 # 🔧 TensorFlow 경고 억제 (JAX가 TensorFlow 없이도 작동 가능)
 # 환경 변수로 TensorFlow 로깅 완전 억제
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -423,10 +432,44 @@ class SelfPlaySimulator:
                 # 캔들 데이터를 MarketState로 변환
                 market_state = self._convert_candle_to_market_state(row)
                 
+                # 🔥 MFE/MAE 계산용 고가/저가 추출
+                current_high = row.get('high', market_state.price)
+                current_low = row.get('low', market_state.price)
+                
                 # 각 에이전트의 행동 결정 및 실행
                 for agent in agents:
+                    # 1. 보유 중인 포지션의 고가/저가 갱신 (MFE/MAE 추적)
+                    if agent.state.position is not None:
+                        if 'max_price' not in agent.state.position:
+                            agent.state.position['max_price'] = agent.state.position['entry_price']
+                        if 'min_price' not in agent.state.position:
+                            agent.state.position['min_price'] = agent.state.position['entry_price']
+                        
+                        agent.state.position['max_price'] = max(agent.state.position['max_price'], current_high)
+                        agent.state.position['min_price'] = min(agent.state.position['min_price'], current_low)
+                    
+                    # 청산 전 상태 백업
+                    position_stats = {}
+                    if agent.state.position is not None:
+                        position_stats = {
+                            'max_price': agent.state.position.get('max_price', agent.state.position['entry_price']),
+                            'min_price': agent.state.position.get('min_price', agent.state.position['entry_price']),
+                            'entry_price': agent.state.position['entry_price']
+                        }
+
                     action = agent.decide_action(market_state)
                     trade_result = agent.execute_action(action, market_state)
+
+                    # 2. 청산 시 MFE/MAE 기록
+                    if action == Action.SELL and trade_result.get("type") == "SELL" and position_stats:
+                        entry_price = position_stats['entry_price']
+                        if entry_price > 0:
+                            mfe_pct = ((position_stats['max_price'] - entry_price) / entry_price) * 100
+                            mae_pct = ((position_stats['min_price'] - entry_price) / entry_price) * 100
+                            
+                            if agent.state.trades:
+                                agent.state.trades[-1]['mfe_pct'] = mfe_pct
+                                agent.state.trades[-1]['mae_pct'] = mae_pct
         else:
             # 가상 데이터 생성 (기존 방식)
             # 7단계 레짐 랜덤 설정
@@ -566,9 +609,44 @@ class SelfPlaySimulator:
                     actual_steps = min(precise_steps, len(candle_data))
                     for idx, (_, row) in enumerate(candle_data.head(actual_steps).iterrows()):
                         market_state = self._convert_candle_to_market_state(row)
+                        
+                        # 🔥 MFE/MAE 계산용 고가/저가 추출
+                        current_high = row.get('high', market_state.price)
+                        current_low = row.get('low', market_state.price)
+                        
+                        # 1. 보유 중인 포지션의 고가/저가 갱신 (MFE/MAE 추적)
+                        if agent.state.position is not None:
+                            if 'max_price' not in agent.state.position:
+                                agent.state.position['max_price'] = agent.state.position['entry_price']
+                            if 'min_price' not in agent.state.position:
+                                agent.state.position['min_price'] = agent.state.position['entry_price']
+                            
+                            agent.state.position['max_price'] = max(agent.state.position['max_price'], current_high)
+                            agent.state.position['min_price'] = min(agent.state.position['min_price'], current_low)
+                        
+                        # 청산 전 상태 백업
+                        position_stats = {}
+                        if agent.state.position is not None:
+                            position_stats = {
+                                'max_price': agent.state.position.get('max_price', agent.state.position['entry_price']),
+                                'min_price': agent.state.position.get('min_price', agent.state.position['entry_price']),
+                                'entry_price': agent.state.position['entry_price']
+                            }
+
                         action = agent.decide_action(market_state)
                         trade_result = agent.execute_action(action, market_state)
                         last_market_state = market_state  # 마지막 상태 저장
+                        
+                        # 2. 청산 시 MFE/MAE 기록
+                        if action == Action.SELL and trade_result.get("type") == "SELL" and position_stats:
+                            entry_price = position_stats['entry_price']
+                            if entry_price > 0:
+                                mfe_pct = ((position_stats['max_price'] - entry_price) / entry_price) * 100
+                                mae_pct = ((position_stats['min_price'] - entry_price) / entry_price) * 100
+                                
+                                if agent.state.trades:
+                                    agent.state.trades[-1]['mfe_pct'] = mfe_pct
+                                    agent.state.trades[-1]['mae_pct'] = mae_pct
                 else:
                     # 가상 데이터 생성 (기존 방식)
                     for step in range(precise_steps):
@@ -910,9 +988,12 @@ class SelfPlaySimulator:
             avg_pnl_per_trade = total_pnl / total_trades if total_trades > 0 else 0
             max_drawdown = abs(random.uniform(0.01, 0.10))
             
-            # 📊 샤프 비율 계산 (수익률 기반, 정규화)
+            # 📊 Calmar Ratio 계산 (수익률 / MDD, Sharpe 대신 사용)
             return_rate = total_pnl / 10000.0  # 수익률 (소수점)
-            sharpe_ratio = (return_rate / max_drawdown) if max_drawdown > 0 else 0
+            # Calmar ratio: 연환산 수익률 / MDD (보수적 평가)
+            calmar_ratio = (return_rate / max_drawdown) if max_drawdown > 0 else 0
+            # Sharpe ratio는 거래별 수익률의 표준편차가 필요하므로 간단히 추정
+            sharpe_ratio = calmar_ratio * 0.5  # Calmar의 약 50% 수준으로 보수적 추정
             
             performance = {
                 "total_trades": total_trades,
@@ -1033,9 +1114,12 @@ class SelfPlaySimulator:
             avg_pnl_per_trade = total_pnl / total_trades if total_trades > 0 else 0
             max_drawdown = abs(random.uniform(0.01, 0.10))
             
-            # 📊 샤프 비율 계산 (수익률 기반, 정규화)
+            # 📊 Calmar Ratio 계산 (수익률 / MDD, Sharpe 대신 사용)
             return_rate = total_pnl / 10000.0  # 수익률 (소수점)
-            sharpe_ratio = (return_rate / max_drawdown) if max_drawdown > 0 else 0
+            # Calmar ratio: 연환산 수익률 / MDD (보수적 평가)
+            calmar_ratio = (return_rate / max_drawdown) if max_drawdown > 0 else 0
+            # Sharpe ratio는 거래별 수익률의 표준편차가 필요하므로 간단히 추정
+            sharpe_ratio = calmar_ratio * 0.5  # Calmar의 약 50% 수준으로 보수적 추정
             
             performance = {
                 "total_trades": total_trades,
@@ -1152,11 +1236,40 @@ class SelfPlaySimulator:
             
             # 최종 분류
             if buy_score > sell_score and buy_score > 0.3:
-                return 'buy'
+                preliminary_direction = 'buy'
             elif sell_score > buy_score and sell_score > 0.3:
-                return 'sell'
+                preliminary_direction = 'sell'
             else:
-                return 'neutral'
+                preliminary_direction = 'neutral'
+            
+            # 🔥 MFE/MAE 기반 방향성 검증 (근본적 개선)
+            strategy_id = strategy.get('id', '')
+            if preliminary_direction != 'neutral' and strategy_id:
+                try:
+                    from rl_pipeline.core.strategy_grading import (
+                        get_strategy_mfe_stats, MFEGrading
+                    )
+                    
+                    mfe_stats = get_strategy_mfe_stats(strategy_id)
+                    if mfe_stats and mfe_stats.coverage_n >= 20:
+                        entry_score, risk_score, edge_score = MFEGrading.calculate_scores(mfe_stats)
+                        
+                        # EntryScore가 음수면 방향 무효
+                        if not MFEGrading.validate_direction_by_mfe(entry_score, min_entry_score=0.0):
+                            logger.debug(f"🚫 {strategy_id}: 방향 무효화 (EntryScore={entry_score:.4f} < 0)")
+                            return 'neutral'
+                        
+                        # 신뢰도가 너무 낮으면 neutral
+                        confidence = MFEGrading.get_directional_confidence(entry_score, edge_score)
+                        if confidence < 0.2:
+                            logger.debug(f"🚫 {strategy_id}: 신뢰도 부족 (confidence={confidence:.3f})")
+                            return 'neutral'
+                            
+                except Exception as mfe_err:
+                    logger.debug(f"⚠️ MFE 검증 스킵 ({strategy_id}): {mfe_err}")
+            
+            return preliminary_direction
+            
         except Exception as e:
             logger.debug(f"⚠️ 전략 방향 분류 실패: {e}")
             return 'neutral'
@@ -1523,14 +1636,53 @@ class SelfPlaySimulator:
                             
                             # t_hit: 평균 거래 수로 추정 (정확한 값은 알 수 없음)
                             t_hit = perf.get('total_trades', 0)
-                            
+
+                            # 🔥 인터벌별 맞춤 보상 계산
+                            if INTERVAL_PROFILES_AVAILABLE and calculate_reward and interval:
+                                try:
+                                    # 예측과 실제 결과 준비
+                                    prediction = {
+                                        'direction': 1 if perf.get('win_rate', 0.5) > 0.5 else -1,
+                                        'return': perf.get('total_pnl', 0.0) / 100.0,
+                                        'regime': 'bull' if perf.get('total_pnl', 0) > 0 else 'bear',
+                                        'swing': 'up' if perf.get('total_pnl', 0) > 0 else 'down',
+                                        'trend': 'continuation',
+                                        'entry_quality': 'good' if perf.get('win_rate', 0.5) > 0.6 else 'neutral',
+                                        'r_multiple': abs(perf.get('total_pnl', 0.0) / 100.0),
+                                        'stop_hit': perf.get('win_rate', 0.5) < 0.4,
+                                    }
+
+                                    actual = {
+                                        'direction': 1 if realized_ret_signed > 0 else -1,
+                                        'return': realized_ret_signed,
+                                        'regime': 'bull' if realized_ret_signed > 0.05 else ('bear' if realized_ret_signed < -0.05 else 'range'),
+                                        'swing': 'up' if realized_ret_signed > 0 else 'down',
+                                        'trend': 'continuation' if perf.get('win_rate', 0.5) > 0.5 else 'reversal',
+                                        'entry_quality': 'excellent' if realized_ret_signed > 0.03 else 'good',
+                                        'r_multiple': abs(realized_ret_signed),
+                                        'stop_hit': realized_ret_signed < -0.02,
+                                    }
+
+                                    # interval_profiles의 calculate_reward 사용
+                                    total_reward = calculate_reward(interval, prediction, actual)
+                                    logger.debug(f"🔥 {interval} 인터벌 맞춤 보상 사용: {total_reward:.3f}")
+                                except (ValueError, TypeError) as e:
+                                    logger.debug(f"interval_profiles 보상 계산 실패 (입력 데이터 오류), 기본값 사용: {e}")
+                                    total_reward = perf.get('total_pnl', 0.0) / 100.0
+                                except Exception as e:
+                                    logger.warning(f"interval_profiles 보상 계산 중 예상치 못한 오류: {e}", exc_info=True)
+                                    total_reward = perf.get('total_pnl', 0.0) / 100.0
+                            else:
+                                # 기본 보상 계산
+                                total_reward = perf.get('total_pnl', 0.0) / 100.0
+
                             save_episode_summary(
                                 episode_id=episode_id,
                                 ts_exit=int(datetime.now().timestamp()),
                                 first_event=first_event,
                                 t_hit=t_hit,
                                 realized_ret_signed=realized_ret_signed,
-                                total_reward=perf.get('total_pnl', 0.0) / 100.0,  # 보상은 간단히 수익률로 설정
+                                total_reward=total_reward,  # 🔥 계산된 보상 사용
                                 acc_flag=0 if acc_flag is None else acc_flag,  # None이면 0으로 설정
                                 coin=coin,
                                 interval=interval,
@@ -1612,8 +1764,9 @@ class SelfPlaySimulator:
                     if not performances:
                         continue
                     
-                    avg_win_rate = np.mean([p.get("win_rate", 0) for p in performances])
-                    avg_pnl = np.mean([p.get("total_pnl", 0) for p in performances])
+                    # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+                    avg_win_rate = np.median([p.get("win_rate", 0) for p in performances])
+                    avg_pnl = np.median([p.get("total_pnl", 0) for p in performances])
                     
                     # 레짐별 성과가 나쁜 경우 파라미터 조정
                     if avg_win_rate < 0.4 or avg_pnl < 0:
@@ -1678,9 +1831,10 @@ class SelfPlaySimulator:
             
             # 전체 통계
             total_trades = sum(p.get("total_trades", 0) for p in all_performances)
-            avg_win_rate = np.mean([p.get("win_rate", 0) for p in all_performances])
-            avg_pnl = np.mean([p.get("total_pnl", 0) for p in all_performances])
-            avg_sharpe = np.mean([p.get("sharpe_ratio", 0) for p in all_performances])
+            # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+            avg_win_rate = np.median([p.get("win_rate", 0) for p in all_performances])
+            avg_pnl = np.median([p.get("total_pnl", 0) for p in all_performances])
+            avg_sharpe = np.median([p.get("sharpe_ratio", 0) for p in all_performances])
 
             # 🔥 최고 성과 에이전트 찾기
             best_agent_pnl = max([p.get("total_pnl", 0) for p in all_performances]) if all_performances else 0.0
@@ -1690,9 +1844,9 @@ class SelfPlaySimulator:
             for regime_label, performances in regime_performance.items():
                 if performances:
                     regime_stats[regime_label] = {
-                        "avg_win_rate": np.mean([p.get("win_rate", 0) for p in performances]),
-                        "avg_pnl": np.mean([p.get("total_pnl", 0) for p in performances]),
-                        "avg_sharpe_ratio": np.mean([p.get("sharpe_ratio", 0) for p in performances]),
+                        "avg_win_rate": np.median([p.get("win_rate", 0) for p in performances]),
+                        "avg_pnl": np.median([p.get("total_pnl", 0) for p in performances]),
+                        "avg_sharpe_ratio": np.median([p.get("sharpe_ratio", 0) for p in performances]),
                         "episode_count": len(performances),
                         "total_trades": sum(p.get("total_trades", 0) for p in performances)
                     }

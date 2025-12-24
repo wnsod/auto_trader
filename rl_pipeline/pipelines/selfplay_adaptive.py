@@ -31,44 +31,89 @@ def calculate_strategy_maturity(coin: str, interval: str) -> Dict[str, Any]:
         }
     """
     try:
-        with get_optimized_db_connection("strategies") as conn:
+        from rl_pipeline.db.connection_pool import get_optimized_db_connection
+        from rl_pipeline.core.env import config
+        from rl_pipeline.core.utils import table_exists
+        
+        # 🔥 코인별 DB 경로 사용
+        db_path = config.get_strategy_db_path(coin)
+        
+        with get_optimized_db_connection(db_path) as conn:
             cursor = conn.cursor()
             
             # 1. 전략 수 조회
-            cursor.execute("""
-                SELECT COUNT(*) as count
-                FROM coin_strategies
-                WHERE coin = ? AND interval = ?
-            """, (coin, interval))
-            strategy_count = cursor.fetchone()[0]
+            # 🔥 스키마 변경: strategies -> strategies, coin -> symbol
+            strategy_count = 0
+            if table_exists(cursor, "strategies"):
+                cursor.execute("""
+                    SELECT COUNT(*) as count
+                    FROM strategies
+                    WHERE symbol = ? AND interval = ?
+                """, (coin, interval))
+                strategy_count = cursor.fetchone()[0]
+            elif table_exists(cursor, "strategies"):
+                # 하위 호환성
+                cursor.execute("""
+                    SELECT COUNT(*) as count
+                    FROM strategies
+                    WHERE symbol = ? AND interval = ?
+                """, (coin, interval))
+                strategy_count = cursor.fetchone()[0]
+            
+            if strategy_count == 0:
+                return {
+                    'stage': 'initial',
+                    'strategy_count': 0,
+                    'quality_rate': 0.0,
+                    'prediction_accuracy': 0.5,
+                    'maturity_score': 0.0,
+                    'recommended_ratio': 0.2,
+                    'avg_win_rate': 0.0,
+                    'avg_profit': 0.0
+                }
             
             # 2. 품질 분포 조회
-            cursor.execute("""
-                SELECT 
-                    COUNT(*) as total,
-                    SUM(CASE WHEN quality_grade IN ('S', 'A') THEN 1 ELSE 0 END) as high_grade,
-                    AVG(win_rate) as avg_win_rate,
-                    AVG(profit) as avg_profit
-                FROM coin_strategies
-                WHERE coin = ? AND interval = ?
-            """, (coin, interval))
+            if table_exists(cursor, "strategies"):
+                cursor.execute("""
+                    SELECT 
+                        SUM(CASE WHEN quality_grade IN ('S', 'A') THEN 1 ELSE 0 END) as high_grade,
+                        AVG(win_rate) as avg_win_rate,
+                        AVG(profit) as avg_profit
+                    FROM strategies
+                    WHERE symbol = ? AND interval = ?
+                """, (coin, interval))
+            else:
+                cursor.execute("""
+                    SELECT 
+                        SUM(CASE WHEN quality_grade IN ('S', 'A') THEN 1 ELSE 0 END) as high_grade,
+                        AVG(win_rate) as avg_win_rate,
+                        AVG(profit) as avg_profit
+                    FROM strategies
+                    WHERE symbol = ? AND interval = ?
+                """, (coin, interval))
             
             quality_result = cursor.fetchone()
-            if quality_result and quality_result[0] > 0:
-                total, high_grade, avg_win_rate, avg_profit = quality_result
-                quality_rate = high_grade / total if total > 0 else 0.0
+            high_grade = 0
+            avg_win_rate = 0.0
+            avg_profit = 0.0
+            
+            if quality_result:
+                # quality_result: (high_grade, avg_win_rate, avg_profit)
+                high_grade = quality_result[0] or 0
+                avg_win_rate = quality_result[1] or 0.0
+                avg_profit = quality_result[2] or 0.0
+                quality_rate = high_grade / strategy_count if strategy_count > 0 else 0.0
             else:
                 quality_rate = 0.0
-                avg_win_rate = 0.0
-                avg_profit = 0.0
             
             # 3. 예측 정확도 조회 (rl_episode_summary 테이블에서)
             prediction_accuracy = 0.5  # 기본값
             try:
+                # 🔥 스키마 변경: coin -> symbol
                 cursor.execute("""
                     SELECT AVG(acc_flag) as avg_accuracy
                     FROM rl_episode_summary
-                    WHERE coin = ? AND interval = ?
+                    WHERE symbol = ? AND interval = ?
                     AND ts_exit >= datetime('now', '-7 days')
                 """, (coin, interval))
                 result = cursor.fetchone()

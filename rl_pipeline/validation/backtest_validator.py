@@ -14,7 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def validate_backtest_logic(db_path: str = "data_storage/rl_strategies.db") -> List[str]:
+def validate_backtest_logic(db_path: str = "data_storage/learning_strategies.db") -> List[str]:
     """백테스트 로직 검증"""
     
     conn = sqlite3.connect(db_path)
@@ -26,7 +26,7 @@ def validate_backtest_logic(db_path: str = "data_storage/rl_strategies.db") -> L
         # 샘플 전략 선택
         cursor.execute("""
             SELECT id, coin, interval, profit, win_rate, trades_count
-            FROM coin_strategies
+            FROM strategies
             LIMIT 10
         """)
         strategies = cursor.fetchall()
@@ -145,7 +145,7 @@ def check_data_leakage(
             # 전략 생성 시간 확인
             cursor.execute("""
                 SELECT created_at
-                FROM coin_strategies
+                FROM strategies
                 WHERE strategy_id = ?
             """, (strategy_id,))
             
@@ -166,7 +166,7 @@ def check_data_leakage(
                 AND c.timestamp > sr.created_at
                 AND c.timestamp < (
                     SELECT MIN(timestamp) FROM rl_candles
-                    WHERE coin = ? AND interval = ?
+                    WHERE symbol = ? AND interval = ?
                     AND timestamp > sr.created_at
                 )
             )

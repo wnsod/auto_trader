@@ -125,7 +125,7 @@ class MTFContextBuilder:
                     SELECT timestamp, regime_label, rsi, macd, macd_signal, bb_upper, bb_lower, bb_middle,
                            atr, adx, mfi, volume_ratio
                     FROM candles
-                    WHERE coin = ?
+                    WHERE symbol = ?
                       AND interval = ?
                       AND timestamp <= ?
                       AND timestamp + ? > ?
@@ -303,7 +303,7 @@ class MTFContextBuilder:
                 cursor.execute("""
                     SELECT rmax_mean, kmax_mean
                     FROM strategy_label_stats
-                    WHERE coin = ? AND interval = ? AND regime_tag = ? AND strategy_id = ?
+                    WHERE symbol = ? AND interval = ? AND regime_tag = ? AND strategy_id = ?
                 """, (coin, base_interval, base_regime, base_strategy_id))
 
                 base_stats = cursor.fetchone()
@@ -342,7 +342,7 @@ class MTFContextBuilder:
                     cursor.execute("""
                         SELECT AVG(rmax_mean) AS rmax_mean, AVG(kmax_mean) AS kmax_mean
                         FROM strategy_label_stats
-                        WHERE coin = ? AND interval = ? AND regime_tag = ?
+                        WHERE symbol = ? AND interval = ? AND regime_tag = ?
                     """, (coin, htf_interval, htf_regime))
 
                     htf_stats = cursor.fetchone()
@@ -460,7 +460,7 @@ class MTFContextBuilder:
                 query = """
                     SELECT DISTINCT ts, regime_tag, strategy_id
                     FROM strategy_signal_labels
-                    WHERE coin = ? AND interval = ?
+                    WHERE symbol = ? AND interval = ?
                     ORDER BY ts
                 """
 

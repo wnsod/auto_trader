@@ -47,16 +47,18 @@ v2 백테스트 함수 (⚠️ v2와 함께 폐기됨)
 """
 
 import sys
+import os
 sys.path.append('/workspace')
 
 import numpy as np
 from typing import List, Dict
 from rl_pipeline.analysis.integrated_analysis_v2 import V2Parameters, IntegratedAnalyzerV2
+from rl_pipeline.core.env import config
 
 
 def simple_backtest(raw_params: List[float],
                    coin: str = 'LINK',
-                   db_path: str = '/workspace/data_storage/rl_strategies.db') -> float:
+                   db_path: str = None) -> float:
     """
     간단한 백테스트 - 현재 데이터 기준으로 성능 평가
 
@@ -74,6 +76,9 @@ def simple_backtest(raw_params: List[float],
         Sharpe Ratio (음수면 나쁨, 양수면 좋음)
     """
     try:
+        if db_path is None:
+            db_path = config.STRATEGIES_DB
+
         # 파라미터 생성
         params = V2Parameters(raw_params)
 

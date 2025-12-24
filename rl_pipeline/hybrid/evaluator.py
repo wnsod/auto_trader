@@ -321,19 +321,19 @@ def _run_rule_based(
             avg_profit = 0.0
         
         # Profit Factor 계산 (간단화)
-        positive_trades = sum(1 for p in profits if p > 0)
-        negative_trades = sum(1 for p in profits if p < 0)
+        gross_profit = sum(max(p, 0.0) for p in profits)
+        gross_loss = abs(sum(min(p, 0.0) for p in profits))
         total_trades_rule = sum(trades_counts)
         # 🔥 PF 계산 개선: 거래가 없거나 모두 손실인 경우 처리
         if total_trades_rule == 0:
             profit_factor = 0.0  # 거래가 없으면 PF=0
             logger.warning(f"⚠️ 규칙 기반 평가에서 거래가 생성되지 않음 (total_trades=0)")
-        elif negative_trades == 0:
+        elif gross_loss == 0:
             # 손실 거래가 없으면 PF는 무한대이지만, 실제로는 매우 높은 값으로 설정
-            profit_factor = 100.0 if positive_trades > 0 else 0.0  # 무한대 대신 100으로 제한
-            logger.info(f"✅ 규칙 기반 평가: 손실 거래 없음 (PF={profit_factor:.2f}, 수익 거래: {positive_trades}개)")
+            profit_factor = 100.0 if gross_profit > 0 else 0.0  # 무한대 대신 100으로 제한
+            logger.info(f"✅ 규칙 기반 평가: 손실 거래 없음 (PF={profit_factor:.2f}, 총 수익={gross_profit:.2f})")
         else:
-            profit_factor = positive_trades / negative_trades
+            profit_factor = gross_profit / gross_loss
         
         # 🔧 Return 계산 수정: 초기 자본 기준 퍼센트 (비율로 변환 후 100 곱하기)
         initial_capital = 10000.0
@@ -439,18 +439,18 @@ def _run_hybrid(
             logger.warning(f"⚠️ 비정상적으로 큰 profit 값 감지: {avg_profit:.2f}, 0으로 대체")
             avg_profit = 0.0
         
-        positive_trades = sum(1 for p in profits if p > 0)
-        negative_trades = sum(1 for p in profits if p < 0)
+        gross_profit = sum(max(p, 0.0) for p in profits)
+        gross_loss = abs(sum(min(p, 0.0) for p in profits))
         # 🔥 PF 계산 개선: 거래가 없거나 모두 손실인 경우 처리
         if total_trades == 0:
             profit_factor = 0.0  # 거래가 없으면 PF=0
             logger.warning(f"⚠️ 평가 단계에서 거래가 생성되지 않음 (total_trades=0, 에이전트: {len(agent_results)}개)")
-        elif negative_trades == 0:
+        elif gross_loss == 0:
             # 손실 거래가 없으면 PF는 무한대이지만, 실제로는 매우 높은 값으로 설정
-            profit_factor = 100.0 if positive_trades > 0 else 0.0  # 무한대 대신 100으로 제한
-            logger.info(f"✅ 평가 단계: 손실 거래 없음 (PF={profit_factor:.2f}, 수익 거래: {positive_trades}개)")
+            profit_factor = 100.0 if gross_profit > 0 else 0.0  # 무한대 대신 100으로 제한
+            logger.info(f"✅ 평가 단계: 손실 거래 없음 (PF={profit_factor:.2f}, 총 수익={gross_profit:.2f})")
         else:
-            profit_factor = positive_trades / negative_trades
+            profit_factor = gross_profit / gross_loss
         
         # 🔧 Return 계산 수정: 초기 자본 기준 퍼센트 (비율로 변환)
         initial_capital = 10000.0
@@ -508,6 +508,60 @@ def _default_metrics() -> Dict[str, Any]:
 def _save_evaluation_result(eval_result: EvaluationResult, db_path: str):
     """평가 결과를 DB에 저장"""
     try:
+        # 🔥 DB 경로가 디렉토리인 경우 파일 경로로 보정 (코인별 DB 사용)
+        import os
+        if os.path.isdir(db_path):
+            if eval_result.coin:
+                # 코인별 DB 파일 사용 (예: BTC_strategies.db)
+                db_path = os.path.join(db_path, f"{eval_result.coin}_strategies.db")
+            else:
+                # 기본 파일 사용
+                db_path = os.path.join(db_path, 'common_strategies.db')
+
+        # 🔥 테이블이 없으면 생성 (폴백 경로 사용 시 대비)
+        # db_path가 있으면 해당 DB에 직접 테이블 생성
+        import sqlite3
+        try:
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+                # 테이블 존재 여부 확인
+                cursor.execute("""
+                    SELECT name FROM sqlite_master 
+                    WHERE type='table' AND name='evaluation_results'
+                """)
+                if not cursor.fetchone():
+                    # 테이블 생성
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS evaluation_results (
+                            eval_id TEXT PRIMARY KEY,
+                            model_id TEXT,
+                            market_type TEXT NOT NULL DEFAULT 'COIN',
+                            market TEXT NOT NULL DEFAULT 'BITHUMB',
+                            mode TEXT NOT NULL,
+                            asset TEXT NOT NULL,
+                            interval TEXT NOT NULL,
+                            period_from DATETIME NOT NULL,
+                            period_to DATETIME NOT NULL,
+                            profit_factor REAL,
+                            total_return REAL,
+                            win_rate REAL,
+                            mdd REAL,
+                            sharpe REAL,
+                            trades INTEGER,
+                            latency_ms_p95 REAL,
+                            notes TEXT,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    # 인덱스 생성
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_eval_results_model ON evaluation_results(model_id)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_eval_results_mode ON evaluation_results(mode)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_eval_results_asset_interval ON evaluation_results(asset, interval)")
+                    conn.commit()
+                    logger.debug(f"✅ evaluation_results 테이블 생성 완료: {db_path}")
+        except Exception as table_err:
+            logger.debug(f"⚠️ evaluation_results 테이블 생성 시도 실패 (무시 가능): {table_err}")
+        
         record = {
             'eval_id': eval_result.eval_id,
             'model_id': eval_result.model_id,

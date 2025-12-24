@@ -116,14 +116,14 @@ def test_categorize_coins():
         
         from rl_pipeline.strategy.analyzer import _categorize_coins_by_importance
         
-        test_all_coin_strategies = {
+        test_all_strategies = {
             'BTC': {'15m': [], '30m': []},
             'ETH': {'15m': []},
             'XRP': {'15m': []},
             'UNKNOWN_COIN': {'15m': []}
         }
         
-        coin_groups = _categorize_coins_by_importance(test_all_coin_strategies)
+        coin_groups = _categorize_coins_by_importance(test_all_strategies)
         logger.info(f"  ✅ 코인 그룹화: 메이저 {len(coin_groups['major'])}개, 중형 {len(coin_groups['mid'])}개")
         
         logger.info("✅ 코인 그룹화 함수 테스트 성공")

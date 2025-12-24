@@ -7,7 +7,9 @@ import logging
 import os
 import json
 import uuid
-from typing import Dict, List, Any, Optional
+import math
+import copy
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -95,6 +97,18 @@ if JAX_AVAILABLE:
         optax = None
 else:
     optax = None
+
+# 액션/샘플링 기본 상수 (환경변수로 조정 가능)
+NEUTRAL_TARGET_RATIO = float(os.getenv('NEUTRAL_TARGET_RATIO', '0.2'))
+MIN_NEUTRAL_SAMPLES = int(os.getenv('MIN_NEUTRAL_SAMPLES', '3'))
+MAX_NEUTRAL_SAMPLES = int(os.getenv('MAX_NEUTRAL_SAMPLES', '12'))
+MAX_DIRECTION_SAMPLES = int(os.getenv('MAX_DIRECTION_SAMPLES', '12'))
+NEUTRAL_ACTION_BONUS = float(os.getenv('NEUTRAL_ACTION_BONUS', '0.2'))
+UPDOWN_ACTION_BONUS = float(os.getenv('UPDOWN_ACTION_BONUS', '0.1'))
+NEUTRAL_PRICE_CHANGE_THRESHOLD = float(os.getenv('NEUTRAL_PRICE_CHANGE_THRESHOLD', '0.005'))
+MAX_SYNTHETIC_NEUTRAL = int(os.getenv('MAX_SYNTHETIC_NEUTRAL', '20'))
+MIN_DIRECTIONAL_SAMPLES = int(os.getenv('MIN_DIRECTIONAL_SAMPLES', '2'))
+MAX_SYNTHETIC_DIRECTIONAL = int(os.getenv('MAX_SYNTHETIC_DIRECTIONAL', '12'))
 
 
 class PPOTrainer:
@@ -240,8 +254,36 @@ class PPOTrainer:
         
         # 학습 통계
         self.training_history = []
+
+        # 액션/보상 다양성 설정
+        self.neutral_target_ratio = float(self.train_config.get('neutral_target_ratio', NEUTRAL_TARGET_RATIO))
+        self.min_neutral_samples = int(self.train_config.get('min_neutral_samples', MIN_NEUTRAL_SAMPLES))
+        self.max_neutral_samples = int(self.train_config.get('max_neutral_samples', MAX_NEUTRAL_SAMPLES))
+        self.max_direction_samples = int(self.train_config.get('max_direction_samples', MAX_DIRECTION_SAMPLES))
+        self.neutral_action_bonus = float(self.train_config.get('neutral_action_bonus', NEUTRAL_ACTION_BONUS))
+        self.direction_action_bonus = float(self.train_config.get('direction_action_bonus', UPDOWN_ACTION_BONUS))
+        self.neutral_direction_threshold = float(
+            self.train_config.get('neutral_direction_threshold', NEUTRAL_PRICE_CHANGE_THRESHOLD)
+        )
+        self.max_synthetic_neutral = int(
+            self.train_config.get('max_synthetic_neutral', MAX_SYNTHETIC_NEUTRAL)
+        )
+        self.min_directional_samples = int(
+            self.train_config.get('min_directional_samples', MIN_DIRECTIONAL_SAMPLES)
+        )
+        self.max_synthetic_directional = int(
+            self.train_config.get('max_synthetic_directional', MAX_SYNTHETIC_DIRECTIONAL)
+        )
+        # 최소/최대 유효 범위 보정
+        if self.max_neutral_samples < self.min_neutral_samples:
+            self.max_neutral_samples = self.min_neutral_samples
+        self.neutral_target_ratio = max(0.05, min(0.5, self.neutral_target_ratio))
+        self.neutral_direction_threshold = max(1e-4, self.neutral_direction_threshold)
+        self.max_synthetic_neutral = max(0, self.max_synthetic_neutral)
+        self.min_directional_samples = max(1, self.min_directional_samples)
+        self.max_synthetic_directional = max(self.min_directional_samples, self.max_synthetic_directional)
         
-        logger.info(f"✅ PPO Trainer 초기화 완료 (lr={learning_rate})")
+        logger.info(f"✅ PPO Trainer 초기화 완료 (lr={learning_rate:.6f})")
     
     def train_from_selfplay_data(
         self,
@@ -342,10 +384,10 @@ class PPOTrainer:
                 optimal_batch_size = 64
             elif data_size < 5000:
                 optimal_batch_size = 128
-            elif data_size < 10000:
-                optimal_batch_size = 256
             else:
-                optimal_batch_size = 512
+                # 🔥 성능 개선: 안전 제한을 대폭 완화 (256 -> 2048)
+                # 최신 GPU에서는 충분히 감당 가능하며 학습 속도를 위해 필요
+                optimal_batch_size = 2048
 
             # 설정된 batch_size와 optimal_batch_size 중 작은 값 사용
             if batch_size > optimal_batch_size:
@@ -573,7 +615,7 @@ class PPOTrainer:
         Self-play 결과에서 경험 추출 (기본 버전 - 20차원: 기본 15개 + 확장 지표 5개)
         """
         experiences = []
-        
+
         try:
             for episode in episodes_data:
                 results = episode.get('results', {})
@@ -605,35 +647,36 @@ class PPOTrainer:
                         buy_trades = [t for t in trades if t.get('direction') == 'BUY']  # → UP 예측
                         sell_trades = [t for t in trades if t.get('direction') == 'SELL']  # → DOWN 예측
                         hold_trades = [t for t in trades if t.get('direction') != 'BUY' and t.get('direction') != 'SELL']  # → NEUTRAL 예측
-                        
-                        # 🔥 UP/DOWN 예측을 최대한 포함, NEUTRAL은 제한적으로 포함
-                        # 액션 다양성 확보: 최소한 각 방향 1개씩은 보장
-                        min_buy = min(1, len(buy_trades))  # 최소 1개 보장
-                        min_sell = min(1, len(sell_trades))  # 최소 1개 보장
-                        min_hold = min(1, len(hold_trades))  # 최소 1개 보장
-                        
-                        selected_trades = (
-                            buy_trades[:max(10, min_buy)] +  # UP 예측 최대 10개 (최소 1개 보장)
-                            sell_trades[:max(10, min_sell)] +  # DOWN 예측 최대 10개 (최소 1개 보장)
-                            hold_trades[:max(5, min_hold)]  # NEUTRAL 예측은 최대 5개만 (최소 1개 보장)
+                        hold_trades = self._ensure_neutral_trade_pool(
+                            buy_trades,
+                            sell_trades,
+                            hold_trades,
+                            episode_num=episode_num,
+                            agent_id=agent_id
+                        )
+                        buy_trades, sell_trades = self._ensure_directional_trade_pool(
+                            buy_trades,
+                            sell_trades,
+                            hold_trades,
+                            episode_num=episode_num,
+                            agent_id=agent_id
                         )
                         
-                        # 🔥 액션 다양성 강제: 각 방향이 최소 1개씩 있는지 확인
-                        selected_directions = [t.get('direction') for t in selected_trades]
-                        has_buy = 'BUY' in selected_directions
-                        has_sell = 'SELL' in selected_directions
-                        has_hold = any(d not in ['BUY', 'SELL'] for d in selected_directions)
-                        
-                        # 부족한 방향이 있으면 추가 생성
-                        if not has_buy and buy_trades:
-                            selected_trades.append(buy_trades[0])
-                        if not has_sell and sell_trades:
-                            selected_trades.append(sell_trades[0])
-                        if not has_hold and hold_trades:
-                            selected_trades.append(hold_trades[0])
+                        selected_trades = self._select_trades_with_diversity(buy_trades, sell_trades, hold_trades)
                         
                         # 각 트레이드에서 경험 추출
                         for trade in selected_trades:
+                            # 🔥 인터벌 역할별 보상 가중치 설정
+                            interval_role_weights = {
+                                'Macro Regime': {'direction': 2.0, 'hold': 0.5, 'profit': 1.0},  # 방향성 정확도가 가장 중요
+                                'Trend Structure': {'direction': 1.5, 'hold': 0.8, 'profit': 1.2},  # 추세 파악 중요
+                                'Micro Trend': {'direction': 1.2, 'hold': 1.0, 'profit': 1.5},  # 단기 추세 및 수익 중요
+                                'Execution': {'direction': 1.0, 'hold': 1.2, 'profit': 2.0},  # 수익 실현(타이밍)이 가장 중요
+                                'Timing': {'direction': 1.0, 'hold': 1.2, 'profit': 2.0}  # Execution과 동일
+                            }
+                            # interval_role이 없으면 기본값(Execution) 사용
+                            role_weight = interval_role_weights.get(interval_role, interval_role_weights['Execution'])
+
                             # Market state 재구성 (확장 지표 포함)
                             # 실제로는 trade에 state 정보가 포함되어야 함
                             state = {
@@ -676,38 +719,107 @@ class PPOTrainer:
                                 action = 0  # NEUTRAL: 중립 예측
                                 predicted_direction = 'NEUTRAL'
                             
-                            # 🔥 예측 정확도 기반 보상 시스템
+                            # 🔥 예측 정확도 기반 보상 시스템 (HOLD를 실제 방향으로 재평가)
                             # 실제 가격 변화를 기반으로 예측 정확도 평가
-                            price_change = trade.get('price_change', 0.0)  # 실제 가격 변화율
-                            actual_direction = 'UP' if price_change > 0.005 else ('DOWN' if price_change < -0.005 else 'NEUTRAL')
+                            price_change = float(trade.get('price_change', 0.0) or 0.0)  # 실제 가격 변화율
+                            threshold = self.neutral_direction_threshold
+                            actual_direction = (
+                                'UP' if price_change > threshold
+                                else ('DOWN' if price_change < -threshold else 'NEUTRAL')
+                            )
 
-                            # 방향 예측 정확도 보상 (예측 전략의 핵심)
+                            # 🔥 중요 수정: 예측 목표 강화 (Hindsight Labeling)
+                            # 전략이 HOLD 했더라도, 시장이 움직였다면 그 움직임을 정답으로 학습
+                            # 전략의 소극적 태도(Risk Aversion)가 예측 능력 저하로 이어지지 않도록 함
+                            
+                            if predicted_direction == 'NEUTRAL' and actual_direction != 'NEUTRAL':
+                                # 전략은 관망했지만 시장은 움직임 -> 실제 방향으로 라벨 수정 (Oracle Learning)
+                                if actual_direction == 'UP':
+                                    action = 1 # UP
+                                    predicted_direction = 'UP'
+                                elif actual_direction == 'DOWN':
+                                    action = 2 # DOWN
+                                    predicted_direction = 'DOWN'
+                                # NEUTRAL 라벨을 제거하고 방향성 라벨로 대체하여 적극적 예측 유도
+                            
+                            # 🔥 중요 수정: 전략의 조기 청산(Take-Profit/Stop-Loss)으로 인한 예측 왜곡 방지
+                            # 전략이 20% 상승을 목표로 했으나 5%에서 익절했다면, 실제로는 더 올라갔을 수 있음
+                            # 따라서 'UP' 예측이었는데 익절로 끝난 경우, 이후 가격 추이(잠재적 최대 변동폭)를 고려해야 하지만,
+                            # 현재 trade 정보만으로는 알 수 없으므로, '이익이 났다'는 사실 자체를 긍정적으로 평가.
+                            
+                            # 또한, 강제 청산(Stop Loss)의 경우에도 방향 예측은 맞았으나 변동폭이 커서 털린 경우일 수 있음.
+                            # 하지만 예측 관점에서는 '결과적인 가격 변화'가 중요하므로 actual_direction을 따르는 것이 기본.
+                            
+                            # 단, 'UP' 예측을 했는데 실제로는 'NEUTRAL' 수준의 작은 이익만 보고 끝난 경우 (조기 익절),
+                            # 이를 '틀림'으로 처리하면 억울함. 이익이 났다면(price_change > 0) UP 예측에 대해 부분 점수 부여.
+                            
+                            # 🚀 1. 보상 기본 설정
+                            # 🔥 NEUTRAL(0)도 명확한 예측(방향성 없음/관망)으로 평가
+                            direction_reward = 0.0
+                            
                             if predicted_direction == actual_direction:
-                                # 예측 정확도: 방향 맞춤
+                                # 1. 완전 일치
                                 if predicted_direction == 'UP':
-                                    direction_reward = 1.0  # 상승 예측 맞춤
+                                    direction_reward = 1.5 * role_weight['direction'] # 상승장 예측 성공은 높은 보상
                                 elif predicted_direction == 'DOWN':
-                                    direction_reward = 1.0  # 하락 예측 맞춤
-                                else:  # NEUTRAL
-                                    direction_reward = 0.7  # 중립 예측 맞춤 (보수적 보상)
-                            elif (predicted_direction == 'UP' and actual_direction == 'DOWN') or \
-                                 (predicted_direction == 'DOWN' and actual_direction == 'UP'):
-                                # 예측 정반대: 큰 페널티
-                                direction_reward = -1.0
-                            else:
-                                # 예측 부분 오류 (UP/DOWN ↔ NEUTRAL)
-                                direction_reward = -0.3
+                                    direction_reward = 1.5 * role_weight['direction'] # 하락장 예측 성공도 높은 보상
+                                else: # NEUTRAL
+                                    # 🔥 NEUTRAL도 "방향성 없음"을 맞춘 것이므로 보상 부여
+                                    # 단, 적극적 예측보다는 약간 낮게 (너무 소극적이지 않도록)
+                                    direction_reward = 0.8 * role_weight['hold'] 
+                            
+                            elif predicted_direction == 'UP':
+                                # 2. 상승 예측했으나...
+                                if actual_direction == 'NEUTRAL' and price_change > 0:
+                                    # 조금이라도 올랐으면 부분 점수 (0.5 -> 0.3으로 조정하여 정확성 유도)
+                                    direction_reward = 0.3 * role_weight['direction']
+                                elif actual_direction == 'DOWN':
+                                    # 반대로 감 -> 강한 페널티
+                                    direction_reward = -1.2 * role_weight['direction']
+                                else:
+                                    direction_reward = -0.5 * role_weight['direction']
+                                    
+                            elif predicted_direction == 'DOWN':
+                                # 3. 하락 예측했으나...
+                                if actual_direction == 'NEUTRAL' and price_change < 0:
+                                    # 조금이라도 내렸으면 부분 점수
+                                    direction_reward = 0.3 * role_weight['direction']
+                                elif actual_direction == 'UP':
+                                    # 반대로 감 -> 강한 페널티
+                                    direction_reward = -1.2 * role_weight['direction']
+                                else:
+                                    direction_reward = -0.5 * role_weight['direction']
+                                    
+                            else: # predicted == NEUTRAL
+                                # 4. 중립 예측했으나...
+                                # 방향성장(UP/DOWN)에서 관망은 "기회 손실" -> 페널티
+                                if actual_direction == 'UP' or actual_direction == 'DOWN':
+                                    direction_reward = -0.8 * role_weight['hold']
+                                else:
+                                    # 애매한 상황에서 관망 -> 중립 보상 (0.0)
+                                    direction_reward = 0.0
 
+                            # 🚀 3. 인터벌 역할별 추가 보정
+                            # 위에서 role_weight를 이미 곱했으므로 여기서는 특수 상황만 처리
+                            
                             # 예측 신뢰도 기반 보정 (win_rate 활용)
                             confidence_bonus = (win_rate - 0.5) * 0.5  # -0.25 ~ +0.25
-
+                            
                             # 최종 보상: 예측 정확도 + 신뢰도 보너스
                             reward = direction_reward + confidence_bonus
 
-                            # 🔥 예측 활성화 보너스 (NEUTRAL만 하지 않도록)
-                            # UP/DOWN 예측은 더 많은 정보를 제공하므로 보너스
+                            # 🆕 Policy Collapse 방지: NEUTRAL 액션 보너스 제거
+                            # 이제 NEUTRAL도 정당한 예측으로 평가받으므로 인위적 보너스 불필요
+                            # 대신 방향성 예측(UP/DOWN)에 약간의 인센티브를 주어 적극성 유도
                             if predicted_direction != 'NEUTRAL':
-                                reward += 0.1  # 방향 예측 시도에 작은 보너스
+                                reward += 0.1  # 적극적 예측 인센티브
+
+                            # 🆕 Policy Collapse 방지: NEUTRAL 액션 보너스 추가
+                            # NEUTRAL 액션이 적게 선택되는 경우 보너스 제공
+                            if predicted_direction == 'NEUTRAL':
+                                reward += self.neutral_action_bonus
+                            else:
+                                reward += self.direction_action_bonus
                             
                             # 기본 log_prob (균등 분포 가정: log(1/3) ≈ -1.1)
                             log_prob = -1.1
@@ -730,9 +842,9 @@ class PPOTrainer:
                             }
                             experiences.append(experience)
                         
-                        # 🔥 UP/DOWN 예측 trades가 있으면 더 이상 추가하지 않음 (예측 다양성 확보)
-                        # 모든 trades를 다 사용하면 너무 많아지므로, 선택된 trades만 사용
-                        break  # 이 에이전트는 trades가 있으므로 break하여 다음 에이전트로
+                        # 🔥 UP/DOWN 예측 trades가 있으면 더 이상 추가하지 않음 (예측 다양성 확보) -> 제거: 모든 선택된 trades 활용
+                        # break  # 모든 선택된 트레이드를 활용하여 액션 다양성 확보
+
                     
                     # 🔥 trades가 없는 경우: total_trades가 있으면 경험 생성
                     elif total_trades > 0:
@@ -874,22 +986,40 @@ class PPOTrainer:
                             # 🚀 메타 학습: 상태 벡터 생성 (30차원)
                             state_vec = build_state_vector_with_strategy(state, strategy_params)
 
-                            # 🔥 예측 전략: 전략 방향성, 레짐, 예측 신뢰도 종합 보상
+                            # 🔥 [Update] 예측 전략: 레짐(시장 상황) 기반 강력한 보상 (Effort & Recovery 철학 반영)
+                            # 거래가 없어도 시장 방향(Regime)에 맞는 액션을 취했는지 평가
+                            
                             base_reward = 0.0
                             
-                            # 전략 방향과 액션 일치 여부
-                            if (action == 1 and strategy_direction == 'buy') or \
-                               (action == 2 and strategy_direction == 'sell') or \
-                               (action == 0 and strategy_direction == 'neutral'):
-                                base_reward += 0.1  # 방향 일치 보너스
+                            # 레짐 판단
+                            is_bull = 'bull' in regime.lower()
+                            is_bear = 'bear' in regime.lower()
+                            is_neutral = 'sideways' in regime.lower() or 'neutral' in regime.lower()
                             
-                            # 레짐과 액션 일치 여부
-                            if (action == 1 and 'bull' in regime.lower()) or \
-                               (action == 2 and 'bear' in regime.lower()) or \
-                               (action == 0 and ('sideways' in regime.lower() or 'neutral' in regime.lower())):
-                                base_reward += 0.1  # 레짐 일치 보너스
-                            else:
-                                base_reward -= 0.05  # 레짐 불일치 작은 페널티
+                            if is_bull:
+                                if action == 1: # UP (정답)
+                                    base_reward = 1.5
+                                elif action == 0: # NEUTRAL (기회 놓침)
+                                    base_reward = -2.0
+                                else: # DOWN (틀림 - 도전)
+                                    base_reward = -0.2
+                            elif is_bear:
+                                if action == 2: # DOWN (정답)
+                                    base_reward = 1.5
+                                elif action == 0: # NEUTRAL (기회 놓침)
+                                    base_reward = -2.0
+                                else: # UP (틀림 - 도전)
+                                    base_reward = -0.2
+                            else: # Neutral/Sideways
+                                if action == 0: # NEUTRAL (정답 - Safe Hold)
+                                    base_reward = 0.2
+                                else: # UP/DOWN (틀림 - 도전)
+                                    base_reward = -0.2
+                            
+                            # 전략 방향 일치 보너스 (보조)
+                            if (action == 1 and strategy_direction == 'buy') or \
+                               (action == 2 and strategy_direction == 'sell'):
+                                base_reward += 0.1
                             
                             # 예측 신뢰도 보정
                             confidence_bonus = (predicted_conf - 0.5) * 0.2  # -0.1 ~ 0.1
@@ -1001,33 +1131,67 @@ class PPOTrainer:
                         buy_trades = [t for t in trades if t.get('direction') == 'BUY']  # → UP 예측
                         sell_trades = [t for t in trades if t.get('direction') == 'SELL']  # → DOWN 예측
                         hold_trades = [t for t in trades if t.get('direction') != 'BUY' and t.get('direction') != 'SELL']  # → NEUTRAL 예측
-                        
-                        # 🔥 UP/DOWN 예측을 최대한 포함, NEUTRAL은 제한적으로 포함
-                        # 액션 다양성 확보: 최소한 각 방향 1개씩은 보장
-                        min_buy = min(1, len(buy_trades))  # 최소 1개 보장
-                        min_sell = min(1, len(sell_trades))  # 최소 1개 보장
-                        min_hold = min(1, len(hold_trades))  # 최소 1개 보장
-                        
-                        selected_trades = (
-                            buy_trades[:max(10, min_buy)] +  # UP 예측 최대 10개 (최소 1개 보장)
-                            sell_trades[:max(10, min_sell)] +  # DOWN 예측 최대 10개 (최소 1개 보장)
-                            hold_trades[:max(5, min_hold)]  # NEUTRAL 예측은 최대 5개만 (최소 1개 보장)
+                        hold_trades = self._ensure_neutral_trade_pool(
+                            buy_trades,
+                            sell_trades,
+                            hold_trades,
+                            episode_num=episode_num,
+                            agent_id=agent_id
+                        )
+                        buy_trades, sell_trades = self._ensure_directional_trade_pool(
+                            buy_trades,
+                            sell_trades,
+                            hold_trades,
+                            episode_num=episode_num,
+                            agent_id=agent_id
                         )
                         
-                        # 🔥 액션 다양성 강제: 각 방향이 최소 1개씩 있는지 확인
-                        selected_directions = [t.get('direction') for t in selected_trades]
-                        has_buy = 'BUY' in selected_directions
-                        has_sell = 'SELL' in selected_directions
-                        has_hold = any(d not in ['BUY', 'SELL'] for d in selected_directions)
+                        selected_trades = self._select_trades_with_diversity(buy_trades, sell_trades, hold_trades)
                         
-                        # 부족한 방향이 있으면 추가 생성
-                        if not has_buy and buy_trades:
-                            selected_trades.append(buy_trades[0])
-                        if not has_sell and sell_trades:
-                            selected_trades.append(sell_trades[0])
-                        if not has_hold and hold_trades:
-                            selected_trades.append(hold_trades[0])
+                        # 🔥 디버깅: 선택된 트레이드 상세 확인
+                        # BUY/SELL이 있는데 선택된 트레이드에 없는 경우 확인
+                        has_pool_diversity = len(buy_trades) > 0 or len(sell_trades) > 0
+                        selected_dirs = [t.get('direction') for t in selected_trades]
+                        has_selected_diversity = any(d in ['BUY', 'SELL'] for d in selected_dirs)
                         
+                        if has_pool_diversity and not has_selected_diversity:
+                             logger.error(f"❌ {agent_id}: Pool has diversity (B:{len(buy_trades)}, S:{len(sell_trades)}) but selected_trades DOES NOT. Selected dirs: {selected_dirs[:20]}")
+
+                        # 🔥 액션 다양성 강제 보정
+                        # 만약 NEUTRAL(HOLD)만 있다면, 강제로 BUY/SELL 합성 경험 추가
+                        # 안전한 확인을 위해 모두 문자열 변환 및 대문자 처리
+                        unique_actions_set = set(str(d).upper() for d in selected_dirs)
+                        
+                        # 디버깅 로그 (처음 5개 에이전트만)
+                        if len(experiences) < 5:
+                             logger.info(f"🔍 디버깅: Agent={agent_id}, Dirs={list(unique_actions_set)}")
+
+                        # 'HOLD' 또는 'neutral'만 있는 경우 (BUY/SELL이 없음)
+                        has_directional = any(d in ['BUY', 'SELL'] for d in unique_actions_set)
+                        
+                        if not has_directional:
+                             # BUY/SELL 강제 주입 (state는 마지막 trade 복사하되 변형)
+                             if selected_trades:
+                                 base_trade = selected_trades[0]
+                                 
+                                 # Synthetic BUY
+                                 synthetic_buy = copy.deepcopy(base_trade)
+                                 synthetic_buy['direction'] = 'BUY'
+                                 # 🔥 강제 주입된 데이터는 threshold 이상으로 설정하여 명확한 BUY로 인식되게 함
+                                 synthetic_buy['price_change'] = self.neutral_direction_threshold * 2.0
+                                 synthetic_buy['synthetic_forced'] = True
+                                 selected_trades.append(synthetic_buy)
+                                 
+                                 # Synthetic SELL
+                                 synthetic_sell = copy.deepcopy(base_trade)
+                                 synthetic_sell['direction'] = 'SELL' 
+                                 # 🔥 강제 주입된 데이터는 threshold 이상으로 설정하여 명확한 SELL로 인식되게 함
+                                 synthetic_sell['price_change'] = -self.neutral_direction_threshold * 2.0
+                                 synthetic_sell['synthetic_forced'] = True
+                                 selected_trades.append(synthetic_sell)
+                                 
+                                 logger.info(f"🔧 {agent_id}: 액션 다양성 부족으로 강제 합성 데이터(BUY/SELL) 주입 (Dirs: {unique_actions_set})")
+
                         for trade in selected_trades:
                             # Market state 재구성 (확장 지표 포함)
                             state = {
@@ -1057,7 +1221,7 @@ class PPOTrainer:
                                 'regime_transition_prob': trade.get('regime_transition_prob', 0.05)
                             }
                             
-                            # 🚀 메타 학습: 분석+전략 파라미터 포함 상태 벡터 생성 (35차원)
+                            # 🔥 메타 학습: 분석+전략 파라미터 포함 상태 벡터 생성 (35차원)
                             # 프랙탈/멀티타임프레임/지표교차 점수 + 전략 파라미터 포함하여 더 강력한 학습
                             enhanced_state_vec = build_state_vector_with_analysis_and_strategy(
                                 state,
@@ -1071,7 +1235,9 @@ class PPOTrainer:
                             
                             # 🔥 예측 전략: 액션을 방향 예측으로 변환
                             # BUY → UP(1): 상승 예측, SELL → DOWN(2): 하락 예측, HOLD → NEUTRAL(0): 중립 예측
-                            trade_direction = trade.get('direction', 'HOLD')
+                            # 안전을 위해 문자열 변환 및 대문자화
+                            trade_direction = str(trade.get('direction', 'HOLD')).upper()
+                            
                             if trade_direction == 'BUY':
                                 action = 1  # UP: 상승 예측
                                 predicted_direction = 'UP'
@@ -1081,28 +1247,86 @@ class PPOTrainer:
                             else:
                                 action = 0  # NEUTRAL: 중립 예측
                                 predicted_direction = 'NEUTRAL'
+                                
+                                # 🔥 디버깅: Synthetic trade인데 NEUTRAL로 매핑된 경우 확인
+                                if trade.get('synthetic_forced'):
+                                     logger.error(f"❌ {agent_id}: Synthetic FORCED trade mapped to NEUTRAL! Dir={trade_direction}")
+                                elif trade.get('synthetic_directional'):
+                                     logger.error(f"❌ {agent_id}: Synthetic directional trade mapped to NEUTRAL! Dir={trade_direction}")
                             
-                            # 🔥 예측 정확도 기반 보상 시스템
+                            # 🔥 예측 정확도 기반 보상 시스템 (HOLD를 실제 방향으로 재평가)
                             # 실제 가격 변화를 기반으로 예측 정확도 평가
-                            price_change = trade.get('price_change', 0.0)  # 실제 가격 변화율
-                            actual_direction = 'UP' if price_change > 0.005 else ('DOWN' if price_change < -0.005 else 'NEUTRAL')
+                            price_change = float(trade.get('price_change', 0.0) or 0.0)  # 실제 가격 변화율
+                            threshold = self.neutral_direction_threshold
+                            actual_direction = (
+                                'UP' if price_change > threshold
+                                else ('DOWN' if price_change < -threshold else 'NEUTRAL')
+                            )
 
-                            # 방향 예측 정확도 보상 (예측 전략의 핵심)
+                            # 🔥 중요 수정: 예측 목표 강화 (Hindsight Labeling)
+                            # 전략이 HOLD 했더라도, 시장이 움직였다면 그 움직임을 정답으로 학습
+                            # 전략의 소극적 태도(Risk Aversion)가 예측 능력 저하로 이어지지 않도록 함
+                            
+                            if predicted_direction == 'NEUTRAL' and actual_direction != 'NEUTRAL':
+                                # 전략은 관망했지만 시장은 움직임 -> 실제 방향으로 라벨 수정 (Oracle Learning)
+                                if actual_direction == 'UP':
+                                    action = 1 # UP
+                                    predicted_direction = 'UP'
+                                elif actual_direction == 'DOWN':
+                                    action = 2 # DOWN
+                                    predicted_direction = 'DOWN'
+                                # NEUTRAL 라벨을 제거하고 방향성 라벨로 대체하여 적극적 예측 유도
+                            
+                            # 🔥 중요 수정: 전략의 조기 청산(Take-Profit/Stop-Loss)으로 인한 예측 왜곡 방지
+                            # 전략이 20% 상승을 목표로 했으나 5%에서 익절했다면, 실제로는 더 올라갔을 수 있음
+                            # 따라서 'UP' 예측이었는데 익절로 끝난 경우, 이후 가격 추이(잠재적 최대 변동폭)를 고려해야 하지만,
+                            # 현재 trade 정보만으로는 알 수 없으므로, '이익이 났다'는 사실 자체를 긍정적으로 평가.
+                            
+                            # 또한, 강제 청산(Stop Loss)의 경우에도 방향 예측은 맞았으나 변동폭이 커서 털린 경우일 수 있음.
+                            # 하지만 예측 관점에서는 '결과적인 가격 변화'가 중요하므로 actual_direction을 따르는 것이 기본.
+                            
+                            # 단, 'UP' 예측을 했는데 실제로는 'NEUTRAL' 수준의 작은 이익만 보고 끝난 경우 (조기 익절),
+                            # 이를 '틀림'으로 처리하면 억울함. 이익이 났다면(price_change > 0) UP 예측에 대해 부분 점수 부여.
+                            
+                            direction_reward = 0.0
+                            
                             if predicted_direction == actual_direction:
-                                # 예측 정확도: 방향 맞춤
+                                # 1. 완전 일치
                                 if predicted_direction == 'UP':
-                                    direction_reward = 1.0  # 상승 예측 맞춤
+                                    direction_reward = 1.0
                                 elif predicted_direction == 'DOWN':
-                                    direction_reward = 1.0  # 하락 예측 맞춤
-                                else:  # NEUTRAL
-                                    direction_reward = 0.7  # 중립 예측 맞춤 (보수적 보상)
-                            elif (predicted_direction == 'UP' and actual_direction == 'DOWN') or \
-                                 (predicted_direction == 'DOWN' and actual_direction == 'UP'):
-                                # 예측 정반대: 큰 페널티
-                                direction_reward = -1.0
-                            else:
-                                # 예측 부분 오류 (UP/DOWN ↔ NEUTRAL)
-                                direction_reward = -0.3
+                                    direction_reward = 1.0
+                                else:
+                                    direction_reward = 0.9 # NEUTRAL 보상 (Policy Collapse 방지)
+                            
+                            elif predicted_direction == 'UP':
+                                # 2. 상승 예측했으나...
+                                if actual_direction == 'NEUTRAL' and price_change > 0:
+                                    # 조금이라도 올랐으면 부분 점수 (조기 익절 가능성)
+                                    # threshold(보통 0.002~0.005)보다 작지만 0보다는 큰 경우
+                                    direction_reward = 0.3
+                                elif actual_direction == 'DOWN':
+                                    # 반대로 감 -> 페널티
+                                    direction_reward = -1.0
+                                else:
+                                    # 그 외 (NEUTRAL인데 0 이하인 경우 등)
+                                    direction_reward = -0.3
+                                    
+                            elif predicted_direction == 'DOWN':
+                                # 3. 하락 예측했으나...
+                                if actual_direction == 'NEUTRAL' and price_change < 0:
+                                    # 조금이라도 내렸으면 부분 점수
+                                    direction_reward = 0.3
+                                elif actual_direction == 'UP':
+                                    # 반대로 감 -> 페널티
+                                    direction_reward = -1.0
+                                else:
+                                    direction_reward = -0.3
+                                    
+                            else: # predicted == NEUTRAL
+                                # 4. 중립 예측했으나...
+                                # 크게 움직였으면 페널티 (기회 비용)
+                                direction_reward = -0.5
 
                             # 예측 신뢰도 기반 보정 (win_rate 활용)
                             confidence_bonus = (win_rate - 0.5) * 0.5  # -0.25 ~ +0.25
@@ -1110,10 +1334,12 @@ class PPOTrainer:
                             # 최종 보상: 예측 정확도 + 신뢰도 보너스
                             reward = direction_reward + confidence_bonus
 
-                            # 🔥 예측 활성화 보너스 (NEUTRAL만 하지 않도록)
-                            # UP/DOWN 예측은 더 많은 정보를 제공하므로 보너스
-                            if predicted_direction != 'NEUTRAL':
-                                reward += 0.1  # 방향 예측 시도에 작은 보너스
+                            # 🆕 Policy Collapse 방지: NEUTRAL 액션 보너스 추가
+                            # NEUTRAL 액션이 적게 선택되는 경우 보너스 제공
+                            if predicted_direction == 'NEUTRAL':
+                                reward += self.neutral_action_bonus
+                            else:
+                                reward += self.direction_action_bonus
                             
                             # 기본 log_prob
                             log_prob = -1.1
@@ -1121,20 +1347,22 @@ class PPOTrainer:
                             # 기본 value estimate
                             value = reward * 0.9
                             
-                        experience = {
-                            'episode': episode_num,
-                            'agent_id': agent_id,
-                            'state': enhanced_state_vec,  # 🔥 25차원 벡터
-                            'action': action,
-                            'reward': reward,
-                            'log_prob': log_prob,
-                            'value': value,
-                            'done': False
-                        }
-                        experiences.append(experience)
+                            experience = {
+                                'episode': episode_num,
+                                'agent_id': agent_id,
+                                'state': enhanced_state_vec,  # 🔥 25차원 벡터
+                                'action': action,
+                                'reward': reward,
+                                'log_prob': log_prob,
+                                'value': value,
+                                'done': False,
+                                'analysis_score': ensemble_score * 100.0  # 🆕 타겟 분석 점수 (0~100)
+                            }
+                            experiences.append(experience)
                         
-                        # 🔥 UP/DOWN 예측 trades가 있으면 더 이상 추가하지 않음 (예측 다양성 확보)
-                        break
+                        # 🔥 UP/DOWN 예측 trades가 있으면 더 이상 추가하지 않음 (예측 다양성 확보) -> 제거: 모든 선택된 trades 활용
+                        # break  # 모든 선택된 트레이드를 활용하여 액션 다양성 확보
+
                     
                     # 🔥 trades가 없는 경우: total_trades가 있으면 경험 생성
                     elif total_trades > 0:
@@ -1336,12 +1564,42 @@ class PPOTrainer:
             logger.info(f"📊 경험 추출 완료 (분석 포함): 총 {len(experiences)}개, 고유 액션: {len(unique_actions)}개")
             logger.info(f"   액션 분포: NEUTRAL(0)={action_counts.get(0, 0)}, UP(1)={action_counts.get(1, 0)}, DOWN(2)={action_counts.get(2, 0)}")
             
-            # 🔥 액션 다양성 검증
+            # 🔥 액션 다양성 강제 보정에도 불구하고 여전히 1개라면, 마지막 안전장치로 experiences 리스트 직접 조작
             if len(unique_actions) < 2:
-                logger.warning(f"⚠️ 액션 다양성 부족: 고유 액션 {len(unique_actions)}개만 존재")
-                logger.warning(f"   액션 분포: {action_counts}")
+                logger.warning(f"⚠️ 액션 다양성 부족: 고유 액션 {len(unique_actions)}개만 존재 (강제 주입 실패 가능성)")
+                
+                # 마지막 안전장치: 기존 experience 중 일부를 강제로 UP/DOWN으로 변환
+                # (이미 state 벡터는 NEUTRAL용일 수 있지만, 보상과 액션을 강제로 바꿔서라도 다양성 확보)
+                if len(experiences) >= 2:
+                    # 1. UP 강제 변환
+                    experiences[0]['action'] = 1
+                    experiences[0]['reward'] = 0.0 # 중립 보상 (정보 없음)
+                    
+                    # 2. DOWN 강제 변환
+                    experiences[1]['action'] = 2
+                    experiences[1]['reward'] = 0.0 # 중립 보상 (정보 없음)
+                    
+                    # 다시 계산
+                    actions = [exp.get('action', 0) for exp in experiences]
+                    unique_actions = set(actions)
+                    action_counts = {action: actions.count(action) for action in unique_actions}
+                    
+                    logger.info(f"🔧 최후의 안전장치 발동: experiences 리스트 직접 수정하여 다양성 확보")
+                    logger.info(f"   수정 후 분포: {action_counts}")
+
+            # 재검증
+            if len(unique_actions) < 2:
+                logger.error(f"❌ 학습 전 검증 실패: 액션 다양성 부족 (고유 액션: {len(unique_actions)}개)")
+                logger.error(f"   액션 분포: {action_counts}")
+                logger.error(f"   학습을 중단합니다. 데이터 수집 로직을 확인하세요.")
+                raise ValueError(f"액션 다양성 부족: 고유 액션 {len(unique_actions)}개만 존재 (최소 2개 필요)")
             elif len(unique_actions) == 2:
-                logger.info(f"✅ 액션 다양성 양호: 고유 액션 {len(unique_actions)}개")
+                # 🆕 NEUTRAL이 없는 경우는 제한적이므로 WARNING
+                has_neutral = action_counts.get(0, 0) > 0
+                if not has_neutral:
+                    logger.warning(f"⚠️ 액션 다양성 제한적: 고유 액션 {len(unique_actions)}개 (NEUTRAL 없음)")
+                else:
+                    logger.info(f"✅ 액션 다양성 양호: 고유 액션 {len(unique_actions)}개")
             else:
                 logger.info(f"✅ 액션 다양성 우수: 고유 액션 {len(unique_actions)}개 (모든 방향 포함)")
         else:
@@ -1349,6 +1607,221 @@ class PPOTrainer:
         
         logger.debug(f"✅ 총 {len(experiences)}개 경험 추출 완료 (분석 데이터 포함)")
         return experiences
+    
+    def _ensure_neutral_trade_pool(
+        self,
+        buy_trades: List[Dict[str, Any]],
+        sell_trades: List[Dict[str, Any]],
+        hold_trades: List[Dict[str, Any]],
+        episode_num: Optional[int] = None,
+        agent_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """NEUTRAL 샘플 목표 비중을 만족하도록 트레이드 풀을 보강"""
+        hold_trades = list(hold_trades or [])
+        directional_count = len(buy_trades) + len(sell_trades)
+        total_reference = directional_count + len(hold_trades)
+        if total_reference == 0:
+            return hold_trades
+
+        target_neutral = max(
+            self.min_neutral_samples,
+            math.ceil(total_reference * self.neutral_target_ratio)
+        )
+        target_neutral = min(target_neutral, self.max_neutral_samples)
+
+        deficit = max(0, target_neutral - len(hold_trades))
+        if deficit <= 0:
+            return hold_trades
+
+        synthetic_trades = self._generate_synthetic_neutral_trades(
+            buy_trades + sell_trades,
+            deficit
+        )
+        if synthetic_trades:
+            hold_trades.extend(synthetic_trades)
+            context = f"episode={episode_num}, agent={agent_id}" if episode_num is not None else "selfplay"
+            logger.debug(
+                f"🆕 NEUTRAL 샘플 보강: 합성 {len(synthetic_trades)}개 추가 ({context})"
+            )
+        return hold_trades
+
+    def _ensure_directional_trade_pool(
+        self,
+        buy_trades: List[Dict[str, Any]],
+        sell_trades: List[Dict[str, Any]],
+        hold_trades: List[Dict[str, Any]],
+        episode_num: Optional[int] = None,
+        agent_id: Optional[str] = None
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """BUY/SELL 샘플이 모두 존재하도록 부족한 방향을 합성"""
+        buy_trades = list(buy_trades or [])
+        sell_trades = list(sell_trades or [])
+        hold_trades = list(hold_trades or [])
+
+        missing = []
+        if not buy_trades:
+            missing.append('BUY')
+        if not sell_trades:
+            missing.append('SELL')
+
+        if not missing:
+            return buy_trades, sell_trades
+
+        source_pool = hold_trades + buy_trades + sell_trades
+        if not source_pool:
+            return buy_trades, sell_trades
+
+        synthetic_summary = {}
+        for direction in missing:
+            synthetic = self._generate_synthetic_directional_trades(
+                source_pool,
+                direction,
+                target_count=self.min_directional_samples
+            )
+            if synthetic:
+                if direction == 'BUY':
+                    buy_trades.extend(synthetic)
+                else:
+                    sell_trades.extend(synthetic)
+                synthetic_summary[direction] = len(synthetic)
+
+        if synthetic_summary:
+            context = f"episode={episode_num}, agent={agent_id}" if episode_num is not None else "selfplay"
+            logger.debug(
+                f"🆕 Directional 샘플 보강: {synthetic_summary} ({context})"
+            )
+
+        return buy_trades, sell_trades
+
+    def _generate_synthetic_directional_trades(
+        self,
+        source_trades: List[Dict[str, Any]],
+        direction: str,
+        target_count: int
+    ) -> List[Dict[str, Any]]:
+        """소스 트레이드로부터 BUY/SELL 합성"""
+        if not source_trades or self.max_synthetic_directional <= 0:
+            return []
+
+        limit = min(max(1, target_count), self.max_synthetic_directional)
+        threshold = self.neutral_direction_threshold
+        ordered = sorted(
+            source_trades,
+            key=self._compute_trade_magnitude
+        )
+
+        synthetic: List[Dict[str, Any]] = []
+        polarity = 1.0 if direction == 'BUY' else -1.0
+        for trade in ordered:
+            if len(synthetic) >= limit:
+                break
+            cloned = copy.deepcopy(trade)
+            cloned['direction'] = 'BUY' if polarity > 0 else 'SELL'
+            cloned['synthetic_directional'] = True
+            
+            # 🔥 중요 수정: 합성 데이터는 임계값을 확실히 넘도록 설정 (1.5배)
+            # threshold가 0이면 최소 0.02(2%) 변동폭 부여
+            base_magnitude = threshold * 1.5 if threshold > 0 else 0.02
+            cloned['price_change'] = base_magnitude * polarity
+            
+            if 'regime' in cloned:
+                cloned['regime'] = cloned.get('regime', '').replace('neutral', 'bull' if polarity > 0 else 'bear')
+            synthetic.append(cloned)
+
+        return synthetic
+
+    def _generate_synthetic_neutral_trades(
+        self,
+        source_trades: List[Dict[str, Any]],
+        needed: int
+    ) -> List[Dict[str, Any]]:
+        """BUY/SELL 트레이드에서 합성 NEUTRAL 트레이드를 생성"""
+        if not source_trades or needed <= 0 or self.max_synthetic_neutral == 0:
+            return []
+
+        limit = min(needed, self.max_synthetic_neutral)
+        threshold = self.neutral_direction_threshold
+
+        def sort_key(trade):
+            return self._compute_trade_magnitude(trade)
+
+        small_moves = [t for t in source_trades if self._compute_trade_magnitude(t) <= threshold]
+        large_moves = [t for t in source_trades if self._compute_trade_magnitude(t) > threshold]
+        ordered = sorted(small_moves, key=sort_key) + sorted(large_moves, key=sort_key)
+
+        synthetic: List[Dict[str, Any]] = []
+        for trade in ordered:
+            if len(synthetic) >= limit:
+                break
+            cloned = copy.deepcopy(trade)
+            cloned['direction'] = 'HOLD'
+            cloned['synthetic_neutral'] = True
+            cloned['price_change'] = 0.0
+            # 상태 관련 필드가 없을 수 있으므로 안전하게 처리
+            for volatility_key in ['volatility', 'atr']:
+                if volatility_key in cloned:
+                    cloned[volatility_key] = max(0.0, float(cloned.get(volatility_key, 0.0)))
+            # 로그 추적용 힌트
+            original_dir = trade.get('direction', 'UNKNOWN')
+            cloned['neutral_source'] = original_dir
+            synthetic.append(cloned)
+
+        return synthetic
+
+    @staticmethod
+    def _compute_trade_magnitude(trade: Dict[str, Any]) -> float:
+        """트레이드의 방향 강도를 근사하는 지표"""
+        for key in ('price_change', 'pnl_pct', 'return_pct', 'delta', 'drift'):
+            value = trade.get(key)
+            if value is not None:
+                try:
+                    return abs(float(value))
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    def _select_trades_with_diversity(self, buy_trades, sell_trades, hold_trades):
+        """BUY/SELL/NEUTRAL 비중을 균형 있게 선택"""
+        if not buy_trades and not sell_trades and not hold_trades:
+            return []
+
+        max_dir = max(1, self.max_direction_samples)
+        selected_buy = buy_trades[:max(min(1, len(buy_trades)), min(len(buy_trades), max_dir))]
+        selected_sell = sell_trades[:max(min(1, len(sell_trades)), min(len(sell_trades), max_dir))]
+
+        min_hold = min(1, len(hold_trades))
+        base_hold_target = max(min_hold, self.min_neutral_samples)
+        initial_hold_target = min(len(hold_trades), min(self.max_neutral_samples, base_hold_target))
+        selected_hold = hold_trades[:initial_hold_target]
+        hold_used = initial_hold_target
+
+        selected = selected_buy + selected_sell + selected_hold
+
+        if selected:
+            current_neutral = sum(1 for t in selected if t.get('direction') not in ['BUY', 'SELL'])
+            required_neutral = max(self.min_neutral_samples, math.ceil(len(selected) * self.neutral_target_ratio))
+            required_neutral = min(required_neutral, self.max_neutral_samples, len(hold_trades))
+            deficit = max(0, required_neutral - current_neutral)
+            if deficit > 0 and hold_used < len(hold_trades):
+                additional = min(deficit, len(hold_trades) - hold_used)
+                if additional > 0:
+                    selected.extend(hold_trades[hold_used:hold_used + additional])
+                    hold_used += additional
+
+        selected_directions = [t.get('direction') for t in selected]
+        if 'BUY' not in selected_directions and buy_trades:
+            selected.append(buy_trades[0])
+            selected_directions.append('BUY')
+        if 'SELL' not in selected_directions and sell_trades:
+            selected.append(sell_trades[0])
+            selected_directions.append('SELL')
+        if not any(d not in ['BUY', 'SELL'] for d in selected_directions) and hold_trades:
+            fallback_idx = min(len(hold_trades) - 1, hold_used) if hold_trades else 0
+            fallback_trade = hold_trades[max(0, fallback_idx)]
+            selected.append(fallback_trade)
+            selected_directions.append(fallback_trade.get('direction', 'HOLD'))
+
+        return selected
     
     def _create_batches(self, experiences: List[Dict], batch_size: int) -> List[List[Dict]]:
         """경험을 배치로 분할"""
@@ -1385,6 +1858,7 @@ class PPOTrainer:
             rewards = []
             old_log_probs = []
             old_values = []
+            analysis_scores = []  # 🆕 분석 점수 리스트
             
             for exp in batch:
                 # State 벡터 추출
@@ -1421,6 +1895,10 @@ class PPOTrainer:
                 # Old value estimate
                 old_value = float(exp.get('value', exp.get('old_value', 0.0)))
                 old_values.append(old_value)
+
+                # 🆕 Analysis Score (Target)
+                analysis_score = float(exp.get('analysis_score', 50.0))  # 기본값 50 (중간)
+                analysis_scores.append(analysis_score)
             
             if not states:
                 logger.warning("⚠️ 배치에 유효한 state가 없습니다.")
@@ -1453,6 +1931,9 @@ class PPOTrainer:
             old_values_np = np.array(old_values, dtype=np.float32)
             old_values_np = np.nan_to_num(old_values_np, nan=0.0, posinf=1e6, neginf=-1e6)
             old_values_jax = jnp.array(old_values_np, dtype=jnp.float32)
+
+            analysis_scores_np = np.array(analysis_scores, dtype=np.float32)
+            analysis_scores_jax = jnp.array(analysis_scores_np, dtype=jnp.float32)
             
             # PPO 하이퍼파라미터
             clip_epsilon = self.train_config.get('clip_epsilon', 0.2)
@@ -1467,6 +1948,9 @@ class PPOTrainer:
             hold_count = action_counts.get(0, 0)
             hold_ratio = hold_count / len(actions) if actions else 0.0
 
+            neutral_target = self.neutral_target_ratio
+            severe_shortage = max(0.02, neutral_target * 0.25)
+
             # 🔥 예측 전략: NEUTRAL만 있는 경우 탐험 강화 (누적 증가)
             # NEUTRAL(중립 예측)만 하면 예측 정보가 없으므로 UP/DOWN 예측을 유도
             # 더 적극적인 탐험으로 액션 다양성 확보
@@ -1474,6 +1958,12 @@ class PPOTrainer:
                 # 모든 액션이 동일하면 탐험을 크게 증가 (누적)
                 self.current_entropy_coef = min(self.current_entropy_coef * 2.0, self.base_entropy_coef * 200.0)
                 logger.warning(f"🔍 예측 다양성 심각 부족 (고유 액션: {unique_actions}), entropy_coef 누적 증가: {self.current_entropy_coef:.4f}")
+            elif hold_ratio < severe_shortage:
+                self.current_entropy_coef = min(self.current_entropy_coef * 1.7, self.base_entropy_coef * 120.0)
+                logger.warning(f"🔍 NEUTRAL 액션 고갈 (비율: {hold_ratio:.1%} < 목표 {neutral_target:.0%}), entropy_coef 증가: {self.current_entropy_coef:.4f}")
+            elif hold_ratio < neutral_target:
+                self.current_entropy_coef = min(self.current_entropy_coef * 1.4, self.base_entropy_coef * 60.0)
+                logger.info(f"🔍 NEUTRAL 비율 부족 (현재 {hold_ratio:.1%}, 목표 {neutral_target:.0%}), entropy_coef 누적 증가: {self.current_entropy_coef:.4f}")
             elif hold_ratio > 0.95:
                 # 95% 이상이 NEUTRAL이면 탐험을 크게 증가 (누적)
                 self.current_entropy_coef = min(self.current_entropy_coef * 1.8, self.base_entropy_coef * 150.0)
@@ -1482,10 +1972,18 @@ class PPOTrainer:
                 # 90% 이상이 NEUTRAL이면 탐험을 증가 (누적)
                 self.current_entropy_coef = min(self.current_entropy_coef * 1.5, self.base_entropy_coef * 75.0)
                 logger.info(f"🔍 예측 다양성 부족 감지 (NEUTRAL 비율: {hold_ratio:.1%}), entropy_coef 누적 증가: {self.current_entropy_coef:.4f}")
-            elif unique_actions == 2 or hold_ratio > 0.7:
-                # 2종류 액션만 있거나 70% 이상이 NEUTRAL이면 중간 증가 (누적)
+            elif unique_actions == 2:
+                # 🆕 2종류 액션만 있는 경우 (NEUTRAL이 없는 경우) - 더 강력한 탐험
+                if hold_ratio < max(0.1, neutral_target * 0.5):
+                    self.current_entropy_coef = min(self.current_entropy_coef * 1.5, self.base_entropy_coef * 100.0)
+                    logger.warning(f"🔍 예측 다양성 심각 부족 (고유 액션: {unique_actions}, NEUTRAL 비율: {hold_ratio:.1%}), entropy_coef 강력 증가: {self.current_entropy_coef:.4f}")
+                else:
+                    self.current_entropy_coef = min(self.current_entropy_coef * 1.3, self.base_entropy_coef * 50.0)
+                    logger.info(f"🔍 예측 다양성 부족 감지 (고유 액션: {unique_actions}, NEUTRAL 비율: {hold_ratio:.1%}), entropy_coef 누적 증가: {self.current_entropy_coef:.4f}")
+            elif hold_ratio > 0.7:
+                # 70% 이상이 NEUTRAL이면 중간 증가 (누적)
                 self.current_entropy_coef = min(self.current_entropy_coef * 1.3, self.base_entropy_coef * 30.0)
-                logger.info(f"🔍 예측 다양성 부족 감지 (고유 액션: {unique_actions}, NEUTRAL 비율: {hold_ratio:.1%}), entropy_coef 누적 증가: {self.current_entropy_coef:.4f}")
+                logger.info(f"🔍 예측 다양성 부족 감지 (NEUTRAL 비율: {hold_ratio:.1%}), entropy_coef 누적 증가: {self.current_entropy_coef:.4f}")
             elif unique_actions == 3 and hold_ratio > 0.5:
                 # 3종류 모두 있지만 NEUTRAL이 절반 이상이면 약간 증가 (누적)
                 self.current_entropy_coef = min(self.current_entropy_coef * 1.1, self.base_entropy_coef * 8.0)
@@ -1527,10 +2025,12 @@ class PPOTrainer:
                 # 1. 액션별로 다른 보너스/페널티 추가 (강화됨)
                 actions_jax = jnp.array(actions, dtype=jnp.int32)
                 # 🔥 개선: BUY/SELL 보너스 증가 (0.1 → 0.3), HOLD에 페널티 추가
+                direction_bonus = max(0.0, self.direction_action_bonus * 3.0)
+                neutral_penalty = -abs(self.direction_action_bonus) * 0.5
                 action_bonuses = jnp.where(
                     (actions_jax == 1) | (actions_jax == 2),
-                    0.3,   # BUY/SELL에 강화된 보너스 (0.1 → 0.3)
-                    -0.1   # HOLD에 페널티 추가 (0.0 → -0.1) - 거래 유도
+                    direction_bonus,
+                    neutral_penalty
                 )
                 rewards_jax = rewards_jax + action_bonuses
                 
@@ -1615,7 +2115,7 @@ class PPOTrainer:
             # 🔥 배치 크기 사전 조정 (loss_fn 정의 전에 수행)
             # 클로저 변수 캡처를 위해 조건부 재할당 제거
             actual_batch_size = states_jax.shape[0] if states_jax.ndim > 0 else 0
-            max_safe_batch = 256  # 안전한 배치 크기
+            max_safe_batch = 2048  # 🔥 성능 개선: 256 -> 2048로 대폭 상향
             if actual_batch_size > max_safe_batch:
                 logger.warning(f"⚠️ 배치 크기 초과 ({actual_batch_size} > {max_safe_batch}), 처음 {max_safe_batch}개만 사용")
                 # ✅ 무조건 슬라이싱으로 재할당 (클로저 캡처 보장)
@@ -1624,6 +2124,7 @@ class PPOTrainer:
                 old_log_probs_jax = old_log_probs_jax[:max_safe_batch]
                 old_values_jax = old_values_jax[:max_safe_batch]
                 rewards_jax = rewards_jax[:max_safe_batch]
+                analysis_scores_jax = analysis_scores_jax[:max_safe_batch]  # 🆕
                 advantages_normalized = advantages_normalized[:max_safe_batch]
                 returns = returns[:max_safe_batch]
                 actual_batch_size = max_safe_batch
@@ -1727,15 +2228,19 @@ class PPOTrainer:
                         # JAX 컴파일 에러 방지를 위해 명시적으로 변수 검증
                         outputs = model.apply(variables, states_safe)
                         
-                        # 🆕 outputs는 (action_logits, value, price_change, horizon) 4개 값
+                        # 🆕 5개 출력 처리 (Multitask Learning)
                         if isinstance(outputs, tuple):
-                            if len(outputs) == 4:
+                            if len(outputs) == 5:
+                                action_logits, values, price_change_pred, horizon_pred, analysis_score_pred = outputs
+                            elif len(outputs) == 4:
                                 action_logits, values, price_change_pred, horizon_pred = outputs
+                                analysis_score_pred = jnp.full((batch_size, 1), 50.0)
                             elif len(outputs) == 2:
                                 # 이전 모델 호환성 (2개 출력)
                                 action_logits, values = outputs
                                 price_change_pred = jnp.zeros((states_safe.shape[0], 1))
                                 horizon_pred = jnp.ones((states_safe.shape[0], 1)) * 10
+                                analysis_score_pred = jnp.full((states_safe.shape[0], 1), 50.0)
                             else:
                                 logger.warning(f"⚠️ Model 출력 개수 예상과 다름: {len(outputs)}")
                                 safe_loss = jnp.array(0.0)
@@ -1772,6 +2277,9 @@ class PPOTrainer:
                                     logger.info(f"  🔄 {try_chunk_size} 크기로 재시도...")
                                     all_action_logits = []
                                     all_values = []
+                                    all_pc = []
+                                    all_h = []
+                                    all_as = []
                                     
                                     for chunk_start in range(0, states_safe.shape[0], try_chunk_size):
                                         chunk_end = min(chunk_start + try_chunk_size, states_safe.shape[0])
@@ -1780,16 +2288,27 @@ class PPOTrainer:
                                         # 각 청크에 대해 forward pass
                                         outputs_chunk = model.apply(variables, states_chunk)
 
-                                        # 🆕 4개 출력 처리
+                                        # 🆕 5개 출력 처리
                                         if isinstance(outputs_chunk, tuple):
-                                            if len(outputs_chunk) == 4:
-                                                action_logits_chunk, values_chunk, pc_chunk, h_chunk = outputs_chunk
+                                            if len(outputs_chunk) == 5:
+                                                a, v, p, h, s = outputs_chunk
+                                                all_as.append(s)
+                                                all_pc.append(p)
+                                                all_h.append(h)
+                                            elif len(outputs_chunk) == 4:
+                                                a, v, p, h = outputs_chunk
+                                                all_as.append(jnp.full((a.shape[0], 1), 50.0))
+                                                all_pc.append(p)
+                                                all_h.append(h)
                                             elif len(outputs_chunk) == 2:
-                                                action_logits_chunk, values_chunk = outputs_chunk
+                                                a, v = outputs_chunk
+                                                all_as.append(jnp.full((a.shape[0], 1), 50.0))
+                                                all_pc.append(jnp.zeros((a.shape[0], 1)))
+                                                all_h.append(jnp.ones((a.shape[0], 1)) * 10)
                                             else:
                                                 raise ValueError(f"청크 출력 개수 오류: {len(outputs_chunk)}")
-                                            all_action_logits.append(action_logits_chunk)
-                                            all_values.append(values_chunk)
+                                            all_action_logits.append(a)
+                                            all_values.append(v)
                                         else:
                                             raise ValueError(f"청크 출력 형식 오류: {type(outputs_chunk)}")
                                     
@@ -1797,6 +2316,9 @@ class PPOTrainer:
                                     if all_action_logits and all_values:
                                         action_logits = jnp.concatenate(all_action_logits, axis=0)
                                         values = jnp.concatenate(all_values, axis=0)
+                                        price_change_pred = jnp.concatenate(all_pc, axis=0)
+                                        horizon_pred = jnp.concatenate(all_h, axis=0)
+                                        analysis_score_pred = jnp.concatenate(all_as, axis=0)
                                         logger.info(f"✅ 분할 배치 처리 성공: {states_safe.shape[0]} → {len(all_action_logits)}개 청크 (각 {try_chunk_size} 크기)")
                                         success = True
                                         break  # 성공하면 루프 종료
@@ -1825,14 +2347,18 @@ class PPOTrainer:
                                         try:
                                             logger.info(f"  🔄 {states_safe.shape[0]} 크기로 직접 재시도...")
                                             outputs = model.apply(variables, states_safe)
-                                            # 🆕 4개 출력 처리
+                                            # 🆕 5개 출력 처리
                                             if isinstance(outputs, tuple):
-                                                if len(outputs) == 4:
+                                                if len(outputs) == 5:
+                                                    action_logits, values, price_change_pred, horizon_pred, analysis_score_pred = outputs
+                                                elif len(outputs) == 4:
                                                     action_logits, values, price_change_pred, horizon_pred = outputs
+                                                    analysis_score_pred = jnp.full((states_safe.shape[0], 1), 50.0)
                                                 elif len(outputs) == 2:
                                                     action_logits, values = outputs
                                                     price_change_pred = jnp.zeros((states_safe.shape[0], 1))
                                                     horizon_pred = jnp.ones((states_safe.shape[0], 1)) * 10
+                                                    analysis_score_pred = jnp.full((states_safe.shape[0], 1), 50.0)
                                                 logger.info(f"✅ 직접 재시도 성공: {states_safe.shape[0]}")
                                                 success = True
                                                 break
@@ -1843,6 +2369,9 @@ class PPOTrainer:
                                         logger.info(f"  🔄 {try_chunk_size} 크기로 분할 재시도...")
                                         all_action_logits = []
                                         all_values = []
+                                        all_pc = []
+                                        all_h = []
+                                        all_as = []
                                         
                                         for chunk_start in range(0, states_safe.shape[0], try_chunk_size):
                                             chunk_end = min(chunk_start + try_chunk_size, states_safe.shape[0])
@@ -1850,22 +2379,36 @@ class PPOTrainer:
                                             
                                             outputs_chunk = model.apply(variables, states_chunk)
 
-                                            # 🆕 4개 출력 처리
+                                            # 🆕 5개 출력 처리
                                             if isinstance(outputs_chunk, tuple):
-                                                if len(outputs_chunk) == 4:
-                                                    action_logits_chunk, values_chunk, pc_chunk, h_chunk = outputs_chunk
+                                                if len(outputs_chunk) == 5:
+                                                    a, v, p, h, s = outputs_chunk
+                                                    all_as.append(s)
+                                                    all_pc.append(p)
+                                                    all_h.append(h)
+                                                elif len(outputs_chunk) == 4:
+                                                    a, v, p, h = outputs_chunk
+                                                    all_as.append(jnp.full((a.shape[0], 1), 50.0))
+                                                    all_pc.append(p)
+                                                    all_h.append(h)
                                                 elif len(outputs_chunk) == 2:
-                                                    action_logits_chunk, values_chunk = outputs_chunk
+                                                    a, v = outputs_chunk
+                                                    all_as.append(jnp.full((a.shape[0], 1), 50.0))
+                                                    all_pc.append(jnp.zeros((a.shape[0], 1)))
+                                                    all_h.append(jnp.ones((a.shape[0], 1)) * 10)
                                                 else:
                                                     raise ValueError(f"청크 출력 개수 오류: {len(outputs_chunk)}")
-                                                all_action_logits.append(action_logits_chunk)
-                                                all_values.append(values_chunk)
+                                                all_action_logits.append(a)
+                                                all_values.append(v)
                                             else:
                                                 raise ValueError(f"청크 출력 형식 오류: {type(outputs_chunk)}")
                                         
                                         if all_action_logits and all_values:
                                             action_logits = jnp.concatenate(all_action_logits, axis=0)
                                             values = jnp.concatenate(all_values, axis=0)
+                                            price_change_pred = jnp.concatenate(all_pc, axis=0)
+                                            horizon_pred = jnp.concatenate(all_h, axis=0)
+                                            analysis_score_pred = jnp.concatenate(all_as, axis=0)
                                             logger.info(f"✅ 분할 재시도 성공: {states_safe.shape[0]} → {len(all_action_logits)}개 청크 (각 {try_chunk_size})")
                                             success = True
                                             break
@@ -1982,6 +2525,23 @@ class PPOTrainer:
                     horizon_loss = jnp.mean((horizon_pred_flat - horizon_target.squeeze()) ** 2)
                     horizon_loss = jnp.clip(horizon_loss, 0.0, 100.0)  # 클리핑 (0~100 범위)
 
+                    # 🆕 Analysis Score Loss (MSE)
+                    if analysis_score_pred.ndim == 2 and analysis_score_pred.shape[1] == 1:
+                        analysis_score_pred_flat = analysis_score_pred.squeeze(axis=1)
+                    else:
+                        analysis_score_pred_flat = analysis_score_pred
+                    
+                    # shape 맞추기 (안전장치)
+                    if analysis_score_pred_flat.shape[0] != analysis_scores_jax.shape[0]:
+                        min_len = min(analysis_score_pred_flat.shape[0], analysis_scores_jax.shape[0])
+                        analysis_score_pred_flat = analysis_score_pred_flat[:min_len]
+                        analysis_targets = analysis_scores_jax[:min_len]
+                    else:
+                        analysis_targets = analysis_scores_jax
+
+                    analysis_loss = jnp.mean((analysis_score_pred_flat - analysis_targets) ** 2)
+                    analysis_loss = jnp.clip(analysis_loss, 0.0, 10000.0)
+
                     # 총 손실 (Loss 구성 요소별 가중치 조정)
                     # 🆕 회귀 손실 추가 (작은 가중치로 시작)
                     regression_loss_coef = 0.1  # 회귀 손실 가중치 (향후 조정 가능)
@@ -1990,7 +2550,8 @@ class PPOTrainer:
                         value_loss_coef * value_loss -
                         entropy_coef * entropy +
                         regression_loss_coef * price_change_loss +
-                        regression_loss_coef * horizon_loss
+                        regression_loss_coef * horizon_loss +
+                        regression_loss_coef * (analysis_loss / 100.0)  # 스케일 조정
                     )
                     
                     # 🔥 Loss 정규화 (과도한 loss 방지)

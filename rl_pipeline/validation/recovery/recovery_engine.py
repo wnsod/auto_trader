@@ -437,10 +437,10 @@ class RecoveryEngine:
     def _checkpoint_database(self):
         """데이터베이스 WAL 체크포인트 실행"""
         try:
-            # learning_results.db는 이제 rl_strategies.db로 통합됨 (중복 제거)
+            # learning_results.db는 이제 learning_strategies.db로 통합됨 (중복 제거)
             db_paths = [
                 os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                            'data', 'rl_strategies.db')
+                            'data', 'learning_strategies.db')
             ]
 
             for db_path in db_paths:

@@ -11,6 +11,7 @@ import random
 import hashlib
 import json
 import numpy as np
+import pandas as pd
 from typing import Dict, List, Any, Optional, Tuple, Set
 from dataclasses import dataclass
 from datetime import datetime
@@ -222,7 +223,8 @@ def create_grid_search_strategies(coin: str, interval: str, df: Any,
             if has_real_data and not df.empty:
                 # MACD
                 if 'macd' in df.columns:
-                    macd_mean = df['macd'].mean()
+                    # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+                    macd_mean = df['macd'].median()
                     macd_std = df['macd'].std()
                     macd_min_actual = df['macd'].min()
                     macd_max_actual = df['macd'].max()
@@ -515,29 +517,122 @@ def create_direction_specialized_strategies(coin: str, interval: str, df: Any,
             atr_mean = 0.02
             has_real_data = False
         
-        # 1. 매수 특화 전략 (상승 추세 포착) - 데이터 기반
-        logger.info(f"📈 {coin} {interval} 매수 특화 전략 생성 (데이터 기반)...")
+        # 1. 매수 특화 전략 (상승 추세 포착) - 성공 패턴 기반
+        logger.info(f"📈 {coin} {interval} 매수 특화 전략 생성 (성공 패턴 기반)...")
+        
+        # 🆕 성공 패턴 추출: 저점에서 매수해서 성공한 케이스 찾기
+        successful_buy_patterns = []
+        if not df.empty and len(df) > 50:
+            try:
+                from trade.realtime_candles_calculate import calculate_pattern_pivot_points
+                df_with_pivot = calculate_pattern_pivot_points(df.copy(), interval)
+                
+                # 🆕 인터벌에 따라 동적으로 경계 제외 범위 조정
+                # pivot 계산에 필요한 최소값 (2개) + 여유분 (3개) = 5개
+                # 미래 수익 확인에 필요한 10개는 유지하되, 전체 데이터의 10%를 넘지 않도록
+                pivot_window_needed = 5  # pivot 계산에 필요한 앞쪽 여유분
+                future_check_needed = 10  # 미래 수익 확인에 필요한 뒤쪽 개수
+                max_exclude_ratio = 0.1  # 전체 데이터의 최대 10%만 제외
+                
+                total_needed = pivot_window_needed + future_check_needed
+                max_exclude_count = int(len(df_with_pivot) * max_exclude_ratio)
+                
+                # 데이터가 충분하면 고정값 사용, 부족하면 비율로 조정
+                if len(df_with_pivot) > total_needed * 2:
+                    start_idx = pivot_window_needed
+                    end_idx = len(df_with_pivot) - future_check_needed
+                else:
+                    # 데이터가 적으면 비율로 조정 (최소 3개는 앞쪽, 5개는 뒤쪽)
+                    start_idx = max(3, int(len(df_with_pivot) * 0.05))
+                    end_idx = len(df_with_pivot) - max(5, int(len(df_with_pivot) * 0.05))
+                
+                # 저점에서 매수해서 성공한 패턴 추출
+                for i in range(start_idx, end_idx):
+                    if df_with_pivot.iloc[i]['pivot_low'] == 1:
+                        entry_price = df_with_pivot.iloc[i]['low']
+                        entry_candle = df_with_pivot.iloc[i]
+                        
+                        # 이후 10개 캔들 중 최대 수익 확인
+                        future_candles = df_with_pivot.iloc[i+1:i+11]
+                        if len(future_candles) > 0:
+                            max_price = future_candles['high'].max()
+                            max_profit_pct = (max_price - entry_price) / entry_price if entry_price > 0 else 0
+                            
+                            # 2% 이상 수익 발생한 경우 성공 패턴으로 저장
+                            if max_profit_pct >= 0.02:
+                                pattern = {
+                                    'rsi': entry_candle.get('rsi', 50.0),
+                                    'macd': entry_candle.get('macd', 0.0),
+                                    'macd_signal': entry_candle.get('macd_signal', 0.0),
+                                    'volume_ratio': entry_candle.get('volume_ratio', 1.0),
+                                    'mfi': entry_candle.get('mfi', 50.0),
+                                    'atr': entry_candle.get('atr', 0.02),
+                                    'profit_pct': max_profit_pct
+                                }
+                                successful_buy_patterns.append(pattern)
+                
+                if successful_buy_patterns:
+                    logger.info(f"  ✅ {coin} {interval} 성공 매수 패턴 {len(successful_buy_patterns)}개 발견")
+                else:
+                    logger.debug(f"  ⚠️ {coin} {interval} 성공 매수 패턴 없음 (기본 범위 사용)")
+            except Exception as e:
+                logger.debug(f"  ⚠️ {coin} {interval} 성공 패턴 추출 실패: {e}")
+        
+        # 성공 패턴 기반 파라미터 생성 (Instance-based Imitation)
+        # 통계적 평균(Mean)을 쓰지 않고, 성공했던 개별 케이스를 직접 모방하여 다양성 확보
+        if successful_buy_patterns:
+            logger.info(f"  🧬 {coin} {interval}: {len(successful_buy_patterns)}개의 성공 매수 패턴을 기반으로 정밀 전략 생성")
+        
         for i in range(n_per_direction):
-            # 🆕 낮은 RSI 범위: 실제 데이터의 하위 30% 구간
-            rsi_low_range = max(10, rsi_min_actual)
-            rsi_low_range_max = min(rsi_mean - rsi_std, rsi_max_actual * 0.5)
-            rsi_min = random.uniform(rsi_low_range, rsi_low_range_max)
-            rsi_max = random.uniform(rsi_mean, min(rsi_mean + rsi_std * 1.5, rsi_max_actual))
-            
-            # 🆕 높은 거래량: 실제 데이터의 상위 50% 구간
-            volume_high_min = max(volume_mean, volume_min_actual * 1.2)
-            volume_min = random.uniform(volume_high_min, volume_max_actual * 0.8)
-            volume_max = random.uniform(volume_min * 1.2, min(volume_max_actual, volume_mean + volume_std * 2))
-            
-            # 🆕 MACD 상승 신호: 실제 데이터 기반
-            macd_buy_range_min = max(macd_min_actual, macd_mean - macd_std)
-            macd_buy_range_max = min(macd_max_actual, macd_mean + macd_std * 2)
-            macd_buy = random.uniform(macd_buy_range_min, macd_buy_range_max)
-            macd_sell = random.uniform(macd_min_actual, min(macd_mean - macd_std, macd_max_actual))
+            # 🆕 성공 패턴 기반 파라미터 생성
+            if successful_buy_patterns:
+                # 1. 성공했던 케이스 중 하나를 무작위 선택 (Template)
+                target_pattern = random.choice(successful_buy_patterns)
+                
+                # 2. 해당 케이스의 지표 값을 기준으로 좁은 탐색 범위 설정 (정밀 타격)
+                # RSI: 타겟 값 주변 ±3~7 범위
+                center_rsi = target_pattern.get('rsi', 50)
+                rsi_span = random.uniform(3, 7)
+                rsi_min = max(10, center_rsi - rsi_span)
+                rsi_max = min(90, center_rsi + rsi_span)
+                
+                # Volume: 타겟 값 주변 ±15% 범위
+                center_vol = target_pattern.get('volume_ratio', 1.0)
+                vol_span_ratio = random.uniform(0.1, 0.2)
+                volume_min = max(0.3, center_vol * (1 - vol_span_ratio))
+                volume_max = min(5.0, center_vol * (1 + vol_span_ratio))
+                
+                # MACD: 타겟 값 주변 미세 조정
+                center_macd = target_pattern.get('macd', 0.0)
+                macd_span = 0.0005  # 매우 좁게
+                macd_buy = center_macd + random.uniform(-macd_span, macd_span)
+                macd_sell = 0.0 # 매수 전략에서 macd_sell_threshold는 청산용이거나 미사용
+            else:
+                # 성공 패턴이 없으면 기본 범위 사용 (기존 로직 유지)
+                rsi_low_range = max(10, rsi_min_actual)
+                rsi_low_range_max = min(rsi_mean - rsi_std, rsi_max_actual * 0.5)
+                rsi_min = random.uniform(rsi_low_range, rsi_low_range_max)
+                rsi_max = random.uniform(rsi_mean, min(rsi_mean + rsi_std * 1.5, rsi_max_actual))
+                
+                volume_high_min = max(volume_mean, volume_min_actual * 1.2)
+                volume_min = random.uniform(volume_high_min, volume_max_actual * 0.8)
+                volume_max = random.uniform(volume_min * 1.2, min(volume_max_actual, volume_mean + volume_std * 2))
+                
+                macd_buy_range_min = max(macd_min_actual, macd_mean - macd_std)
+                macd_buy_range_max = min(macd_max_actual, macd_mean + macd_std * 2)
+                macd_buy = random.uniform(macd_buy_range_min, macd_buy_range_max)
+                macd_sell = random.uniform(macd_min_actual, min(macd_mean - macd_std, macd_max_actual))
             
             # 보수적 손절, 공격적 익절
             stop_loss = random.uniform(0.015, 0.025)
             take_profit = random.uniform(0.05, 0.1)
+            
+            # 🆕 성공 패턴 기반 전략 메타데이터
+            strategy_metadata = {
+                'success_pattern_based': len(successful_buy_patterns) > 0,
+                'success_pattern_count': len(successful_buy_patterns),
+                'entry_filter_type': 'low_point_detection'
+            }
             
             strategy = Strategy(
                 id=f"{coin}_{interval}_buy_specialized_{i:04d}",
@@ -569,32 +664,125 @@ def create_direction_specialized_strategies(coin: str, interval: str, df: Any,
                 atr_condition={'min': max(0.01, atr_min_actual if has_real_data else 0.01), 
                              'max': min(0.05, atr_max_actual if has_real_data else 0.05)},
                 pattern_source='direction_specialized',
-                enhancement_type='buy_optimized'
+                enhancement_type='buy_optimized',
+                metadata=strategy_metadata
             )
             strategies_by_direction['BUY'].append(strategy)
         
-        # 2. 매도 특화 전략 (하락 추세 포착) - 데이터 기반
-        logger.info(f"📉 {coin} {interval} 매도 특화 전략 생성 (데이터 기반)...")
+        # 2. 매도 특화 전략 (하락 추세 포착) - 성공 패턴 기반
+        logger.info(f"📉 {coin} {interval} 매도 특화 전략 생성 (성공 패턴 기반)...")
+        
+        # 🆕 성공 패턴 추출: 고점에서 매도해서 성공한 케이스 찾기
+        successful_sell_patterns = []
+        if not df.empty and len(df) > 50:
+            try:
+                from trade.realtime_candles_calculate import calculate_pattern_pivot_points
+                df_with_pivot = calculate_pattern_pivot_points(df.copy(), interval)
+                
+                # 🆕 인터벌에 따라 동적으로 경계 제외 범위 조정
+                # pivot 계산에 필요한 최소값 (2개) + 여유분 (3개) = 5개
+                # 미래 수익 확인에 필요한 10개는 유지하되, 전체 데이터의 10%를 넘지 않도록
+                pivot_window_needed = 5  # pivot 계산에 필요한 앞쪽 여유분
+                future_check_needed = 10  # 미래 수익 확인에 필요한 뒤쪽 개수
+                max_exclude_ratio = 0.1  # 전체 데이터의 최대 10%만 제외
+                
+                total_needed = pivot_window_needed + future_check_needed
+                max_exclude_count = int(len(df_with_pivot) * max_exclude_ratio)
+                
+                # 데이터가 충분하면 고정값 사용, 부족하면 비율로 조정
+                if len(df_with_pivot) > total_needed * 2:
+                    start_idx = pivot_window_needed
+                    end_idx = len(df_with_pivot) - future_check_needed
+                else:
+                    # 데이터가 적으면 비율로 조정 (최소 3개는 앞쪽, 5개는 뒤쪽)
+                    start_idx = max(3, int(len(df_with_pivot) * 0.05))
+                    end_idx = len(df_with_pivot) - max(5, int(len(df_with_pivot) * 0.05))
+                
+                # 고점에서 매도해서 성공한 패턴 추출
+                for i in range(start_idx, end_idx):
+                    if df_with_pivot.iloc[i]['pivot_high'] == 1:
+                        entry_price = df_with_pivot.iloc[i]['high']
+                        entry_candle = df_with_pivot.iloc[i]
+                        
+                        # 이후 10개 캔들 중 최대 손익 확인 (매도는 가격 하락이 수익)
+                        future_candles = df_with_pivot.iloc[i+1:i+11]
+                        if len(future_candles) > 0:
+                            min_price = future_candles['low'].min()
+                            max_profit_pct = (entry_price - min_price) / entry_price if entry_price > 0 else 0
+                            
+                            # 2% 이상 수익 발생한 경우 성공 패턴으로 저장
+                            if max_profit_pct >= 0.02:
+                                pattern = {
+                                    'rsi': entry_candle.get('rsi', 50.0),
+                                    'macd': entry_candle.get('macd', 0.0),
+                                    'macd_signal': entry_candle.get('macd_signal', 0.0),
+                                    'volume_ratio': entry_candle.get('volume_ratio', 1.0),
+                                    'mfi': entry_candle.get('mfi', 50.0),
+                                    'atr': entry_candle.get('atr', 0.02),
+                                    'profit_pct': max_profit_pct
+                                }
+                                successful_sell_patterns.append(pattern)
+                
+                if successful_sell_patterns:
+                    logger.info(f"  ✅ {coin} {interval} 성공 매도 패턴 {len(successful_sell_patterns)}개 발견")
+                else:
+                    logger.debug(f"  ⚠️ {coin} {interval} 성공 매도 패턴 없음 (기본 범위 사용)")
+            except Exception as e:
+                logger.debug(f"  ⚠️ {coin} {interval} 성공 패턴 추출 실패: {e}")
+        
+        # 성공 패턴 기반 파라미터 생성 (Instance-based Imitation) - 매도 전략
+        if successful_sell_patterns:
+            logger.info(f"  🧬 {coin} {interval}: {len(successful_sell_patterns)}개의 성공 매도 패턴을 기반으로 정밀 전략 생성")
+        
         for i in range(n_per_direction):
-            # 🆕 높은 RSI 범위: 실제 데이터의 상위 30% 구간
-            rsi_high_range_min = max(rsi_mean + rsi_std, rsi_min_actual * 0.5)
-            rsi_min = random.uniform(rsi_high_range_min, rsi_mean + rsi_std)
-            rsi_max = random.uniform(max(rsi_mean + rsi_std * 1.5, rsi_max_actual * 0.8), min(90, rsi_max_actual))
-            
-            # 🆕 거래량 급증: 실제 데이터의 상위 70% 구간
-            volume_surge_min = max(volume_mean + volume_std, volume_min_actual * 1.5)
-            volume_min = random.uniform(volume_surge_min, volume_max_actual * 0.9)
-            volume_max = random.uniform(volume_min * 1.2, min(volume_max_actual, volume_mean + volume_std * 3))
-            
-            # 🆕 MACD 하락 신호: 실제 데이터 기반
-            macd_sell_range_min = max(macd_mean + macd_std, macd_min_actual)
-            macd_sell_range_max = min(macd_max_actual, macd_mean + macd_std * 2)
-            macd_sell = random.uniform(macd_sell_range_min, macd_sell_range_max)
-            macd_buy = random.uniform(macd_min_actual, min(macd_mean + macd_std, macd_max_actual))
+            # 🆕 성공 패턴 기반 파라미터 생성
+            if successful_sell_patterns:
+                # 1. 성공했던 케이스 중 하나를 무작위 선택 (Template)
+                target_pattern = random.choice(successful_sell_patterns)
+                
+                # 2. 해당 케이스의 지표 값을 기준으로 좁은 탐색 범위 설정
+                # RSI: 타겟 값 주변 ±3~7 범위
+                center_rsi = target_pattern.get('rsi', 50)
+                rsi_span = random.uniform(3, 7)
+                rsi_min = max(10, center_rsi - rsi_span)
+                rsi_max = min(90, center_rsi + rsi_span)
+                
+                # Volume: 타겟 값 주변 ±15% 범위
+                center_vol = target_pattern.get('volume_ratio', 1.0)
+                vol_span_ratio = random.uniform(0.1, 0.2)
+                volume_min = max(0.3, center_vol * (1 - vol_span_ratio))
+                volume_max = min(5.0, center_vol * (1 + vol_span_ratio))
+                
+                # MACD: 타겟 값 주변 미세 조정
+                center_macd = target_pattern.get('macd', 0.0)
+                macd_span = 0.0005
+                macd_sell = center_macd + random.uniform(-macd_span, macd_span)
+                macd_buy = 0.0 # 매도 전략에서 macd_buy_threshold는 청산용이거나 미사용
+            else:
+                # 성공 패턴이 없으면 기본 범위 사용 (기존 로직 유지)
+                rsi_high_range_min = max(rsi_mean + rsi_std, rsi_min_actual * 0.5)
+                rsi_min = random.uniform(rsi_high_range_min, rsi_mean + rsi_std)
+                rsi_max = random.uniform(max(rsi_mean + rsi_std * 1.5, rsi_max_actual * 0.8), min(90, rsi_max_actual))
+                
+                volume_surge_min = max(volume_mean + volume_std, volume_min_actual * 1.5)
+                volume_min = random.uniform(volume_surge_min, volume_max_actual * 0.9)
+                volume_max = random.uniform(volume_min * 1.2, min(volume_max_actual, volume_mean + volume_std * 3))
+                
+                macd_sell_range_min = max(macd_mean + macd_std, macd_min_actual)
+                macd_sell_range_max = min(macd_max_actual, macd_mean + macd_std * 2)
+                macd_sell = random.uniform(macd_sell_range_min, macd_sell_range_max)
+                macd_buy = random.uniform(macd_min_actual, min(macd_mean + macd_std, macd_max_actual))
             
             # 공격적 손절, 보수적 익절
             stop_loss = random.uniform(0.02, 0.04)
             take_profit = random.uniform(0.03, 0.06)
+            
+            # 🆕 성공 패턴 기반 전략 메타데이터
+            strategy_metadata = {
+                'success_pattern_based': len(successful_sell_patterns) > 0,
+                'success_pattern_count': len(successful_sell_patterns),
+                'entry_filter_type': 'high_point_detection'
+            }
             
             strategy = Strategy(
                 id=f"{coin}_{interval}_sell_specialized_{i:04d}",
@@ -626,71 +814,17 @@ def create_direction_specialized_strategies(coin: str, interval: str, df: Any,
                 atr_condition={'min': max(0.01, atr_min_actual if has_real_data else 0.01), 
                              'max': min(0.05, atr_max_actual if has_real_data else 0.05)},
                 pattern_source='direction_specialized',
-                enhancement_type='sell_optimized'
+                enhancement_type='sell_optimized',
+                metadata=strategy_metadata
             )
             strategies_by_direction['SELL'].append(strategy)
         
-        # 3. 홀드 특화 전략 (박스권/변동성 낮음) - 데이터 기반
-        logger.info(f"⚖️ {coin} {interval} 홀드 특화 전략 생성 (데이터 기반)...")
-        for i in range(n_per_direction):
-            # 🆕 중립 RSI 범위: 실제 데이터의 중간 ±표준편차 구간
-            rsi_neutral_min = max(rsi_mean - rsi_std, rsi_min_actual)
-            rsi_neutral_max = min(rsi_mean + rsi_std, rsi_max_actual)
-            rsi_min = random.uniform(rsi_neutral_min, rsi_mean - rsi_std * 0.5)
-            rsi_max = random.uniform(rsi_mean + rsi_std * 0.5, rsi_neutral_max)
-            
-            # 🆕 낮은 거래량 (박스권): 실제 데이터의 평균 근처 구간
-            volume_neutral_min = max(volume_min_actual, volume_mean - volume_std)
-            volume_neutral_max = min(volume_max_actual, volume_mean + volume_std)
-            volume_min = random.uniform(volume_neutral_min, volume_mean - volume_std * 0.5)
-            volume_max = random.uniform(volume_mean + volume_std * 0.5, volume_neutral_max)
-            
-            # 🆕 중립 MACD: 실제 데이터의 평균 근처
-            macd_neutral_min = max(macd_min_actual, macd_mean - macd_std)
-            macd_neutral_max = min(macd_max_actual, macd_mean + macd_std)
-            macd_buy = random.uniform(macd_neutral_min, macd_mean)
-            macd_sell = random.uniform(macd_mean, macd_neutral_max)
-            
-            # 보수적 손절/익절
-            stop_loss = random.uniform(0.02, 0.03)
-            take_profit = random.uniform(0.04, 0.06)
-            
-            strategy = Strategy(
-                id=f"{coin}_{interval}_hold_specialized_{i:04d}",
-                params={
-                    'rsi_min': rsi_min,
-                    'rsi_max': rsi_max,
-                    'volume_ratio_min': volume_min,
-                    'volume_ratio_max': volume_max,
-                    'stop_loss_pct': stop_loss,
-                    'take_profit_pct': take_profit,
-                    'macd_buy_threshold': macd_buy,
-                    'macd_sell_threshold': macd_sell,
-                },
-                version="v2.0",
-                coin=coin,
-                interval=interval,
-                created_at=datetime.now(),
-                strategy_type="hold_specialized",
-                rsi_min=rsi_min,
-                rsi_max=rsi_max,
-                volume_ratio_min=volume_min,
-                volume_ratio_max=volume_max,
-                stop_loss_pct=stop_loss,
-                take_profit_pct=take_profit,
-                macd_buy_threshold=macd_buy,
-                macd_sell_threshold=macd_sell,
-                rsi_condition={'min': rsi_min, 'max': rsi_max},
-                volume_condition={'min': volume_min, 'max': volume_max},
-                atr_condition={'min': max(0.01, atr_min_actual if has_real_data else 0.01), 
-                             'max': min(0.05, atr_max_actual if has_real_data else 0.05)},
-                pattern_source='direction_specialized',
-                enhancement_type='hold_optimized'
-            )
-            strategies_by_direction['HOLD'].append(strategy)
+        # 3. 홀드 특화 전략 (생성하지 않음 - 관망은 매매 신호 부재의 결과여야 함)
+        # logger.info(f"⚖️ {coin} {interval} 홀드 특화 전략 생성 건너뜀 (관망 전략 비활성화)")
+        strategies_by_direction['HOLD'] = []
         
         total = sum(len(v) for v in strategies_by_direction.values())
-        logger.info(f"✅ 방향성별 특화 전략 생성 완료: 총 {total}개 (BUY:{len(strategies_by_direction['BUY'])}, SELL:{len(strategies_by_direction['SELL'])}, HOLD:{len(strategies_by_direction['HOLD'])})")
+        logger.info(f"✅ 방향성별 특화 전략 생성 완료: 총 {total}개 (BUY:{len(strategies_by_direction['BUY'])}, SELL:{len(strategies_by_direction['SELL'])})")
         return strategies_by_direction
         
     except Exception as e:
@@ -715,12 +849,12 @@ def create_enhanced_strategies_with_diversity(coin: str, interval: str, df: Any,
         all_strategies.extend(grid_strategies)
         logger.info(f"✅ 그리드 서치: {len(grid_strategies)}개")
         
-        # 2. 방향성별 특화 전략 (40% - 각 방향성 13.3%)
-        direction_count = int(total_count * 0.133)
+        # 2. 방향성별 특화 전략 (40% - 각 방향성 20%)
+        direction_count = int(total_count * 0.2)
         direction_strategies = create_direction_specialized_strategies(coin, interval, df, direction_count)
         all_strategies.extend(direction_strategies['BUY'])
         all_strategies.extend(direction_strategies['SELL'])
-        all_strategies.extend(direction_strategies['HOLD'])
+        # HOLD 전략은 추가하지 않음
         logger.info(f"✅ 방향성별 특화: {sum(len(v) for v in direction_strategies.values())}개")
         
         # 3. 기존 지능형 전략 (30%) - create_intelligent_strategies 호출은 별도로

@@ -101,15 +101,15 @@ def calculate_regime_from_indicators(rsi: float, atr: float, price: float) -> st
 # ============================================================================
 
 def add_regime_column_to_strategies():
-    """coin_strategies 테이블에 regime 컬럼 추가"""
+    """strategies 테이블에 regime 컬럼 추가"""
     try:
-        logger.info("🔧 coin_strategies 테이블에 regime 컬럼 추가 시작...")
+        logger.info("🔧 strategies 테이블에 regime 컬럼 추가 시작...")
 
         with get_optimized_db_connection("strategies") as conn:
             cursor = conn.cursor()
 
             # 컬럼 존재 여부 확인
-            cursor.execute("PRAGMA table_info(coin_strategies)")
+            cursor.execute("PRAGMA table_info(strategies)")
             columns = [col[1] for col in cursor.fetchall()]
 
             if 'regime' in columns:
@@ -118,7 +118,7 @@ def add_regime_column_to_strategies():
 
             # regime 컬럼 추가
             cursor.execute("""
-                ALTER TABLE coin_strategies
+                ALTER TABLE strategies
                 ADD COLUMN regime TEXT DEFAULT 'ranging'
             """)
             conn.commit()
@@ -128,7 +128,7 @@ def add_regime_column_to_strategies():
             # 인덱스 추가
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_strategies_coin_interval_regime
-                ON coin_strategies(coin, interval, regime)
+                ON strategies(coin, interval, regime)
             """)
             conn.commit()
 
@@ -154,7 +154,7 @@ def verify_regime_column():
         with get_optimized_db_connection("strategies") as conn:
             cursor = conn.cursor()
 
-            cursor.execute("PRAGMA table_info(coin_strategies)")
+            cursor.execute("PRAGMA table_info(strategies)")
             columns = {col[1]: col[2] for col in cursor.fetchall()}
 
             if 'regime' not in columns:
@@ -196,8 +196,8 @@ def count_strategies_by_regime(coin: str, interval: str) -> Dict[str, int]:
 
             cursor.execute("""
                 SELECT regime, COUNT(*) as count
-                FROM coin_strategies
-                WHERE coin = ? AND interval = ?
+                FROM strategies
+                WHERE symbol = ? AND interval = ?
                 GROUP BY regime
             """, (coin, interval))
 
@@ -226,7 +226,7 @@ def analyze_strategy_coverage():
             # 코인-인터벌 목록 조회
             cursor.execute("""
                 SELECT DISTINCT coin, interval
-                FROM coin_strategies
+                FROM strategies
                 ORDER BY coin, interval
             """)
 
@@ -309,8 +309,8 @@ def limit_strategies_per_regime(coin: str, interval: str, regime: str, max_count
 
             # 현재 전략 수 확인
             cursor.execute("""
-                SELECT COUNT(*) FROM coin_strategies
-                WHERE coin = ? AND interval = ? AND regime = ?
+                SELECT COUNT(*) FROM strategies
+                WHERE symbol = ? AND interval = ? AND regime = ?
             """, (coin, interval, regime))
 
             current_count = cursor.fetchone()[0]
@@ -323,10 +323,10 @@ def limit_strategies_per_regime(coin: str, interval: str, regime: str, max_count
             delete_count = current_count - max_count
 
             cursor.execute("""
-                DELETE FROM coin_strategies
+                DELETE FROM strategies
                 WHERE id IN (
-                    SELECT id FROM coin_strategies
-                    WHERE coin = ? AND interval = ? AND regime = ?
+                    SELECT id FROM strategies
+                    WHERE symbol = ? AND interval = ? AND regime = ?
                     ORDER BY profit ASC
                     LIMIT ?
                 )
@@ -374,11 +374,11 @@ def test_strategy_save_and_load():
             cursor = conn.cursor()
 
             # 기존 테스트 전략 삭제
-            cursor.execute("DELETE FROM coin_strategies WHERE id = ?", (test_strategy['id'],))
+            cursor.execute("DELETE FROM strategies WHERE id = ?", (test_strategy['id'],))
 
             # 전략 저장
             cursor.execute("""
-                INSERT INTO coin_strategies
+                INSERT INTO strategies
                 (id, coin, interval, regime, strategy_type, profit, win_rate,
                  sharpe_ratio, max_drawdown, profit_factor, trades_count,
                  quality_grade, created_at)
@@ -405,7 +405,7 @@ def test_strategy_save_and_load():
             # 전략 로드
             cursor.execute("""
                 SELECT id, coin, interval, regime, profit, win_rate, quality_grade
-                FROM coin_strategies
+                FROM strategies
                 WHERE id = ?
             """, (test_strategy['id'],))
 
@@ -428,7 +428,7 @@ def test_strategy_save_and_load():
                 logger.info("✅ 데이터 검증 통과")
 
                 # 테스트 데이터 정리
-                cursor.execute("DELETE FROM coin_strategies WHERE id = ?", (test_strategy['id'],))
+                cursor.execute("DELETE FROM strategies WHERE id = ?", (test_strategy['id'],))
                 conn.commit()
                 logger.info("✅ 테스트 데이터 정리 완료")
 

@@ -95,7 +95,7 @@ class LabelRewardSystem:
             cursor.execute("""
                 SELECT rmax_mean, rmin_mean, kmax_mean, pf, win_rate, n_signals
                 FROM strategy_label_stats
-                WHERE coin = ? AND interval = ? AND regime_tag = ? AND strategy_id = ?
+                WHERE symbol = ? AND interval = ? AND regime_tag = ? AND strategy_id = ?
             """, (coin, interval, regime_tag, strategy_id))
 
             stats_row = cursor.fetchone()

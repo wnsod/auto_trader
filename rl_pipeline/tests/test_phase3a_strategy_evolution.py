@@ -23,7 +23,7 @@ from rl_pipeline.strategy.strategy_evolver import (
     EVOLUTION_MIN_GRADE
 )
 from rl_pipeline.db.connection_pool import get_strategy_db_pool
-from rl_pipeline.db.schema import create_coin_strategies_table
+from rl_pipeline.db.schema import create_strategies_table
 
 logging.basicConfig(
     level=logging.INFO,
@@ -422,7 +422,7 @@ def test_db_save():
     
     try:
         # 기본 테이블 생성 (없을 경우)
-        create_coin_strategies_table()
+        create_strategies_table()
         
         evolver = StrategyEvolver()
         strategies = create_test_strategies()
@@ -434,7 +434,7 @@ def test_db_save():
             
             # 기존 테스트 전략 삭제 (클린업)
             cursor.execute("""
-                DELETE FROM coin_strategies 
+                DELETE FROM strategies 
                 WHERE id LIKE 'test_evolution%'
             """)
             cursor.execute("""
@@ -447,7 +447,7 @@ def test_db_save():
             for strategy in strategies[:2]:  # 첫 2개만
                 import json
                 cursor.execute("""
-                    INSERT OR REPLACE INTO coin_strategies (
+                    INSERT OR REPLACE INTO strategies (
                         id, coin, interval, quality_grade, profit, win_rate,
                         rsi_min, rsi_max, stop_loss_pct, take_profit_pct, version
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -488,8 +488,8 @@ def test_db_save():
             cursor = conn.cursor()
             
             for e in evolved:
-                # coin_strategies 확인
-                cursor.execute("SELECT id, parent_id, version FROM coin_strategies WHERE id = ?", (e.strategy_id,))
+                # strategies 확인
+                cursor.execute("SELECT id, parent_id, version FROM strategies WHERE id = ?", (e.strategy_id,))
                 result = cursor.fetchone()
                 
                 if not result:

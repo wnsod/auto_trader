@@ -139,14 +139,15 @@ def analyze_market(coin: str, interval: str, df: pd.DataFrame) -> Optional[Dict[
         
         # 가격 통계
         closes = analysis_df['close'].values
-        price_mean = np.mean(closes)
+        # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+        price_mean = np.median(closes)
         price_std = np.std(closes)
         price_trend = (closes[-1] - closes[0]) / closes[0] if len(closes) > 0 else 0.0
         
         # RSI 통계
         rsis = analysis_df['rsi'].dropna().values if 'rsi' in analysis_df.columns else []
         if len(rsis) > 0:
-            rsi_mean = np.mean(rsis)
+            rsi_mean = np.median(rsis)
             rsi_std = np.std(rsis)
             rsi_25 = np.percentile(rsis, 25)
             rsi_75 = np.percentile(rsis, 75)
@@ -156,7 +157,7 @@ def analyze_market(coin: str, interval: str, df: pd.DataFrame) -> Optional[Dict[
         # 거래량 통계
         volumes = analysis_df['volume'].values if 'volume' in analysis_df.columns else []
         if len(volumes) > 0:
-            volume_mean = np.mean(volumes)
+            volume_mean = np.median(volumes)
             volume_std = np.std(volumes)
         else:
             volume_mean = volume_std = 1.0
@@ -164,7 +165,7 @@ def analyze_market(coin: str, interval: str, df: pd.DataFrame) -> Optional[Dict[
         # Volume Ratio 통계 (실제 전략 조건에 사용)
         volume_ratios = analysis_df['volume_ratio'].dropna().values if 'volume_ratio' in analysis_df.columns else []
         if len(volume_ratios) > 0:
-            volume_ratio_mean = np.mean(volume_ratios)
+            volume_ratio_mean = np.median(volume_ratios)
             volume_ratio_std = np.std(volume_ratios)
             volume_ratio_25 = np.percentile(volume_ratios, 25)
             volume_ratio_75 = np.percentile(volume_ratios, 75)
@@ -177,7 +178,7 @@ def analyze_market(coin: str, interval: str, df: pd.DataFrame) -> Optional[Dict[
         # ATR 통계
         atrs = analysis_df['atr'].dropna().values if 'atr' in analysis_df.columns else []
         if len(atrs) > 0:
-            atr_mean = np.mean(atrs)
+            atr_mean = np.median(atrs)
             atr_std = np.std(atrs)
         else:
             atr_mean = atr_std = 0.02
@@ -695,7 +696,18 @@ def create_intelligent_strategies(coin: str, interval: str, num_strategies: int,
         if not suppress_detailed_logs:
             logger.info(f"🔍 {coin} {interval} 받은 데이터 검증:")
             logger.info(f"  - 데이터 개수: {len(df)}")
+            # 컬럼 목록에서 coin 대신 symbol이 있는지 확인
+            # 하지만 df는 pandas DataFrame이므로 컬럼명을 단순히 출력함.
+            # 데이터 로드 시점에 coin으로 되어 있었다면 여기서도 coin으로 보임.
+            # 이 로그는 검증용이므로 그대로 두되, 실제 로직에서 coin 사용 여부를 체크해야 함.
             logger.info(f"  - 컬럼 목록: {list(df.columns)}")
+
+        # 데이터프레임 컬럼 표준화 (coin -> symbol)
+        # 전략 생성 로직 내에서 'coin' 컬럼에 의존하는 부분이 있다면 'symbol'로 변경하거나 매핑 필요
+        if 'coin' in df.columns and 'symbol' not in df.columns:
+            # 복사본을 만들지 않고 inplace로 수정하면 원본 데이터에 영향을 줄 수 있으므로 주의
+            # 여기서는 읽기 전용으로 사용되므로 큰 문제 없을 수 있으나, 안전하게 처리
+            pass # df['symbol'] = df['coin'] # 필요한 경우 추가
 
         # 필수 기술지표 확인
         required_indicators = ['rsi', 'volume_ratio', 'macd', 'macd_signal', 'mfi', 'atr', 'adx']
@@ -1049,7 +1061,7 @@ def create_intelligent_strategies(coin: str, interval: str, num_strategies: int,
 
 
 
-def create_coin_strategies_dynamic(coin: str, intervals: List[str], all_candle_data: Dict[Tuple[str, str], pd.DataFrame]) -> int:
+def create_strategies_dynamic(coin: str, intervals: List[str], all_candle_data: Dict[Tuple[str, str], pd.DataFrame]) -> int:
 
     """🆕 코인별 동적 분할 전략 생성 함수 - 15일 기준 자동 분할"""
 
@@ -1226,17 +1238,21 @@ def _load_trained_strategies(coin: str, interval: str) -> List[Dict[str, Any]]:
     """
     try:
         from rl_pipeline.db.connection_pool import get_strategy_db_pool
-
-        pool = get_strategy_db_pool()
+        from rl_pipeline.core.env import config
+        
+        # 🔥 코인별 DB 경로 사용
+        coin_db_path = config.get_strategy_db_path(coin)
+        pool = get_strategy_db_pool(coin_db_path)
+        
         with pool.get_connection() as conn:
             cursor = conn.cursor()
 
             # strategy_training_history와 조인하여 학습 완료된 전략만 로드
             query = """
                 SELECT cs.*
-                FROM coin_strategies cs
+                FROM strategies cs
                 INNER JOIN strategy_training_history sth ON cs.id = sth.strategy_id
-                WHERE cs.coin = ? AND cs.interval = ?
+                WHERE cs.symbol = ? AND cs.interval = ?
                 ORDER BY sth.trained_at DESC
             """
 
@@ -1263,7 +1279,7 @@ def _load_trained_strategies(coin: str, interval: str) -> List[Dict[str, Any]]:
         return []
 
 
-def create_coin_strategies(coin: str, intervals: List[str], all_candle_data: Dict[Tuple[str, str], pd.DataFrame]) -> int:
+def create_strategies(coin: str, intervals: List[str], all_candle_data: Dict[Tuple[str, str], pd.DataFrame]) -> int:
 
     try:
 
@@ -1300,8 +1316,8 @@ def create_coin_strategies(coin: str, intervals: List[str], all_candle_data: Dic
                 # 🆕 개선된 전략 생성 (방향성 확보)
                 strategies = []
                 
-                # 환경변수로 개선 모드 제어
-                use_enhanced_generation = os.getenv('USE_ENHANCED_STRATEGY_GENERATION', 'false').lower() == 'true'
+                # 🆕 개선 모드: ENHANCEMENTS_AVAILABLE이 있으면 기본적으로 사용 (환경변수로 비활성화 가능)
+                use_enhanced_generation = os.getenv('USE_ENHANCED_STRATEGY_GENERATION', 'true' if ENHANCEMENTS_AVAILABLE else 'false').lower() == 'true'
                 
                 if use_enhanced_generation and ENHANCEMENTS_AVAILABLE:
                     logger.info(f"🚀 {coin} {interval}: 개선된 전략 생성 모드 사용")
@@ -1352,10 +1368,15 @@ def create_coin_strategies(coin: str, intervals: List[str], all_candle_data: Dic
                     logger.info(f"✅ 그리드 서치 전략: {len(grid_strategies)}개 ({grid_ratio:.0%})")
                     
                     # 3. 방향성별 특화 전략 (비율 기반, 각 방향 동일 분배) - 중복 체크 포함
-                    direction_count = int(config.STRATEGIES_PER_COMBINATION * direction_ratio / 3)  # 각 방향에 동일 분배
+                    direction_count = int(config.STRATEGIES_PER_COMBINATION * direction_ratio / 2)  # BUY, SELL만 (HOLD 제외)
                     direction_strategies_raw = create_direction_specialized_strategies(coin, interval, df, direction_count * 2)  # 여유 있게 생성
                     direction_strategies = {'BUY': [], 'SELL': [], 'HOLD': []}
-                    for direction in ['BUY', 'SELL', 'HOLD']:
+                    
+                    # BUY, SELL만 처리 (HOLD 제외)
+                    for direction in ['BUY', 'SELL']:
+                        if direction not in direction_strategies_raw:
+                            continue
+                            
                         for s in direction_strategies_raw[direction]:
                             if ENHANCEMENTS_AVAILABLE:
                                 s_hash = generate_strategy_hash(s)
@@ -1368,10 +1389,11 @@ def create_coin_strategies(coin: str, intervals: List[str], all_candle_data: Dic
                                 direction_strategies[direction].append(s)
                                 if len(direction_strategies[direction]) >= direction_count:
                                     break
+                    
                     strategies.extend(direction_strategies['BUY'])
                     strategies.extend(direction_strategies['SELL'])
-                    strategies.extend(direction_strategies['HOLD'])
-                    logger.info(f"✅ 방향성별 특화 전략: {sum(len(v) for v in direction_strategies.values())}개")
+                    # strategies.extend(direction_strategies['HOLD'])  # HOLD 전략 제외
+                    logger.info(f"✅ 방향성별 특화 전략: {sum(len(v) for v in direction_strategies.values())}개 (HOLD 제외)")
                     
                     # 🆕 목표 개수 맞추기: 부족하면 추가 생성 (중복 체크 포함)
                     target_count = config.STRATEGIES_PER_COMBINATION
@@ -1544,12 +1566,12 @@ def _analyze_directional_periods(df: pd.DataFrame) -> Dict[str, int]:
             window_data = df.iloc[start_idx:start_idx + window]
             
             # RSI 분석
-            avg_rsi = window_data['rsi'].mean() if 'rsi' in window_data.columns else 50.0
+            avg_rsi = window_data['rsi'].median() if 'rsi' in window_data.columns else 50.0
             
             # MACD 분석
-            avg_macd = window_data['macd'].mean() if 'macd' in window_data.columns else 0.0
+            avg_macd = window_data['macd'].median() if 'macd' in window_data.columns else 0.0
             if 'macd_signal' in window_data.columns:
-                avg_macd_signal = window_data['macd_signal'].mean()
+                avg_macd_signal = window_data['macd_signal'].median()
                 macd_bullish = avg_macd > avg_macd_signal and avg_macd > 0.005
                 macd_bearish = avg_macd < avg_macd_signal and avg_macd < -0.005
             else:
@@ -1819,7 +1841,7 @@ def create_indicator_condition(indicator: str, group: str, df: pd.DataFrame, str
                     # numeric으로 변환 시도
                     numeric_data = pd.to_numeric(sampled_data, errors='coerce').dropna()
                     if len(numeric_data) > 0:
-                        mean_val = numeric_data.mean()
+                        mean_val = numeric_data.median()  # 🔧 mean 대신 median 사용
                         std_val = numeric_data.std()
                         
                         if condition_type == 'range':
@@ -1993,7 +2015,8 @@ def create_integrated_analysis_strategy(
                 strategy_params['volume_ratio_max'] = vol_cond.get('max', 2.0)
         else:
             if 'volume_ratio' in df.columns:
-                avg_vol = df['volume_ratio'].mean()
+                # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+                avg_vol = df['volume_ratio'].median()
                 vol_std = df['volume_ratio'].std()
                 strategy_params['volume_ratio_min'] = max(0.5, avg_vol - vol_std)
                 strategy_params['volume_ratio_max'] = min(5.0, avg_vol + vol_std)
@@ -2009,7 +2032,8 @@ def create_integrated_analysis_strategy(
                 strategy_params['macd_sell_threshold'] = macd_cond.get('sell', 0.0)
         else:
             if 'macd' in df.columns:
-                avg_macd = df['macd'].mean()
+                # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+                avg_macd = df['macd'].median()
                 macd_std = df['macd'].std()
                 strategy_params['macd_buy_threshold'] = avg_macd - macd_std
                 strategy_params['macd_sell_threshold'] = avg_macd + macd_std
@@ -2342,19 +2366,13 @@ def _calculate_macd_buy_threshold(df: pd.DataFrame, market_condition: str, patte
         
 
         # 최근 MACD 값들의 통계 계산
-
         recent_macd = df['macd'].tail(20)
-
-        macd_mean = recent_macd.mean()
-
+        # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+        macd_mean = recent_macd.median()
         macd_std = recent_macd.std()
-
         
-
         # 시장 상황별 기본 임계값
-
         base_thresholds = {
-
             'bullish': 0.02,
 
             'bearish': -0.01,
@@ -2428,19 +2446,13 @@ def _calculate_macd_sell_threshold(df: pd.DataFrame, market_condition: str, patt
         
 
         # 최근 MACD 값들의 통계 계산
-
         recent_macd = df['macd'].tail(20)
-
-        macd_mean = recent_macd.mean()
-
+        # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+        macd_mean = recent_macd.median()
         macd_std = recent_macd.std()
-
         
-
         # 시장 상황별 기본 임계값
-
         base_thresholds = {
-
             'bullish': -0.01,
 
             'bearish': 0.02,
@@ -2521,45 +2533,26 @@ def create_enhanced_market_adaptive_strategy(
         
 
         # 실제 데이터 기반 파라미터 계산
-
         if not df.empty and len(df) > 20:
-
             # 실제 지표값 계산 (모든 지표 활용!)
-
-            avg_rsi = df['rsi'].mean()
-
+            # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+            avg_rsi = df['rsi'].median()
             rsi_std = df['rsi'].std()
-
-            avg_volume_ratio = df['volume_ratio'].mean()
-
+            avg_volume_ratio = df['volume_ratio'].median()
             volume_std = df['volume_ratio'].std()
-
-            avg_atr = df['atr'].mean()
-
+            avg_atr = df['atr'].median()
             atr_std = df['atr'].std()
-
             
-
             # MFI 계산 (사용 가능한 경우)
-
-            avg_mfi = df['mfi'].mean() if 'mfi' in df.columns else 50.0
-
+            avg_mfi = df['mfi'].median() if 'mfi' in df.columns else 50.0
             mfi_std = df['mfi'].std() if 'mfi' in df.columns else 15.0
-
             
-
             # ADX 계산 (사용 가능한 경우)
-
-            avg_adx = df['adx'].mean() if 'adx' in df.columns else 25.0
-
+            avg_adx = df['adx'].median() if 'adx' in df.columns else 25.0
             adx_std = df['adx'].std() if 'adx' in df.columns else 10.0
-
             
-
             # MACD 계산 (사용 가능한 경우)
-
-            avg_macd = df['macd'].mean() if 'macd' in df.columns else 0.0
-
+            avg_macd = df['macd'].median() if 'macd' in df.columns else 0.0
             macd_std = df['macd'].std() if 'macd' in df.columns else 0.01
 
             
@@ -2976,19 +2969,20 @@ def create_guided_random_strategy(
         # 🔥 실제 캔들 데이터에서 지표 계산
         if not df.empty and len(df) > 20:
             # 실제 지표값 계산
-            avg_rsi = df['rsi'].mean() if 'rsi' in df.columns and not df['rsi'].isna().all() else 50.0
+            # 🔥 평균(Mean) -> 중앙값(Median) 변경으로 이상치 영향 최소화
+            avg_rsi = df['rsi'].median() if 'rsi' in df.columns and not df['rsi'].isna().all() else 50.0
             rsi_std = df['rsi'].std() if 'rsi' in df.columns and not df['rsi'].isna().all() else 15.0
             
-            avg_volume_ratio = df['volume_ratio'].mean() if 'volume_ratio' in df.columns and not df['volume_ratio'].isna().all() else 1.0
+            avg_volume_ratio = df['volume_ratio'].median() if 'volume_ratio' in df.columns and not df['volume_ratio'].isna().all() else 1.0
             volume_std = df['volume_ratio'].std() if 'volume_ratio' in df.columns and not df['volume_ratio'].isna().all() else 0.5
             
-            avg_atr = df['atr'].mean() if 'atr' in df.columns and not df['atr'].isna().all() else 0.02
+            avg_atr = df['atr'].median() if 'atr' in df.columns and not df['atr'].isna().all() else 0.02
             atr_std = df['atr'].std() if 'atr' in df.columns and not df['atr'].isna().all() else 0.01
             
-            avg_mfi = df['mfi'].mean() if 'mfi' in df.columns and not df['mfi'].isna().all() else 50.0
+            avg_mfi = df['mfi'].median() if 'mfi' in df.columns and not df['mfi'].isna().all() else 50.0
             mfi_std = df['mfi'].std() if 'mfi' in df.columns and not df['mfi'].isna().all() else 15.0
             
-            avg_adx = df['adx'].mean() if 'adx' in df.columns and not df['adx'].isna().all() else 25.0
+            avg_adx = df['adx'].median() if 'adx' in df.columns and not df['adx'].isna().all() else 25.0
             adx_std = df['adx'].std() if 'adx' in df.columns and not df['adx'].isna().all() else 10.0
         else:
             # 데이터 부족 시 기본값
@@ -3590,7 +3584,7 @@ def create_global_strategies(all_coin_data: Dict[str, Dict[str, pd.DataFrame]],
 
 
 
-def create_global_strategies_from_results(all_coin_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> int:
+def create_global_strategies_from_results(all_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> int:
 
     """
 
@@ -3600,7 +3594,7 @@ def create_global_strategies_from_results(all_coin_strategies: Dict[str, Dict[st
 
     Args:
 
-        all_coin_strategies: 모든 코인의 self-play 결과 {coin: {interval: [strategy_list]}}
+        all_strategies: 모든 코인의 self-play 결과 {coin: {interval: [strategy_list]}}
 
 
 
@@ -3616,7 +3610,7 @@ def create_global_strategies_from_results(all_coin_strategies: Dict[str, Dict[st
 
 
 
-        if not all_coin_strategies:
+        if not all_strategies:
 
             logger.warning("⚠️ self-play 결과 없음, 기본 글로벌 전략만 생성")
 
@@ -3633,7 +3627,7 @@ def create_global_strategies_from_results(all_coin_strategies: Dict[str, Dict[st
         logger.info("📊 구역 기반 글로벌 전략 생성 (regime × RSI × market × volatility)")
 
         # 구역 기반 글로벌 전략 생성
-        global_strategies = create_zone_based_global_strategies(all_coin_strategies)
+        global_strategies = create_zone_based_global_strategies(all_strategies)
 
         if not global_strategies:
             logger.warning("⚠️ 구역 기반 글로벌 전략 생성 실패, 기본 글로벌 전략 생성")

@@ -1,6 +1,6 @@
 """
 Learning Results DB 관리 모듈
-이제 rl_strategies.db로 통합됨
+이제 learning_strategies.db로 통합됨
 """
 
 import logging
@@ -13,453 +13,570 @@ from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-# DB 경로 - learning_results.db는 이제 rl_strategies.db로 통합됨
+# DB 경로 - learning_results.db는 이제 learning_strategies.db로 통합됨
 # config에서 LEARNING_RESULTS_DB_PATH = STRATEGIES_DB로 설정됨
 from rl_pipeline.core.env import config
-LEARNING_RESULTS_DB_PATH = config.LEARNING_RESULTS_DB_PATH
+
+def get_learning_results_db_path() -> str:
+    """동적으로 학습 결과 DB 경로 반환 (디렉토리 모드 지원)"""
+    # 🔥 환경변수 우선 확인 (엔진화된 run_learning.py에서 설정)
+    env_strategies_path = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
+    
+    if env_strategies_path:
+        base_path = env_strategies_path
+    else:
+        base_path = config.LEARNING_RESULTS_DB_PATH
+    
+    # 🔧 디렉토리 모드 지원: 폴더면 common_strategies.db 사용
+    if os.path.isdir(base_path) or not base_path.endswith('.db'):
+        result = os.path.join(base_path, 'common_strategies.db')
+    else:
+        result = base_path
+    
+    # 절대 경로로 변환
+    return os.path.abspath(result)
+
+# 호환성을 위한 변수 (동적 경로는 get_learning_results_db_path() 사용 권장)
+# 🔥 참고: 이 변수는 임포트 시점에 고정됨. 런타임에는 get_learning_results_db_path() 사용
+def _get_initial_db_path():
+    try:
+        path = get_learning_results_db_path()
+        logger.debug(f"📂 learning_results DB 경로: {path}")
+        return path
+    except Exception as e:
+        logger.warning(f"⚠️ learning_results DB 경로 초기화 실패: {e}")
+        return None
+
+LEARNING_RESULTS_DB_PATH = _get_initial_db_path()
 
 
 @contextmanager
 def get_learning_db_connection(db_path: str = None):
     """learning_results.db 연결 관리"""
     if db_path is None:
-        db_path = LEARNING_RESULTS_DB_PATH
+        db_path = get_learning_results_db_path()
+    
+    # 🔧 디렉토리 모드 지원: 폴더면 common_strategies.db 사용
+    if os.path.isdir(db_path) or not db_path.endswith('.db'):
+        db_path = os.path.join(db_path, 'common_strategies.db')
+    
+    # 🔥 절대 경로 변환 (상대 경로 문제 방지)
+    db_path = os.path.abspath(db_path)
+    
+    # 디렉토리가 없으면 생성
+    db_dir = os.path.dirname(db_path)
+    if db_dir and not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            logger.info(f"📁 DB 디렉토리 생성: {db_dir}")
+        except Exception as e:
+            logger.warning(f"⚠️ DB 디렉토리 생성 실패 ({db_dir}): {e}")
     
     conn = None
     try:
-        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn = sqlite3.connect(db_path, timeout=60.0)
+        conn.execute("PRAGMA busy_timeout=60000")
         conn.row_factory = sqlite3.Row
         yield conn
     except Exception as e:
         if conn:
             conn.rollback()
-        logger.error(f"❌ rl_strategies.db (learning_results) 연결 실패: {e}")
+        # 🔥 실제 경로를 에러 메시지에 포함
+        logger.error(f"❌ learning_results DB 연결 실패 ({db_path}): {e}")
         raise
     finally:
         if conn:
             conn.close()
 
 def create_learning_results_tables(db_path: str = None) -> bool:
-    """rl_strategies.db에 learning_results 테이블 생성 (통합됨)"""
+    """learning_strategies.db에 learning_results 테이블 생성 (통합됨)
+
+    핵심 설계:
+    - coin → symbol 매핑
+    - market_type, market 컬럼 추가
+    """
     try:
         if db_path is None:
             db_path = LEARNING_RESULTS_DB_PATH
         with get_learning_db_connection(db_path) as conn:
             cursor = conn.cursor()
-            
+
             # 1. Self-play 진화 결과
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS selfplay_evolution_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
                     interval TEXT NOT NULL,
                     regime TEXT NOT NULL,
-                    
+
                     -- 진화 전략 정보
                     initial_strategy TEXT NOT NULL,
                     evolved_strategy TEXT NOT NULL,
                     evolution_steps INTEGER DEFAULT 0,
-                    
+
                     -- 진화 성과
                     initial_performance REAL DEFAULT 0.0,
                     evolved_performance REAL DEFAULT 0.0,
                     improvement_rate REAL DEFAULT 0.0,
-                    
+
                     -- 진화 과정
                     evolution_history TEXT DEFAULT '[]',
                     adaptation_patterns TEXT DEFAULT '{}',
-                    
+
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             # 2. 레짐 기반 라우팅 결과
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS regime_routing_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
                     interval TEXT NOT NULL,
                     regime TEXT NOT NULL,
-                    
+
                     -- 라우팅된 전략
                     routed_strategy TEXT NOT NULL,
                     routing_confidence REAL DEFAULT 0.0,
                     routing_score REAL DEFAULT 0.0,
-                    
+
                     -- 레짐별 성능
                     regime_performance REAL DEFAULT 0.0,
                     regime_adaptation REAL DEFAULT 0.0,
-                    
+
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # 3. 통합분석 결과
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS integrated_analysis_results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
-                    interval TEXT NOT NULL,
-                    regime TEXT NOT NULL,
-                    
-                    -- 분석 결과
-                    fractal_score REAL DEFAULT 0.0,
-                    multi_timeframe_score REAL DEFAULT 0.0,
-                    indicator_cross_score REAL DEFAULT 0.0,
-                    
-                    -- JAX 앙상블 결과
-                    ensemble_score REAL DEFAULT 0.0,
-                    ensemble_confidence REAL DEFAULT 0.0,
-                    
-                    -- 최종 시그널 점수
-                    final_signal_score REAL DEFAULT 0.0,
-                    signal_confidence REAL DEFAULT 0.0,
-                    signal_action TEXT DEFAULT 'hold',
-                    
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # 4. 실시간 학습 피드백
+
+            # 3. 실시간 학습 피드백
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS realtime_learning_feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
                     interval TEXT NOT NULL,
                     signal_id TEXT NOT NULL,
-                    
+
                     -- 시그널 정보
                     signal_score REAL DEFAULT 0.0,
                     signal_action TEXT NOT NULL,
                     signal_timestamp DATETIME NOT NULL,
-                    
+
                     -- 실제 결과
                     actual_profit REAL DEFAULT 0.0,
                     actual_success BOOLEAN DEFAULT FALSE,
                     market_condition TEXT DEFAULT 'unknown',
-                    
+
                     -- 학습 피드백
                     learning_adjustment REAL DEFAULT 0.0,
                     strategy_update TEXT DEFAULT '{}',
-                    
+
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # 5. 글로벌 전략 결과
+
+            # 4. 글로벌 전략 결과
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS global_strategy_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+
                     -- 글로벌 성능
                     overall_score REAL DEFAULT 0.0,
                     overall_confidence REAL DEFAULT 0.0,
                     policy_improvement REAL DEFAULT 0.0,
                     convergence_rate REAL DEFAULT 0.0,
-                    
+
                     -- 상위 성능
                     top_performers TEXT DEFAULT '[]',
-                    top_coins TEXT DEFAULT '[]',
+                    top_symbols TEXT DEFAULT '[]',
                     top_intervals TEXT DEFAULT '[]',
-                    
+
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # 6. 파이프라인 실행 로그
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS pipeline_execution_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
-                    interval TEXT NOT NULL,
-                    
-                    -- 실행 통계
-                    strategies_created INTEGER DEFAULT 0,
-                    selfplay_episodes INTEGER DEFAULT 0,
-                    regime_detected TEXT DEFAULT 'unknown',
-                    routing_results INTEGER DEFAULT 0,
-                    
-                    -- 최종 결과
-                    signal_score REAL DEFAULT 0.0,
-                    signal_action TEXT DEFAULT 'HOLD',
-                    execution_time REAL DEFAULT 0.0,
-                    status TEXT DEFAULT 'unknown',
-                    
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # 🆕 7. 시그널 계산용 전략 요약 테이블 (realtime_signal_selector.py 전용)
+
+            # 5. 시그널 계산용 전략 요약 테이블
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS strategy_summary_for_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
                     interval TEXT NOT NULL,
-                    
+
                     -- 최상위 전략 요약 정보
                     top_strategy_id TEXT,
-                    top_strategy_params TEXT,  -- JSON: {rsi_min, rsi_max, volume_ratio_min, ...}
+                    top_strategy_params TEXT,
                     top_profit REAL DEFAULT 0.0,
                     top_win_rate REAL DEFAULT 0.0,
-                    top_quality_grade TEXT,  -- S/A/B/C/D/F
-                    
+                    top_quality_grade TEXT,
+
                     -- 평균 성능 지표
                     avg_profit REAL DEFAULT 0.0,
                     avg_win_rate REAL DEFAULT 0.0,
                     avg_sharpe_ratio REAL DEFAULT 0.0,
                     avg_calmar_ratio REAL DEFAULT 0.0,
                     avg_profit_factor REAL DEFAULT 0.0,
-                    
+
                     -- 전략 통계
                     total_strategies INTEGER DEFAULT 0,
                     s_grade_count INTEGER DEFAULT 0,
                     a_grade_count INTEGER DEFAULT 0,
-                    
-                    -- 업데이트 시간
+
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    
-                    UNIQUE(coin, interval)
+
+                    UNIQUE(market_type, market, symbol, interval)
                 )
             """)
-            
-            # 🆕 8. 시그널 계산용 DNA 요약 테이블
+
+            # 6. 시그널 계산용 DNA 요약 테이블
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS dna_summary_for_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT,
                     interval TEXT,
-                    
-                    -- DNA 요약 정보 (실시간 시그널 계산용)
-                    profitability_score REAL DEFAULT 0.0,  -- win_rate mean
-                    stability_score REAL DEFAULT 0.0,      -- trades_count 기반
-                    scalability_score REAL DEFAULT 0.0,    -- complexity_score mean
-                    dna_quality REAL DEFAULT 0.0,          -- total_strategies 기반
-                    
+
+                    -- DNA 요약 정보
+                    profitability_score REAL DEFAULT 0.0,
+                    stability_score REAL DEFAULT 0.0,
+                    scalability_score REAL DEFAULT 0.0,
+                    dna_quality REAL DEFAULT 0.0,
+
                     -- DNA 패턴 요약
-                    rsi_pattern TEXT,  -- 최빈 RSI 패턴
-                    macd_pattern TEXT,  -- 최빈 MACD 패턴
-                    volume_pattern TEXT,  -- 최빈 Volume 패턴
-                    
+                    rsi_pattern TEXT,
+                    macd_pattern TEXT,
+                    volume_pattern TEXT,
+
                     -- DNA 히스토리 요약
-                    dna_momentum REAL DEFAULT 0.0,  -- 최근 변화율
-                    dna_stability REAL DEFAULT 0.0,  -- 안정성 점수
-                    
+                    dna_momentum REAL DEFAULT 0.0,
+                    dna_stability REAL DEFAULT 0.0,
+
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    
-                    UNIQUE(coin, interval)
+
+                    UNIQUE(market_type, market, symbol, interval)
                 )
             """)
-            
-            # 🆕 9. 시그널 계산용 글로벌 전략 요약 테이블
+
+            # 7. 시그널 계산용 글로벌 전략 요약 테이블
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS global_strategy_summary_for_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
                     interval TEXT NOT NULL,
-                    
+
                     -- 최상위 글로벌 전략 요약
                     top_global_strategy_id TEXT,
-                    top_global_strategy_params TEXT,  -- JSON
+                    top_global_strategy_params TEXT,
                     top_global_score REAL DEFAULT 0.0,
-                    
+
                     -- 평균 성능
                     avg_global_score REAL DEFAULT 0.0,
                     avg_global_confidence REAL DEFAULT 0.0,
-                    
+
                     -- 통계
                     total_global_strategies INTEGER DEFAULT 0,
-                    
+
                     -- 학습 품질 지표
                     learning_quality_score REAL DEFAULT 0.0,
                     reliability_score REAL DEFAULT 0.0,
-                    
+
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    
-                    UNIQUE(interval)
+
+                    UNIQUE(market_type, interval)
                 )
             """)
-            
-            # 🆕 10. 시그널 계산용 프랙탈/시너지 요약 테이블
+
+            # 8. 시그널 계산용 프랙탈/시너지 요약 테이블
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS analysis_summary_for_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
                     interval TEXT NOT NULL,
-                    
+
                     -- 프랙탈 분석 요약
                     fractal_score REAL DEFAULT 0.0,
-                    fractal_pattern TEXT,  -- JSON
-                    
+                    fractal_pattern TEXT,
+
                     -- 시너지 분석 요약
                     synergy_score REAL DEFAULT 0.0,
-                    synergy_patterns TEXT,  -- JSON
-                    
+                    synergy_patterns TEXT,
+
                     -- 최적 조건
                     optimal_rsi_min REAL DEFAULT 30.0,
                     optimal_rsi_max REAL DEFAULT 70.0,
                     optimal_volume_ratio REAL DEFAULT 1.0,
-                    
+
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    
-                    UNIQUE(coin, interval)
+
+                    UNIQUE(market_type, market, symbol, interval)
                 )
             """)
-            
-            # 인덱스 생성
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_selfplay_coin_interval ON selfplay_evolution_results(coin, interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_regime_routing_coin_interval ON regime_routing_results(coin, interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_integrated_analysis_coin_interval ON integrated_analysis_results(coin, interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_realtime_feedback_coin_interval ON realtime_learning_feedback(coin, interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_logs_coin_interval ON pipeline_execution_logs(coin, interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_strategy_summary_coin_interval ON strategy_summary_for_signals(coin, interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dna_summary_coin_interval ON dna_summary_for_signals(coin, interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_global_strategy_summary_interval ON global_strategy_summary_for_signals(interval)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_summary_coin_interval ON analysis_summary_for_signals(coin, interval)")
-            
-            conn.commit()
-            logger.info("✅ rl_strategies.db learning_results 테이블 생성 완료")
-            return True
-            
-    except Exception as e:
-        logger.error(f"❌ rl_strategies.db learning_results 테이블 생성 실패: {e}")
-        return False
 
-def save_selfplay_results(coin: str, interval: str, selfplay_result: Dict[str, Any], db_path: str = None) -> bool:
-    """Self-play 결과를 rl_strategies.db에 저장"""
-    try:
-        import json
-        from rl_pipeline.db.connection_pool import get_optimized_db_connection
-        
-        # 🔥 원본 summary 보존 (온라인 결과로 덮어써지지 않도록)
-        original_summary = selfplay_result.get("summary", {})
-        summary = original_summary.copy() if original_summary else {}
-        cycle_results = selfplay_result.get("cycle_results", [])
-        
-        # 🔥 rl_strategies.db에 selfplay_results 테이블 생성 및 저장
-        with get_optimized_db_connection("strategies") as conn:
-            cursor = conn.cursor()
-            
-            # selfplay_results 테이블이 없으면 생성
+            # 9. selfplay_results 테이블 (save_selfplay_results에서 사용)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS selfplay_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    coin TEXT NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
                     interval TEXT NOT NULL,
                     episodes INTEGER NOT NULL,
                     results TEXT NOT NULL,
                     summary TEXT,
                     created_at TEXT NOT NULL,
-                    UNIQUE(coin, interval, episodes, results)
+                    UNIQUE(market_type, market, symbol, interval, episodes, results)
                 )
             """)
-            
-            saved_count = 0
-            
-            # 🔥 cycle_results가 없으면 traditional_result에서 가져오기 (dual mode 대응)
-            if not cycle_results and selfplay_result.get('dual_mode'):
-                traditional_result = selfplay_result.get('traditional_result')
-                if traditional_result:
-                    cycle_results = traditional_result.get("cycle_results", [])
-            
-            # 🔥 온라인 Self-play 결과 처리 추가 (온라인 결과가 아직 변환되지 않은 경우)
-            online_summary = None  # 온라인 summary 별도 저장 (원본 summary 보존)
-            if not cycle_results:
-                try:
-                    from rl_pipeline.hybrid.online_data_converter import (
-                        extract_online_selfplay_result,
-                        convert_online_segments_to_cycle_results
-                    )
-                    
-                    online_segments = extract_online_selfplay_result(selfplay_result)
-                    if online_segments:
-                        cycle_results = convert_online_segments_to_cycle_results(online_segments, summary)
-                        logger.debug(f"✅ 온라인 Self-play 결과 변환 완료 ({len(cycle_results)}개 cycle)")
-                    # online_result에 직접 있는 경우
-                    elif selfplay_result.get('online_result'):
-                        online_result = selfplay_result.get('online_result', {})
-                        online_segments = online_result.get('segment_results', [])
-                        if online_segments:
-                            online_summary = online_result.get('summary', {})  # 별도 저장
-                            cycle_results = convert_online_segments_to_cycle_results(online_segments, online_summary)
-                            logger.debug(f"✅ 온라인 Self-play 결과 변환 완료 (online_result에서) ({len(cycle_results)}개 cycle)")
-                except ImportError:
-                    logger.debug(f"⚠️ 온라인 데이터 변환 모듈 없음 (무시)")
-                except Exception as e:
-                    logger.debug(f"⚠️ 온라인 Self-play 결과 변환 실패: {e}")
-            
-            # 🔥 summary가 비어있거나 값이 0.0이면 cycle_results에서 직접 계산
-            if cycle_results and (not summary or 
-                summary.get("avg_win_rate", 0.0) == 0.0 and summary.get("avg_pnl", 0.0) == 0.0):
-                try:
-                    import numpy as np
-                    all_performances = []
-                    for result in cycle_results:
-                        if "results" in result:
-                            for agent_id, performance in result["results"].items():
-                                all_performances.append(performance)
-                    
-                    if all_performances:
-                        calculated_summary = {
-                            "total_episodes": len(cycle_results),
-                            "total_trades": sum(p.get("total_trades", 0) for p in all_performances),
-                            "avg_win_rate": float(np.mean([p.get("win_rate", 0) for p in all_performances])),
-                            "avg_pnl": float(np.mean([p.get("total_pnl", 0) for p in all_performances])),
-                            "avg_sharpe_ratio": float(np.mean([p.get("sharpe_ratio", 0) for p in all_performances])),
-                        }
-                        # 기존 summary와 병합 (계산된 값 우선)
-                        summary.update(calculated_summary)
-                        logger.debug(f"✅ cycle_results에서 summary 계산 완료: win_rate={summary.get('avg_win_rate', 0):.2%}, pnl={summary.get('avg_pnl', 0):.2f}")
-                except Exception as e:
-                    logger.warning(f"⚠️ cycle_results에서 summary 계산 실패: {e}")
-            
-            if not cycle_results:
-                logger.warning(f"⚠️ Self-play 결과 저장: cycle_results가 없습니다. (dual_mode={selfplay_result.get('dual_mode', False)})")
-                logger.info(f"✅ Self-play 결과 저장 완료 (rl_strategies.db): {coin}-{interval}, {saved_count}개")
-                return False
-            
-            for cycle in cycle_results:
-                episode = cycle.get("episode", 0)
-                results = cycle.get("results", {})
-                
-                if not results:
-                    continue
-                
-                for agent_id, performance in results.items():
-                    try:
-                        cursor.execute("""
-                            INSERT OR REPLACE INTO selfplay_results 
-                            (coin, interval, episodes, results, summary, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (
-                            coin,
-                            interval,
-                            episode,
-                            json.dumps({
-                                "agent_id": agent_id,
-                                "performance": performance
-                            }),
-                            json.dumps({
-                                "total_episodes": len(cycle_results),
-                                "episode": episode,
-                                "total_trades": summary.get("total_trades", 0),  # 🔥 추가
-                                "avg_win_rate": summary.get("avg_win_rate", 0.0),
-                                "avg_pnl": summary.get("avg_pnl", 0.0),  # 🔥 수정 (avg_total_return → avg_pnl)
-                                "avg_sharpe_ratio": summary.get("avg_sharpe_ratio", 0.0),  # 🔥 추가
-                                "avg_total_return": summary.get("avg_total_return", summary.get("avg_pnl", 0.0)),  # 호환성 유지 (avg_pnl로 폴백)
-                                "regime_performance": summary.get("regime_performance", {}),  # 🔥 추가 (선택)
-                                "learning_progress": selfplay_result.get("learning_progress", {})
-                            }),
-                            datetime.now().isoformat()
-                        ))
-                        saved_count += 1
-                    except Exception as e:
-                        logger.warning(f"⚠️ Self-play 결과 일부 저장 실패: {e}")
-                        continue
-            
+
+            # 10. Paper Trading 관련 테이블
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trading_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT UNIQUE NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    start_time DATETIME NOT NULL,
+                    end_time DATETIME,
+                    status TEXT DEFAULT 'active',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trading_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    trade_id TEXT UNIQUE NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    entry_price REAL,
+                    exit_price REAL,
+                    quantity REAL,
+                    profit REAL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES paper_trading_sessions(session_id)
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trading_performance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    market_type TEXT NOT NULL DEFAULT 'COIN',
+                    market TEXT NOT NULL DEFAULT 'BITHUMB',
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    total_trades INTEGER DEFAULT 0,
+                    winning_trades INTEGER DEFAULT 0,
+                    total_profit REAL DEFAULT 0.0,
+                    max_drawdown REAL DEFAULT 0.0,
+                    sharpe_ratio REAL DEFAULT 0.0,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES paper_trading_sessions(session_id)
+                )
+            """)
+
+            # 인덱스 생성
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_selfplay_symbol_interval ON selfplay_evolution_results(symbol, interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_regime_routing_symbol_interval ON regime_routing_results(symbol, interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_realtime_feedback_symbol_interval ON realtime_learning_feedback(symbol, interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_strategy_summary_symbol_interval ON strategy_summary_for_signals(symbol, interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dna_summary_symbol_interval ON dna_summary_for_signals(symbol, interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_global_strategy_summary_interval ON global_strategy_summary_for_signals(interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_summary_symbol_interval ON analysis_summary_for_signals(symbol, interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_selfplay_results_symbol_interval ON selfplay_results(symbol, interval)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_paper_trading_sessions_symbol ON paper_trading_sessions(symbol)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_paper_trading_trades_session ON paper_trading_trades(session_id)")
+
             conn.commit()
-            logger.info(f"✅ Self-play 결과 저장 완료 (rl_strategies.db): {coin}-{interval}, {saved_count}개")
+            logger.info("✅ learning_strategies.db learning_results 테이블 생성 완료")
+            return True
+            
+    except Exception as e:
+        logger.error(f"❌ learning_strategies.db learning_results 테이블 생성 실패: {e}")
+        return False
+
+def save_selfplay_results(coin: str, interval: str, selfplay_result: Dict[str, Any], db_path: str = None,
+                         market_type: str = "COIN", market: str = "BITHUMB") -> bool:
+    """Self-play 결과를 learning_strategies.db에 저장
+
+    핵심 설계:
+    - coin 파라미터는 하위 호환성을 위해 유지 (내부적으로 symbol로 저장)
+    - market_type, market 컬럼 추가
+    """
+    try:
+        import json
+        import time
+        import random
+        import numpy as np
+        from rl_pipeline.db.connection_pool import get_optimized_db_connection
+
+        # coin → symbol 매핑 (하위 호환성)
+        symbol = coin
+
+        # 원본 summary 보존 (온라인 결과로 덮어써지지 않도록)
+        original_summary = selfplay_result.get("summary", {})
+        summary = original_summary.copy() if original_summary else {}
+        cycle_results = selfplay_result.get("cycle_results", [])
         
-        return True
+        # 🔥 cycle_results가 없으면 traditional_result에서 가져오기 (dual mode 대응)
+        if not cycle_results and selfplay_result.get('dual_mode'):
+            traditional_result = selfplay_result.get('traditional_result')
+            if traditional_result:
+                cycle_results = traditional_result.get("cycle_results", [])
         
+        # 🔥 온라인 Self-play 결과 처리 추가 (온라인 결과가 아직 변환되지 않은 경우)
+        online_summary = None  # 온라인 summary 별도 저장 (원본 summary 보존)
+        if not cycle_results:
+            try:
+                from rl_pipeline.hybrid.online_data_converter import (
+                    extract_online_selfplay_result,
+                    convert_online_segments_to_cycle_results
+                )
+                
+                online_segments = extract_online_selfplay_result(selfplay_result)
+                if online_segments:
+                    cycle_results = convert_online_segments_to_cycle_results(online_segments, summary)
+                    logger.debug(f"✅ 온라인 Self-play 결과 변환 완료 ({len(cycle_results)}개 cycle)")
+                # online_result에 직접 있는 경우
+                elif selfplay_result.get('online_result'):
+                    online_result = selfplay_result.get('online_result', {})
+                    online_segments = online_result.get('segment_results', [])
+                    if online_segments:
+                        online_summary = online_result.get('summary', {})  # 별도 저장
+                        cycle_results = convert_online_segments_to_cycle_results(online_segments, online_summary)
+                        logger.debug(f"✅ 온라인 Self-play 결과 변환 완료 (online_result에서) ({len(cycle_results)}개 cycle)")
+            except ImportError:
+                logger.debug(f"⚠️ 온라인 데이터 변환 모듈 없음 (무시)")
+            except Exception as e:
+                logger.debug(f"⚠️ 온라인 Self-play 결과 변환 실패: {e}")
+        
+        # 🔥 summary가 비어있거나 값이 0.0이면 cycle_results에서 직접 계산
+        if cycle_results and (not summary or 
+            summary.get("avg_win_rate", 0.0) == 0.0 and summary.get("avg_pnl", 0.0) == 0.0):
+            try:
+                all_performances = []
+                for result in cycle_results:
+                    if "results" in result:
+                        for agent_id, performance in result["results"].items():
+                            all_performances.append(performance)
+                
+                if all_performances:
+                    calculated_summary = {
+                        "total_episodes": len(cycle_results),
+                        "total_trades": sum(p.get("total_trades", 0) for p in all_performances),
+                        "avg_win_rate": float(np.mean([p.get("win_rate", 0) for p in all_performances])),
+                        "avg_pnl": float(np.mean([p.get("total_pnl", 0) for p in all_performances])),
+                        "avg_sharpe_ratio": float(np.mean([p.get("sharpe_ratio", 0) for p in all_performances])),
+                    }
+                    # 기존 summary와 병합 (계산된 값 우선)
+                    summary.update(calculated_summary)
+                    logger.debug(f"✅ cycle_results에서 summary 계산 완료: win_rate={summary.get('avg_win_rate', 0):.2%}, pnl={summary.get('avg_pnl', 0):.2f}")
+            except Exception as e:
+                logger.warning(f"⚠️ cycle_results에서 summary 계산 실패: {e}")
+        
+        if not cycle_results:
+            logger.warning(f"⚠️ Self-play 결과 저장: cycle_results가 없습니다. (dual_mode={selfplay_result.get('dual_mode', False)})")
+            return False
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                # learning_strategies.db에 selfplay_results 테이블 생성 및 저장
+                with get_optimized_db_connection("strategies") as conn:
+                    cursor = conn.cursor()
+
+                    # selfplay_results 테이블이 없으면 생성 (symbol 컬럼 사용)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS selfplay_results (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            market_type TEXT NOT NULL DEFAULT 'COIN',
+                            market TEXT NOT NULL DEFAULT 'BITHUMB',
+                            symbol TEXT NOT NULL,
+                            interval TEXT NOT NULL,
+                            episodes INTEGER NOT NULL,
+                            results TEXT NOT NULL,
+                            summary TEXT,
+                            created_at TEXT NOT NULL,
+                            UNIQUE(market_type, market, symbol, interval, episodes, results)
+                        )
+                    """)
+                    
+                    saved_count = 0
+
+                    for cycle in cycle_results:
+                        episode = cycle.get("episode", 0)
+                        results = cycle.get("results", {})
+
+                        if not results:
+                            continue
+
+                        for agent_id, performance in results.items():
+                            try:
+                                cursor.execute("""
+                                    INSERT OR REPLACE INTO selfplay_results
+                                    (market_type, market, symbol, interval, episodes, results, summary, created_at)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (
+                                    market_type,
+                                    market,
+                                    symbol,
+                                    interval,
+                                    episode,
+                                    json.dumps({
+                                        "agent_id": agent_id,
+                                        "performance": performance
+                                    }),
+                                    json.dumps({
+                                        "total_episodes": len(cycle_results),
+                                        "episode": episode,
+                                        "total_trades": summary.get("total_trades", 0),
+                                        "avg_win_rate": summary.get("avg_win_rate", 0.0),
+                                        "avg_pnl": summary.get("avg_pnl", 0.0),
+                                        "avg_sharpe_ratio": summary.get("avg_sharpe_ratio", 0.0),
+                                        "avg_total_return": summary.get("avg_total_return", summary.get("avg_pnl", 0.0)),
+                                        "regime_performance": summary.get("regime_performance", {}),
+                                        "learning_progress": selfplay_result.get("learning_progress", {})
+                                    }),
+                                    datetime.now().isoformat()
+                                ))
+                                saved_count += 1
+                            except Exception as e:
+                                logger.warning(f"⚠️ Self-play 결과 일부 저장 실패: {e}")
+                                continue
+                    
+                    conn.commit()
+                    logger.info(f"✅ Self-play 결과 저장 완료 (learning_strategies.db): {symbol}-{interval}, {saved_count}개")
+                    return True
+
+            except Exception as e:
+                is_locked = "database is locked" in str(e) or "disk I/O error" in str(e) or "malformed" in str(e)
+                if is_locked and attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0.1, 1.0)
+                    logger.warning(f"⚠️ Self-play 결과 저장 일시적 실패 ({attempt+1}/{max_retries}), {wait_time:.2f}초 후 재시도: {e}")
+                    time.sleep(wait_time)
+                else:
+                    if attempt == max_retries - 1:
+                         logger.error(f"❌ Self-play 결과 저장 실패 (최종): {e}")
+                    # continue loop or return False
+        
+        return False
+
     except Exception as e:
         logger.error(f"❌ Self-play 결과 저장 실패: {e}")
         return False
@@ -468,43 +585,81 @@ def save_pipeline_execution_log(coin: str, interval: str, strategies_created: in
                                selfplay_episodes: int, regime_detected: str,
                                routing_results: int, signal_score: float,
                                signal_action: str, execution_time: float,
-                               status: str, db_path: str = None) -> bool:
-    """파이프라인 실행 로그 저장"""
+                               status: str, db_path: str = None,
+                               market_type: str = "COIN", market: str = "BITHUMB") -> bool:
+    """파이프라인 실행 로그 저장
+
+    핵심 설계:
+    - coin 파라미터는 하위 호환성을 위해 유지 (내부적으로 symbol로 저장)
+    - market_type, market 컬럼 추가
+    """
     try:
+        import time
+        import random
+        
+        # coin → symbol 매핑 (하위 호환성)
+        symbol = coin
+
         # 음수 execution_time 방지
         if execution_time < 0:
-            logger.warning(f"⚠️ 음수 execution_time 감지: {execution_time:.2f}초 → 0.0초로 변경 ({coin}-{interval})")
+            logger.warning(f"⚠️ 음수 execution_time 감지: {execution_time:.2f}초 → 0.0초로 변경 ({symbol}-{interval})")
             execution_time = 0.0
 
-        with get_learning_db_connection(db_path) as conn:
-            cursor = conn.cursor()
+        max_retries = 5
+        
+        for attempt in range(max_retries):
+            try:
+                with get_learning_db_connection(db_path) as conn:
+                    cursor = conn.cursor()
 
-            cursor.execute("""
-                INSERT INTO pipeline_execution_logs
-                (coin, interval, strategies_created, selfplay_episodes, regime_detected,
-                 routing_results, signal_score, signal_action, execution_time, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                coin, interval, strategies_created, selfplay_episodes, regime_detected,
-                routing_results, signal_score, signal_action, execution_time, status
-            ))
+                    cursor.execute("""
+                        INSERT INTO pipeline_execution_logs
+                        (market_type, market, symbol, interval, strategies_created, selfplay_episodes, regime_detected,
+                         routing_results, signal_score, signal_action, execution_time, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        market_type, market, symbol, interval, strategies_created, selfplay_episodes, regime_detected,
+                        routing_results, signal_score, signal_action, execution_time, status
+                    ))
+
+                    conn.commit()
+                    logger.info(f"✅ 파이프라인 실행 로그 저장 완료: {symbol}-{interval}")
+                    return True
             
-            conn.commit()
-            logger.info(f"✅ 파이프라인 실행 로그 저장 완료: {coin}-{interval}")
-            return True
-            
+            except Exception as e:
+                is_locked = "database is locked" in str(e) or "disk I/O error" in str(e) or "malformed" in str(e)
+                if is_locked and attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0.1, 1.0)
+                    logger.warning(f"⚠️ 파이프라인 실행 로그 저장 일시적 실패 ({attempt+1}/{max_retries}), {wait_time:.2f}초 후 재시도: {e}")
+                    time.sleep(wait_time)
+                else:
+                    if attempt == max_retries - 1:
+                        logger.error(f"❌ 파이프라인 실행 로그 저장 실패 (최종): {e}")
+                    # 마지막 시도에서 실패하면 return False
+
+        return False
+
     except Exception as e:
         logger.error(f"❌ 파이프라인 실행 로그 저장 실패: {e}")
         return False
 
-def save_regime_routing_results(coin: str, interval: str, routing_results: List[Any]) -> bool:
-    """레짐 라우팅 결과를 rl_strategies.db에 저장"""
+def save_regime_routing_results(coin: str, interval: str, routing_results: List[Any],
+                               market_type: str = "COIN", market: str = "BITHUMB") -> bool:
+    """레짐 라우팅 결과를 learning_strategies.db에 저장
+
+    핵심 설계:
+    - coin 파라미터는 하위 호환성을 위해 유지 (내부적으로 symbol로 저장)
+    - market_type, market 컬럼 추가
+    """
     try:
         from rl_pipeline.routing.regime_router import RegimeRoutingResult
         import json
-        
+
+        # coin → symbol 매핑 (하위 호환성)
+        symbol = coin
+
         if not routing_results:
-            logger.debug(f"레짐 라우팅 결과가 비어있어 저장 건너뜀: {coin}-{interval}")
+            logger.debug(f"레짐 라우팅 결과가 비어있어 저장 건너뜀: {symbol}-{interval}")
             return True
         
         with get_learning_db_connection(LEARNING_RESULTS_DB_PATH) as conn:
@@ -515,15 +670,18 @@ def save_regime_routing_results(coin: str, interval: str, routing_results: List[
                 try:
                     # RegimeRoutingResult 객체인지 확인
                     if hasattr(result, 'routed_strategy'):
-                        # 객체인 경우
+                        # 객체인 경우 - symbol 사용 (coin 속성은 symbol로 매핑)
+                        result_symbol = getattr(result, 'symbol', getattr(result, 'coin', symbol))
                         routed_strategy_json = json.dumps(result.routed_strategy)
                         cursor.execute("""
-                            INSERT INTO regime_routing_results 
-                            (coin, interval, regime, routed_strategy, routing_confidence, 
+                            INSERT INTO regime_routing_results
+                            (market_type, market, symbol, interval, regime, routed_strategy, routing_confidence,
                              routing_score, regime_performance, regime_adaptation, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            result.coin,
+                            market_type,
+                            market,
+                            result_symbol,
                             result.interval,
                             result.regime,
                             routed_strategy_json,
@@ -536,14 +694,17 @@ def save_regime_routing_results(coin: str, interval: str, routing_results: List[
                         saved_count += 1
                     elif isinstance(result, dict):
                         # 딕셔너리인 경우 (대체 처리)
+                        result_symbol = result.get('symbol', result.get('coin', symbol))
                         routed_strategy_json = json.dumps(result.get('routed_strategy', result))
                         cursor.execute("""
-                            INSERT INTO regime_routing_results 
-                            (coin, interval, regime, routed_strategy, routing_confidence, 
+                            INSERT INTO regime_routing_results
+                            (market_type, market, symbol, interval, regime, routed_strategy, routing_confidence,
                              routing_score, regime_performance, regime_adaptation, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            result.get('coin', coin),
+                            market_type,
+                            market,
+                            result_symbol,
                             result.get('interval', interval),
                             result.get('regime', 'neutral'),
                             routed_strategy_json,
@@ -559,24 +720,31 @@ def save_regime_routing_results(coin: str, interval: str, routing_results: List[
                     continue
             
             conn.commit()
-            logger.info(f"✅ 레짐 라우팅 결과 저장 완료: {coin}-{interval}, {saved_count}개")
-        
+            logger.info(f"✅ 레짐 라우팅 결과 저장 완료: {symbol}-{interval}, {saved_count}개")
+
         return True
-        
+
     except Exception as e:
         logger.error(f"❌ 레짐 라우팅 결과 저장 실패: {e}")
         return False
 
-def save_regime_routing_to_rl_episodes(coin: str, interval: str, routing_results: List[Any]) -> bool:
+def save_regime_routing_to_rl_episodes(coin: str, interval: str, routing_results: List[Any],
+                                       market_type: str = "COIN", market: str = "BITHUMB") -> bool:
     """
-    🔥 레짐 라우팅 백테스트 결과를 rl_episodes 테이블에 저장
+    레짐 라우팅 백테스트 결과를 rl_episodes 테이블에 저장
     Self-play 없이도 예측 정확도를 수집할 수 있도록 함
-    
+
+    핵심 설계:
+    - coin 파라미터는 하위 호환성을 위해 유지 (내부적으로 symbol로 저장)
+    - market_type, market 컬럼 추가
+
     Args:
-        coin: 코인 심볼
+        coin: 코인 심볼 (symbol로 저장)
         interval: 인터벌
         routing_results: 레짐 라우팅 결과 리스트
-    
+        market_type: 시장 유형 (COIN/US_STOCK/KR_STOCK)
+        market: 거래소 (BITHUMB/NYSE/KOSPI 등)
+
     Returns:
         성공 여부
     """
@@ -585,11 +753,14 @@ def save_regime_routing_to_rl_episodes(coin: str, interval: str, routing_results
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
         import uuid
         import hashlib
-        
+
+        # coin → symbol 매핑 (하위 호환성)
+        symbol = coin
+
         if not routing_results:
-            logger.debug(f"레짐 라우팅 결과가 비어있어 rl_episodes 저장 건너뜀: {coin}-{interval}")
+            logger.debug(f"레짐 라우팅 결과가 비어있어 rl_episodes 저장 건너뜀: {symbol}-{interval}")
             return True
-        
+
         saved_count = 0
         timestamp = int(datetime.now().timestamp())
         
@@ -623,61 +794,61 @@ def save_regime_routing_to_rl_episodes(coin: str, interval: str, routing_results
                 # 🔥 거래가 0회여도 저장 (시장 상태 정보는 유용)
                 # 예측 정확도가 0이어도 저장 (나중에 Paper Trading에서 업데이트 가능)
                 
-                # 🔥 각 거래를 에피소드로 저장
+                # 각 거래를 에피소드로 저장
                 # 간단한 방식: 백테스트 결과를 하나의 에피소드로 저장
                 # episode_id 생성 (고유성 보장)
-                episode_id = f"regime_routing_{coin}_{interval}_{strategy_id}_{timestamp}_{saved_count}"
-                
+                episode_id = f"regime_routing_{symbol}_{interval}_{strategy_id}_{timestamp}_{saved_count}"
+
                 # 예측 방향 결정 (백테스트에서 매수 신호 = 상승 예측)
                 predicted_dir = 1  # 상승 예측 (매수 신호)
                 predicted_conf = min(predictive_accuracy, 1.0)  # 예측 정확도를 확신도로 사용
-                
+
                 # 전략 파라미터에서 목표 변동률 추정
                 target_move_pct = strategy.get('take_profit', 0.05)  # 기본값 5%
                 horizon_k = strategy.get('max_hold_periods', 20)  # 기본값 20 캔들
-                
+
                 # state_key 생성 (레짐 기반)
                 regime = result.regime
                 state_key = f"{regime}_{strategy_id}"
-                
+
                 # 진입 가격 추정 (백테스트 결과에서)
                 entry_price = 1.0  # 정규화된 가격 (백테스트에서는 상대적)
-                
-                # 🔥 rl_episodes에 저장 (strategies DB 사용)
+
+                # rl_episodes에 저장 (strategies DB 사용, symbol 컬럼 사용)
                 try:
                     with get_optimized_db_connection("strategies") as strategies_conn:
                         cursor = strategies_conn.cursor()
-                        
-                        # rl_episodes 테이블에 저장
+
+                        # rl_episodes 테이블에 저장 (market_type, market, symbol 사용)
                         cursor.execute("""
                             INSERT OR REPLACE INTO rl_episodes (
-                                episode_id, ts_entry, coin, interval, strategy_id, state_key,
+                                episode_id, ts_entry, market_type, market, symbol, interval, strategy_id, state_key,
                                 predicted_dir, predicted_conf, entry_price, target_move_pct, horizon_k
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            episode_id, timestamp, coin, interval, strategy_id, state_key,
+                            episode_id, timestamp, market_type, market, symbol, interval, strategy_id, state_key,
                             predicted_dir, predicted_conf, entry_price, target_move_pct, horizon_k
                         ))
-                        
-                        # rl_episode_summary 테이블에 저장
+
+                        # rl_episode_summary 테이블에 저장 (market_type, market, symbol 사용)
                         total_profit = backtest_result.get('profit', 0.0)
                         win_rate = backtest_result.get('win_rate', 0.0)
                         realized_ret_signed = total_profit / trades if trades > 0 else 0.0
                         acc_flag = 1 if predictive_accuracy >= 0.5 else 0
                         ts_exit = timestamp + (horizon_k * 900)  # 대략적인 종료 시간
-                        
+
                         cursor.execute("""
                             INSERT OR REPLACE INTO rl_episode_summary (
-                                episode_id, ts_exit, first_event, t_hit,
-                                realized_ret_signed, total_reward, acc_flag,
-                                coin, interval, strategy_id, source_type
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                episode_id, ts_exit, market_type, market, symbol, interval,
+                                strategy_id, first_event, t_hit,
+                                realized_ret_signed, total_reward, acc_flag, source_type
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
-                            episode_id, ts_exit, 'expiry', horizon_k,
-                            realized_ret_signed, predictive_accuracy, acc_flag,
-                            coin, interval, strategy_id, 'regime_routing'
+                            episode_id, ts_exit, market_type, market, symbol, interval,
+                            strategy_id, 'expiry', horizon_k,
+                            realized_ret_signed, predictive_accuracy, acc_flag, 'regime_routing'
                         ))
-                        
+
                         strategies_conn.commit()
                         logger.debug(f"✅ rl_episodes 저장: {episode_id}")
                         
@@ -692,7 +863,7 @@ def save_regime_routing_to_rl_episodes(coin: str, interval: str, routing_results
                 continue
         
         if saved_count > 0:
-            logger.info(f"✅ 레짐 라우팅 결과 rl_episodes 저장 완료: {coin}-{interval}, {saved_count}개 에피소드")
+            logger.info(f"✅ 레짐 라우팅 결과 rl_episodes 저장 완료: {symbol}-{interval}, {saved_count}개 에피소드")
         
         return True
         
@@ -702,108 +873,136 @@ def save_regime_routing_to_rl_episodes(coin: str, interval: str, routing_results
         logger.debug(f"상세 에러:\n{traceback.format_exc()}")
         return False
 
-def save_integrated_analysis_results(coin: str, interval: str, regime: str, analysis_result: Any) -> bool:
-    """통합 분석 결과를 rl_strategies.db에 저장 (integrated_analysis_results 테이블)
+def save_integrated_analysis_results(coin: str, interval: str, regime: str, analysis_result: Any,
+                                     market_type: str = "COIN", market: str = "BITHUMB") -> bool:
+    """통합 분석 결과를 learning_strategies.db에 저장 (integrated_analysis_results 테이블)
 
-    완전한 스키마: id, coin, interval, regime, fractal_score, multi_timeframe_score,
+    완전한 스키마: id, market_type, market, symbol, interval, regime, fractal_score, multi_timeframe_score,
                  indicator_cross_score, ensemble_score, ensemble_confidence,
                  final_signal_score, signal_confidence, signal_action, created_at
     """
-    try:
-        with get_learning_db_connection(LEARNING_RESULTS_DB_PATH) as conn:
-            cursor = conn.cursor()
+    import time
+    import random
 
-            # 안전하게 속성 접근
-            try:
-                result_coin = getattr(analysis_result, 'coin', coin)
-                # interval은 파라미터 우선 사용 (개별 인터벌 저장 시 덮어쓰기 가능)
-                result_interval = interval if interval else getattr(analysis_result, 'interval', 'all_intervals')
-                result_regime = getattr(analysis_result, 'regime', regime if regime else 'neutral')
+    # coin -> symbol 매핑 (하위 호환성)
+    symbol = coin
+    
+    max_retries = 5
+    
+    for attempt in range(max_retries):
+        try:
+            with get_learning_db_connection(LEARNING_RESULTS_DB_PATH) as conn:
+                cursor = conn.cursor()
 
-                # 분석 점수들
-                fractal_score = getattr(analysis_result, 'fractal_score', 0.0)
-                multi_timeframe_score = getattr(analysis_result, 'multi_timeframe_score', 0.0)
-                indicator_cross_score = getattr(analysis_result, 'indicator_cross_score', 0.0)
+                # 안전하게 속성 접근
+                try:
+                    # symbol은 파라미터 우선 사용
+                    result_symbol = getattr(analysis_result, 'symbol', getattr(analysis_result, 'coin', symbol))
+                    # interval은 파라미터 우선 사용
+                    result_interval = interval if interval else getattr(analysis_result, 'interval', 'all_intervals')
+                    result_regime = getattr(analysis_result, 'regime', regime if regime else 'neutral')
 
-                # 앙상블 점수
-                ensemble_score = getattr(analysis_result, 'ensemble_score', 0.0)
-                ensemble_confidence = getattr(analysis_result, 'ensemble_confidence', 0.0)
+                    # 분석 점수들
+                    fractal_score = getattr(analysis_result, 'fractal_score', 0.0)
+                    multi_timeframe_score = getattr(analysis_result, 'multi_timeframe_score', 0.0)
+                    indicator_cross_score = getattr(analysis_result, 'indicator_cross_score', 0.0)
 
-                # 최종 시그널
-                final_signal_score = getattr(analysis_result, 'final_signal_score', 0.5)
-                signal_confidence = getattr(analysis_result, 'signal_confidence', 0.5)
-                signal_action = getattr(analysis_result, 'signal_action', 'HOLD')
-                created_at = getattr(analysis_result, 'created_at', datetime.now().isoformat())
-            except Exception as e:
-                logger.warning(f"⚠️ 분석 결과 속성 접근 실패, 기본값 사용: {e}")
-                result_coin = coin
-                result_interval = interval
-                result_regime = regime if regime else 'neutral'
-                fractal_score = 0.0
-                multi_timeframe_score = 0.0
-                indicator_cross_score = 0.0
-                ensemble_score = 0.0
-                ensemble_confidence = 0.0
-                final_signal_score = 0.5
-                signal_confidence = 0.5
-                signal_action = 'HOLD'
-                created_at = datetime.now().isoformat()
+                    # 앙상블 점수
+                    ensemble_score = getattr(analysis_result, 'ensemble_score', 0.0)
+                    ensemble_confidence = getattr(analysis_result, 'ensemble_confidence', 0.0)
 
-            # 완전한 스키마에 맞춘 INSERT
-            cursor.execute("""
-                INSERT INTO integrated_analysis_results
-                (coin, interval, regime, fractal_score, multi_timeframe_score,
-                 indicator_cross_score, ensemble_score, ensemble_confidence,
-                 final_signal_score, signal_confidence, signal_action, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                result_coin,
-                result_interval,
-                result_regime,
-                fractal_score,
-                multi_timeframe_score,
-                indicator_cross_score,
-                ensemble_score,
-                ensemble_confidence,
-                final_signal_score,
-                signal_confidence,
-                signal_action,
-                created_at
-            ))
+                    # 최종 시그널
+                    final_signal_score = getattr(analysis_result, 'final_signal_score', 0.5)
+                    signal_confidence = getattr(analysis_result, 'signal_confidence', 0.5)
+                    signal_action = getattr(analysis_result, 'signal_action', 'HOLD')
+                    created_at = getattr(analysis_result, 'created_at', datetime.now().isoformat())
+                except Exception as e:
+                    logger.warning(f"⚠️ 분석 결과 속성 접근 실패, 기본값 사용: {e}")
+                    result_symbol = symbol
+                    result_interval = interval
+                    result_regime = regime if regime else 'neutral'
+                    fractal_score = 0.0
+                    multi_timeframe_score = 0.0
+                    indicator_cross_score = 0.0
+                    ensemble_score = 0.0
+                    ensemble_confidence = 0.0
+                    final_signal_score = 0.5
+                    signal_confidence = 0.5
+                    signal_action = 'HOLD'
+                    created_at = datetime.now().isoformat()
 
-            conn.commit()
-            logger.info(f"✅ 통합 분석 결과 저장 완료: {coin}-{interval}")
+                # 완전한 스키마에 맞춘 INSERT (symbol 컬럼 사용)
+                cursor.execute("""
+                    INSERT INTO integrated_analysis_results
+                    (market_type, market, symbol, interval, regime, fractal_score, multi_timeframe_score,
+                     indicator_cross_score, ensemble_score, ensemble_confidence,
+                     final_signal_score, signal_confidence, signal_action, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    market_type,
+                    market,
+                    result_symbol,
+                    result_interval,
+                    result_regime,
+                    fractal_score,
+                    multi_timeframe_score,
+                    indicator_cross_score,
+                    ensemble_score,
+                    ensemble_confidence,
+                    final_signal_score,
+                    signal_confidence,
+                    signal_action,
+                    created_at
+                ))
 
-        return True
+                conn.commit()
+                logger.info(f"✅ 통합 분석 결과 저장 완료: {symbol}-{interval}")
+                return True
 
-    except Exception as e:
-        logger.error(f"❌ 통합 분석 결과 저장 실패: {e}")
-        return False
+        except Exception as e:
+            is_locked = "database is locked" in str(e) or "disk I/O error" in str(e) or "malformed" in str(e)
+            if is_locked and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0.1, 1.0)
+                logger.warning(f"⚠️ 통합 분석 결과 저장 일시적 실패 ({attempt+1}/{max_retries}), {wait_time:.2f}초 후 재시도: {e}")
+                time.sleep(wait_time)
+            else:
+                if attempt == max_retries - 1:
+                     logger.error(f"❌ 통합 분석 결과 저장 실패 (최종): {e}")
+                # 마지막 시도에서 실패하면 False 반환
+                
+    return False
 
 def load_integrated_analysis_results(coin: str, interval: str, db_path: str = None, limit: int = 1) -> Optional[Dict[str, Any]]:
-    """통합 분석 결과를 rl_strategies.db에서 로드 (개별 코인 전략 분석)
+    """통합 분석 결과를 learning_strategies.db에서 로드 (개별 코인 전략 분석)
 
-    완전한 스키마: id, coin, interval, regime, fractal_score, multi_timeframe_score,
+    완전한 스키마: id, market_type, market, symbol, interval, regime, fractal_score, multi_timeframe_score,
                  indicator_cross_score, ensemble_score, ensemble_confidence,
                  final_signal_score, signal_confidence, signal_action, created_at
     """
     try:
-        db_path = db_path or LEARNING_RESULTS_DB_PATH
+        # DB 경로 설정 (디렉토리 모드 지원)
+        if db_path is None:
+            db_path = LEARNING_RESULTS_DB_PATH
+        elif os.path.isdir(db_path):
+            db_path = os.path.join(db_path, 'common_strategies.db')
+            
+        symbol = coin
 
         with get_learning_db_connection(db_path) as conn:
             cursor = conn.cursor()
 
-            # 최신 통합 분석 결과 조회 (완전한 스키마 반영)
+            # 최신 통합 분석 결과 조회 (완전한 스키마 반영, symbol 사용)
             cursor.execute("""
                 SELECT
-                    coin, interval, regime, fractal_score, multi_timeframe_score,
+                    symbol, interval, regime, fractal_score, multi_timeframe_score,
                     indicator_cross_score, ensemble_score, ensemble_confidence,
-                    final_signal_score, signal_confidence, signal_action, created_at
+                    final_signal_score, signal_confidence, signal_action, created_at,
+                    market_type, market
                 FROM integrated_analysis_results
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
                 ORDER BY created_at DESC
                 LIMIT ?
-            """, (coin, interval, limit))
+            """, (symbol, interval, limit))
 
             rows = cursor.fetchall()
             if not rows:
@@ -812,7 +1011,8 @@ def load_integrated_analysis_results(coin: str, interval: str, db_path: str = No
             # 가장 최신 결과 반환
             row = rows[0]
             result = {
-                'coin': row[0],
+                'coin': row[0],  # 호환성을 위해 coin 키 유지 (값은 symbol)
+                'symbol': row[0],
                 'interval': row[1],
                 'regime': row[2],
                 'fractal_score': row[3],
@@ -823,7 +1023,9 @@ def load_integrated_analysis_results(coin: str, interval: str, db_path: str = No
                 'final_signal_score': row[8],
                 'signal_confidence': row[9],
                 'signal_action': row[10],
-                'created_at': row[11]
+                'created_at': row[11],
+                'market_type': row[12],
+                'market': row[13]
             }
 
             return result
@@ -833,7 +1035,7 @@ def load_integrated_analysis_results(coin: str, interval: str, db_path: str = No
         return None
 
 def save_strategy_summary_for_signals(coin: str, interval: str, db_path: str = None) -> bool:
-    """rl_strategies.db의 coin_strategies를 요약하여 rl_strategies.db에 저장"""
+    """learning_strategies.db의 strategies를 요약하여 learning_strategies.db에 저장"""
     try:
         import json
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
@@ -841,7 +1043,7 @@ def save_strategy_summary_for_signals(coin: str, interval: str, db_path: str = N
         if db_path is None:
             db_path = LEARNING_RESULTS_DB_PATH
         
-        # rl_strategies.db에서 전략 데이터 읽기
+        # learning_strategies.db에서 전략 데이터 읽기
         with get_optimized_db_connection("strategies") as conn:
             cursor = conn.cursor()
             
@@ -850,8 +1052,8 @@ def save_strategy_summary_for_signals(coin: str, interval: str, db_path: str = N
                 SELECT id, rsi_min, rsi_max, volume_ratio_min, volume_ratio_max,
                        macd_buy_threshold, macd_sell_threshold, profit, win_rate,
                        sharpe_ratio, calmar_ratio, profit_factor, quality_grade
-                FROM coin_strategies
-                WHERE coin = ? AND interval = ?
+                FROM strategies
+                WHERE symbol = ? AND interval = ?
                 ORDER BY profit DESC, win_rate DESC
                 LIMIT 100
             """, (coin, interval))
@@ -900,10 +1102,10 @@ def save_strategy_summary_for_signals(coin: str, interval: str, db_path: str = N
                 
                 cursor.execute("""
                     INSERT OR REPLACE INTO strategy_summary_for_signals
-                    (coin, interval, top_strategy_id, top_strategy_params, top_profit, top_win_rate,
+                    (market_type, market, symbol, interval, top_strategy_id, top_strategy_params, top_profit, top_win_rate,
                      top_quality_grade, avg_profit, avg_win_rate, avg_sharpe_ratio, avg_calmar_ratio,
                      avg_profit_factor, total_strategies, s_grade_count, a_grade_count, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES ('COIN', 'BITHUMB', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (
                     coin, interval, top_strategy_id, top_strategy_params, top_profit, top_win_rate,
                     top_quality_grade, avg_profit, avg_win_rate, avg_sharpe_ratio, avg_calmar_ratio,
@@ -1011,7 +1213,7 @@ def _extract_volume_pattern(dna_data: Dict) -> str:
         return "normal"
 
 def save_dna_summary_for_signals(coin: str, interval: str = None, db_path: str = None) -> bool:
-    """rl_strategies.db의 strategy_dna를 요약하여 learning_results.db에 저장"""
+    """learning_strategies.db의 strategy_dna를 요약하여 learning_results.db에 저장"""
     try:
         import json
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
@@ -1019,7 +1221,7 @@ def save_dna_summary_for_signals(coin: str, interval: str = None, db_path: str =
         if db_path is None:
             db_path = LEARNING_RESULTS_DB_PATH
         
-        # rl_strategies.db에서 DNA 데이터 읽기
+        # learning_strategies.db에서 DNA 데이터 읽기
         with get_optimized_db_connection("strategies") as conn:
             cursor = conn.cursor()
             
@@ -1027,7 +1229,7 @@ def save_dna_summary_for_signals(coin: str, interval: str = None, db_path: str =
             if coin:
                 cursor.execute("""
                     SELECT dna_data FROM strategy_dna
-                    WHERE coin = ? AND (interval = ? OR interval IS NULL)
+                    WHERE symbol = ? AND (interval = ? OR interval IS NULL)
                     ORDER BY created_at DESC LIMIT 1
                 """, (coin, interval))
             else:
@@ -1060,9 +1262,9 @@ def save_dna_summary_for_signals(coin: str, interval: str = None, db_path: str =
                 
                 cursor.execute("""
                     INSERT OR REPLACE INTO dna_summary_for_signals
-                    (coin, interval, profitability_score, stability_score, scalability_score,
+                    (market_type, market, symbol, interval, profitability_score, stability_score, scalability_score,
                      dna_quality, rsi_pattern, macd_pattern, volume_pattern, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES ('COIN', 'BITHUMB', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (
                     coin, interval, profitability_score, stability_score, scalability_score,
                     dna_quality, rsi_pattern, macd_pattern, volume_pattern
@@ -1077,7 +1279,7 @@ def save_dna_summary_for_signals(coin: str, interval: str = None, db_path: str =
         return False
 
 def save_global_strategy_summary_for_signals(interval: str, db_path: str = None) -> bool:
-    """rl_strategies.db의 global_strategies를 요약하여 learning_results.db에 저장"""
+    """learning_strategies.db의 global_strategies를 요약하여 learning_results.db에 저장"""
     try:
         import json
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
@@ -1085,7 +1287,7 @@ def save_global_strategy_summary_for_signals(interval: str, db_path: str = None)
         if db_path is None:
             db_path = LEARNING_RESULTS_DB_PATH
         
-        # rl_strategies.db에서 글로벌 전략 읽기
+        # learning_strategies.db에서 글로벌 전략 읽기
         with get_optimized_db_connection("strategies") as conn:
             cursor = conn.cursor()
             
@@ -1142,7 +1344,7 @@ def save_global_strategy_summary_for_signals(interval: str, db_path: str = None)
         return False
 
 def save_analysis_summary_for_signals(coin: str, interval: str, db_path: str = None) -> bool:
-    """rl_strategies.db의 fractal_analysis/synergy_analysis를 요약하여 learning_results.db에 저장"""
+    """learning_strategies.db의 fractal_analysis/synergy_analysis를 요약하여 learning_results.db에 저장"""
     try:
         import json
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
@@ -1150,7 +1352,7 @@ def save_analysis_summary_for_signals(coin: str, interval: str, db_path: str = N
         if db_path is None:
             db_path = LEARNING_RESULTS_DB_PATH
         
-        # rl_strategies.db에서 분석 데이터 읽기
+        # learning_strategies.db에서 분석 데이터 읽기
         with get_optimized_db_connection("strategies") as conn:
             cursor = conn.cursor()
             
@@ -1158,7 +1360,7 @@ def save_analysis_summary_for_signals(coin: str, interval: str, db_path: str = N
             cursor.execute("""
                 SELECT fractal_score, pattern_distribution, optimal_rsi_min, optimal_rsi_max, optimal_volume_ratio
                 FROM fractal_analysis
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
                 ORDER BY created_at DESC LIMIT 1
             """, (coin, interval))
             
@@ -1180,7 +1382,7 @@ def save_analysis_summary_for_signals(coin: str, interval: str, db_path: str = N
             cursor.execute("""
                 SELECT synergy_score, synergy_patterns
                 FROM synergy_analysis
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
                 ORDER BY created_at DESC LIMIT 1
             """, (coin, interval))
             
@@ -1198,9 +1400,9 @@ def save_analysis_summary_for_signals(coin: str, interval: str, db_path: str = N
                 
                 cursor.execute("""
                     INSERT OR REPLACE INTO analysis_summary_for_signals
-                    (coin, interval, fractal_score, fractal_pattern, synergy_score,
+                    (market_type, market, symbol, interval, fractal_score, fractal_pattern, synergy_score,
                      synergy_patterns, optimal_rsi_min, optimal_rsi_max, optimal_volume_ratio, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES ('COIN', 'BITHUMB', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (
                     coin, interval, fractal_score, fractal_pattern, synergy_score,
                     synergy_patterns, optimal_rsi_min, optimal_rsi_max, optimal_volume_ratio
@@ -1265,7 +1467,7 @@ def save_global_strategy_results(
             cursor.execute("""
                 INSERT INTO global_strategy_results (
                     overall_score, overall_confidence, policy_improvement, convergence_rate,
-                    top_performers, top_coins, top_intervals
+                    top_performers, top_symbols, top_intervals
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 overall_score,
@@ -1286,12 +1488,21 @@ def save_global_strategy_results(
         return False
 
 def load_global_strategies_from_db(interval: str = None, db_path: str = None) -> List[Dict[str, Any]]:
-    """글로벌 전략을 rl_strategies.db에서 로드"""
+    """글로벌 전략을 learning_strategies.db에서 로드"""
     try:
         import json
         from rl_pipeline.core.env import config
         
         db_path = db_path or config.STRATEGIES_DB
+        
+        # 🔧 디렉토리 모드 지원: 폴더면 common_strategies.db 사용
+        if os.path.isdir(db_path) or not db_path.endswith('.db'):
+            db_path = os.path.join(db_path, 'common_strategies.db')
+        
+        # 파일이 없으면 빈 리스트 반환
+        if not os.path.exists(db_path):
+            logger.info(f"ℹ️ 글로벌 전략 DB 파일이 없습니다: {db_path} (정상 - 아직 학습 데이터 없음)")
+            return []
         
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
@@ -1309,7 +1520,7 @@ def load_global_strategies_from_db(interval: str = None, db_path: str = None) ->
             # 글로벌 전략 조회
             if interval:
                 cursor.execute("""
-                    SELECT id, coin, interval, strategy_type, params, name, description,
+                    SELECT id, symbol, interval, strategy_type, params, name, description,
                            profit, profit_factor, win_rate, trades_count, quality_grade,
                            market_condition, created_at, updated_at, meta
                     FROM global_strategies
@@ -1318,7 +1529,7 @@ def load_global_strategies_from_db(interval: str = None, db_path: str = None) ->
                 """, (interval,))
             else:
                 cursor.execute("""
-                    SELECT id, coin, interval, strategy_type, params, name, description,
+                    SELECT id, symbol, interval, strategy_type, params, name, description,
                            profit, profit_factor, win_rate, trades_count, quality_grade,
                            market_condition, created_at, updated_at, meta
                     FROM global_strategies
@@ -1461,10 +1672,10 @@ def save_realtime_feedback(
             
             cursor.execute("""
                 INSERT INTO realtime_learning_feedback
-                (coin, interval, signal_id, signal_score, signal_action, signal_timestamp,
+                (market_type, market, symbol, interval, signal_id, signal_score, signal_action, signal_timestamp,
                  actual_profit, actual_success, market_condition, learning_adjustment,
                  strategy_update, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES ('COIN', 'BITHUMB', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 coin,
                 interval,
@@ -1514,7 +1725,7 @@ def get_realtime_feedback_summary(
             params = []
             
             if coin:
-                conditions.append("coin = ?")
+                conditions.append("symbol = ?")
                 params.append(coin)
             
             if interval:
@@ -1530,7 +1741,7 @@ def get_realtime_feedback_summary(
                     SUM(CASE WHEN actual_success = 1 THEN 1 ELSE 0 END) as successful_signals,
                     AVG(actual_profit) as avg_profit,
                     AVG(signal_score) as avg_signal_score,
-                    COUNT(DISTINCT coin) as distinct_coins,
+                    COUNT(DISTINCT symbol) as distinct_coins,
                     COUNT(DISTINCT interval) as distinct_intervals
                 FROM realtime_learning_feedback
                 WHERE {where_clause}

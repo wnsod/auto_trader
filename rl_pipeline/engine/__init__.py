@@ -12,7 +12,6 @@ from rl_pipeline.engine.adaptive_rollup import (
 )
 from rl_pipeline.engine.rollup_batch import (
     run_rollup_batch,
-    compute_strategy_grades,
     run_full_rollup_and_grades
 )
 
@@ -40,7 +39,6 @@ __all__ = [
     'get_coin_rollup_profile',
     'create_adaptive_rollup_view',
     'run_rollup_batch',
-    'compute_strategy_grades',
     'run_full_rollup_and_grades',
     'Prediction',
     'PredictionGenerator',

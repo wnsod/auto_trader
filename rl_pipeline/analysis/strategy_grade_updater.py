@@ -179,29 +179,22 @@ class StrategyGradeUpdater:
         grade_updates: Dict[str, Dict[str, Any]],
         update_db: bool = True
     ) -> int:
-        """등급 업데이트를 데이터베이스에 적용
-        
-        Args:
-            coin: 코인 심볼
-            interval: 인터벌
-            grade_updates: 업데이트 정보 딕셔너리
-            update_db: 실제 DB 업데이트 여부
-        
-        Returns:
-            업데이트된 전략 수
-        """
+        """등급 업데이트를 데이터베이스에 적용"""
         if not grade_updates:
             return 0
         
         if not update_db:
-            logger.info(f"📊 [{coin}-{interval}] 등급 업데이트 시뮬레이션: {len(grade_updates)}개")
             return len(grade_updates)
         
         try:
             from rl_pipeline.db.connection_pool import get_optimized_db_connection
+            from rl_pipeline.core.env import config
+            
+            # DB 경로 확인 및 로깅
+            db_path = config.get_strategy_db_path(coin)
             
             updated_count = 0
-            with get_optimized_db_connection("strategies") as conn:
+            with get_optimized_db_connection(db_path) as conn:
                 cursor = conn.cursor()
                 
                 from rl_pipeline.core.utils import table_exists
@@ -210,38 +203,68 @@ class StrategyGradeUpdater:
                     try:
                         new_grade = update_info['new_grade']
                         
-                        # coin_strategies 테이블 업데이트 (테이블 존재 확인)
-                        if table_exists(cursor, "coin_strategies"):
+                        # 1. strategies 테이블 업데이트 (ID만 사용)
+                        if table_exists(cursor, "strategies"):
+                            # strategies 테이블은 ID가 PK이므로 ID만으로 업데이트 가능
+                            # 불필요한 symbol/interval 조건 제거하여 매칭 실패 방지
                             cursor.execute("""
-                                UPDATE coin_strategies
+                                UPDATE strategies
                                 SET quality_grade = ?, updated_at = datetime('now')
-                                WHERE id = ? AND coin = ? AND interval = ?
-                            """, (new_grade, strategy_id, coin, interval))
+                                WHERE id = ?
+                            """, (new_grade, strategy_id))
+                            
                             if cursor.rowcount > 0:
                                 updated_count += 1
-                                logger.debug(f"✅ {strategy_id} 등급 업데이트: {update_info['old_grade']} → {new_grade}")
+                                logger.debug(f"✅ strategies.{strategy_id} 등급 업데이트: {update_info['old_grade']} → {new_grade}")
                         
-                        # strategy_grades 테이블도 업데이트 (있는 경우)
+                        # 2. strategy_grades 테이블 업데이트
                         if table_exists(cursor, "strategy_grades"):
-                            cursor.execute("""
+                            # 컬럼 확인
+                            cursor.execute("PRAGMA table_info(strategy_grades)")
+                            cols = [row[1] for row in cursor.fetchall()]
+                            
+                            # WHERE 절 구성
+                            where_clause = "WHERE strategy_id = ?"
+                            params = [new_grade, int(datetime.now().timestamp()), strategy_id]
+                            
+                            # symbol/coin 컬럼 처리
+                            if 'symbol' in cols:
+                                where_clause += " AND symbol = ?"
+                                params.append(coin)
+                            elif 'coin' in cols:
+                                where_clause += " AND coin = ?"
+                                params.append(coin)
+                                
+                            # interval 처리
+                            if 'interval' in cols:
+                                where_clause += " AND interval = ?"
+                                params.append(interval)
+
+                            cursor.execute(f"""
                                 UPDATE strategy_grades
                                 SET grade = ?, updated_at = ?
-                                WHERE strategy_id = ? AND coin = ? AND interval = ?
-                            """, (new_grade, int(datetime.now().timestamp()), strategy_id, coin, interval))
-                            if cursor.rowcount > 0 and updated_count == 0:  # coin_strategies에서 업데이트되지 않았다면 카운트
+                                {where_clause}
+                            """, tuple(params))
+                            
+                            if cursor.rowcount > 0 and updated_count == 0:
                                 updated_count += 1
+                                logger.debug(f"✅ strategy_grades.{strategy_id} 등급 업데이트 완료")
                     
                     except Exception as e:
-                        logger.warning(f"⚠️ {strategy_id} 등급 업데이트 실패: {e}", exc_info=True)
+                        logger.warning(f"⚠️ {strategy_id} 등급 업데이트 개별 실패: {e}")
                         continue
                 
                 conn.commit()
             
-            logger.info(f"✅ [{coin}-{interval}] DB 등급 업데이트 완료: {updated_count}개 전략")
+            if updated_count > 0:
+                logger.info(f"✅ [{coin}-{interval}] DB 등급 업데이트 완료: {updated_count}개 전략 (경로: {db_path})")
+            else:
+                logger.warning(f"⚠️ [{coin}-{interval}] DB 등급 업데이트 실패: 0개 업데이트 (대상 {len(grade_updates)}개, 경로: {db_path})")
+                
             return updated_count
             
         except Exception as e:
-            logger.error(f"❌ DB 등급 업데이트 실패: {e}", exc_info=True)
+            logger.error(f"❌ DB 등급 업데이트 전체 실패: {e}", exc_info=True)
             return 0
     
     def _get_current_grade(self, strategy_id: str, coin: str, interval: str) -> str:
@@ -249,29 +272,63 @@ class StrategyGradeUpdater:
         try:
             from rl_pipeline.db.connection_pool import get_optimized_db_connection
             from rl_pipeline.core.utils import safe_query_one, table_exists
+            from rl_pipeline.core.env import config
             
-            with get_optimized_db_connection("strategies") as conn:
+            # 🔥 코인별 DB 경로 명시적 사용
+            db_path = config.get_strategy_db_path(coin)
+            
+            with get_optimized_db_connection(db_path) as conn:
                 cursor = conn.cursor()
                 
-                # coin_strategies 테이블에서 조회
-                if table_exists(cursor, "coin_strategies"):
-                    result = safe_query_one(
-                        cursor,
-                        "SELECT quality_grade FROM coin_strategies WHERE id = ? AND coin = ? AND interval = ?",
-                        (strategy_id, coin, interval),
-                        table_name="coin_strategies"
-                    )
+                # strategies 테이블에서 조회
+                if table_exists(cursor, "strategies"):
+                    # 컬럼 확인
+                    cursor.execute("PRAGMA table_info(strategies)")
+                    cols = [row[1] for row in cursor.fetchall()]
+                    has_symbol = 'symbol' in cols
+                    has_coin = 'coin' in cols
+                    
+                    query = "SELECT quality_grade FROM strategies WHERE id = ?"
+                    params = [strategy_id]
+                    
+                    if has_symbol:
+                        query += " AND symbol = ?"
+                        params.append(coin)
+                    elif has_coin:
+                        query += " AND coin = ?"
+                        params.append(coin)
+                        
+                    # interval 컬럼이 있다고 가정
+                    if 'interval' in cols:
+                        query += " AND interval = ?"
+                        params.append(interval)
+                        
+                    result = safe_query_one(cursor, query, tuple(params), table_name="strategies")
                     if result and result[0]:
                         return result[0]
                 
                 # strategy_grades 테이블에서 조회 시도
                 if table_exists(cursor, "strategy_grades"):
-                    result = safe_query_one(
-                        cursor,
-                        "SELECT grade FROM strategy_grades WHERE strategy_id = ? AND coin = ? AND interval = ?",
-                        (strategy_id, coin, interval),
-                        table_name="strategy_grades"
-                    )
+                    cursor.execute("PRAGMA table_info(strategy_grades)")
+                    cols = [row[1] for row in cursor.fetchall()]
+                    has_symbol = 'symbol' in cols
+                    has_coin = 'coin' in cols
+                    
+                    query = "SELECT grade FROM strategy_grades WHERE strategy_id = ?"
+                    params = [strategy_id]
+                    
+                    if has_symbol:
+                        query += " AND symbol = ?"
+                        params.append(coin)
+                    elif has_coin:
+                        query += " AND coin = ?"
+                        params.append(coin)
+                        
+                    if 'interval' in cols:
+                        query += " AND interval = ?"
+                        params.append(interval)
+                        
+                    result = safe_query_one(cursor, query, tuple(params), table_name="strategy_grades")
                     if result and result[0]:
                         return result[0]
             

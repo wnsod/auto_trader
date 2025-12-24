@@ -23,7 +23,7 @@ from rl_pipeline.db.connection_pool import get_optimized_db_connection
 
 logger = logging.getLogger(__name__)
 
-def revalidate_coin_strategies(coin: str, intervals: List[str]) -> Dict[str, Any]:
+def revalidate_strategies(coin: str, intervals: List[str]) -> Dict[str, Any]:
 
     """기존 재검증 함수 (호환성 유지)"""
 
@@ -35,7 +35,7 @@ def revalidate_coin_strategies(coin: str, intervals: List[str]) -> Dict[str, Any
 
         # 동적 재검증 함수 호출
 
-        return revalidate_coin_strategies_dynamic(coin, intervals)
+        return revalidate_strategies_dynamic(coin, intervals)
 
         
 
@@ -47,7 +47,7 @@ def revalidate_coin_strategies(coin: str, intervals: List[str]) -> Dict[str, Any
 
 
 
-def revalidate_coin_strategies_dynamic(coin: str, intervals: List[str], 
+def revalidate_strategies_dynamic(coin: str, intervals: List[str], 
 
                                       dna_analysis: Dict[str, Any] = None,
 
@@ -235,11 +235,11 @@ def revalidate_long_term_strategies(coin: str, interval: str, dna_analysis: Dict
 
                        sr.total_trades, sr.win_rate as sr_win_rate, sr.total_return, sr.max_drawdown, sr.sharpe_ratio
 
-                FROM coin_strategies cs
+                FROM strategies cs
 
                 LEFT JOIN simulation_results sr ON cs.id = sr.strategy_id
 
-                WHERE cs.coin = ? AND cs.interval = ?
+                WHERE cs.symbol = ? AND cs.interval = ?
 
                 AND sr.total_trades > 0
 
@@ -387,11 +387,11 @@ def revalidate_short_term_front_strategies(coin: str, interval: str, dna_analysi
 
                        sr.total_trades, sr.win_rate as sr_win_rate, sr.total_return, sr.max_drawdown, sr.sharpe_ratio
 
-                FROM coin_strategies cs
+                FROM strategies cs
 
                 LEFT JOIN simulation_results sr ON cs.id = sr.strategy_id
 
-                WHERE cs.coin = ? AND cs.interval = ?
+                WHERE cs.symbol = ? AND cs.interval = ?
 
                 AND sr.total_trades > 0
 
@@ -539,11 +539,11 @@ def revalidate_short_term_back_strategies(coin: str, interval: str, dna_analysis
 
                        sr.total_trades, sr.win_rate as sr_win_rate, sr.total_return, sr.max_drawdown, sr.sharpe_ratio
 
-                FROM coin_strategies cs
+                FROM strategies cs
 
                 LEFT JOIN simulation_results sr ON cs.id = sr.strategy_id
 
-                WHERE cs.coin = ? AND cs.interval = ?
+                WHERE cs.symbol = ? AND cs.interval = ?
 
                 AND sr.total_trades > 0
 
@@ -689,11 +689,11 @@ def revalidate_short_term_only_strategies(coin: str, interval: str, dna_analysis
 
                        sr.total_trades, sr.win_rate as sr_win_rate, sr.total_return, sr.max_drawdown, sr.sharpe_ratio
 
-                FROM coin_strategies cs
+                FROM strategies cs
 
                 LEFT JOIN simulation_results sr ON cs.id = sr.strategy_id
 
-                WHERE cs.coin = ? AND cs.interval = ?
+                WHERE cs.symbol = ? AND cs.interval = ?
 
                 AND sr.total_trades > 0
 
@@ -863,9 +863,9 @@ def revalidate_short_term_only_strategies(coin: str, interval: str, dna_analysis
 
                                    ma_period, bb_period, bb_std
 
-                            FROM coin_strategies 
+                            FROM strategies 
 
-                            WHERE coin = ? AND interval = ?
+                            WHERE symbol = ? AND interval = ?
 
                             ORDER BY created_at DESC
 
@@ -887,9 +887,9 @@ def revalidate_short_term_only_strategies(coin: str, interval: str, dna_analysis
 
                                        20.0 as ma_period, 20.0 as bb_period, 2.0 as bb_std
 
-                                FROM coin_strategies 
+                                FROM strategies 
 
-                                WHERE coin = ? AND interval = ?
+                                WHERE symbol = ? AND interval = ?
 
                                 ORDER BY created_at DESC
 
@@ -1177,7 +1177,7 @@ def update_strategy_grade(id: str, new_grade: str) -> bool:
 
             cursor.execute("""
 
-                UPDATE coin_strategies 
+                UPDATE strategies 
 
                 SET quality_grade = ?, updated_at = datetime('now')
 
@@ -1233,9 +1233,9 @@ def load_high_grade_strategies(coin: str, interval: str, num_strategies: int = 5
 
                            quality_grade
 
-                    FROM coin_strategies 
+                    FROM strategies 
 
-                    WHERE coin = ? AND interval = ? AND is_active = 1 
+                    WHERE symbol = ? AND interval = ? AND is_active = 1 
 
                     AND quality_grade IN ('A', 'A+', 'B+')
 
@@ -1261,9 +1261,9 @@ def load_high_grade_strategies(coin: str, interval: str, num_strategies: int = 5
 
                                quality_grade
 
-                        FROM coin_strategies 
+                        FROM strategies 
 
-                        WHERE coin = ? AND interval = ? AND is_active = 1 
+                        WHERE symbol = ? AND interval = ? AND is_active = 1 
 
                         AND quality_grade IN ('A', 'A+', 'B+')
 
@@ -1379,11 +1379,11 @@ def calculate_current_strategy_quality(coin: str, interval: str) -> float:
 
                        AVG(sr.sharpe_ratio) as avg_sharpe, COUNT(*) as strategy_count
 
-                FROM coin_strategies cs
+                FROM strategies cs
 
                 LEFT JOIN simulation_results sr ON cs.id = sr.strategy_id
 
-                WHERE cs.coin = ? AND cs.interval = ?
+                WHERE cs.symbol = ? AND cs.interval = ?
 
                 AND sr.total_trades > 0
 
@@ -1449,7 +1449,7 @@ def get_previous_strategy_quality(coin: str, interval: str) -> float:
 
                 SELECT analysis_result FROM strategy_quality_history 
 
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
 
                 ORDER BY created_at DESC LIMIT 1
 
@@ -1567,7 +1567,7 @@ def revalidate_with_dynamic_iteration(
 
                 # 재검증 실행 (기존 함수 호출)
 
-                iteration_results = revalidate_coin_strategies_dynamic_single(
+                iteration_results = revalidate_strategies_dynamic_single(
 
                     coin, interval, dna_analysis, fractal_analysis, optimal_conditions
 

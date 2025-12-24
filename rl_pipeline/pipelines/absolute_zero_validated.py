@@ -69,17 +69,17 @@ try:
     AZError = core_errors.AZError
     create_run_record = strategy_manager.create_run_record
     update_run_record = strategy_manager.update_run_record
-    create_coin_strategies = strategy_manager.create_coin_strategies
+    create_strategies = strategy_manager.create_strategies
     create_global_strategies = strategy_manager.create_global_strategies
     run_self_play_test = selfplay.run_self_play_test
     RegimeRouter = regime_router.RegimeRouter
     create_regime_routing_strategies = regime_router.create_regime_routing_strategies
     IntegratedAnalyzer = integrated_analyzer.IntegratedAnalyzer
-    analyze_coin_strategies = integrated_analyzer.analyze_coin_strategies
+    analyze_strategies = integrated_analyzer.analyze_strategies
     analyze_global_strategies = integrated_analyzer.analyze_global_strategies
     ensure_indexes = db_schema.ensure_indexes
     setup_database_tables = db_schema.setup_database_tables
-    create_coin_strategies_table = db_schema.create_coin_strategies_table
+    create_strategies_table = db_schema.create_strategies_table
     get_optimized_db_connection = db_pool.get_optimized_db_connection
 
     NEW_PIPELINE_AVAILABLE = True
@@ -167,8 +167,8 @@ def _configure_logging():
 # 🔥 pipelines 폴더로 이동했으므로 상위 디렉토리 기준으로 경로 설정
 # base_dir는 이미 위에서 정의됨
 CANDLES_DB_PATH = os.path.join(base_dir, 'data', 'rl_candles.db')
-STRATEGIES_DB_PATH = os.path.join(base_dir, 'data', 'rl_strategies.db')
-# learning_results.db는 이제 rl_strategies.db로 통합됨 (core/env.py 참조)
+STRATEGIES_DB_PATH = os.path.join(base_dir, 'data', 'learning_strategies.db')
+# learning_results.db는 이제 learning_strategies.db로 통합됨 (core/env.py 참조)
 LEARNING_RESULTS_DB_PATH = STRATEGIES_DB_PATH
 
 def ensure_storage_ready():
@@ -485,9 +485,9 @@ def main():
 
             # 필수 테이블 보강 생성 (방어적)
             try:
-                create_coin_strategies_table()
+                create_strategies_table()
             except Exception as se:
-                logger.warning(f"⚠️ coin_strategies 보강 생성 실패(무시 가능): {se}")
+                logger.warning(f"⚠️ strategies 보강 생성 실패(무시 가능): {se}")
 
             # 인덱스 생성 (한 번만)
             try:
@@ -543,7 +543,7 @@ def main():
 
         if not coin_interval_combinations:
             logger.error("❌ 사용 가능한 코인/인터벌 조합이 없습니다.")
-            logger.error("❌ 캔들 데이터를 먼저 수집하세요: python rl_candles_collector.py")
+            logger.error("❌ 캔들 데이터를 먼저 수집하세요: python candles_collector.py")
             return {"error": "no coin/interval combinations found", "message": "캔들 데이터를 먼저 수집하세요"}
 
         # 테스트를 위해 첫 번째 코인만 실행 (전체 실행 원하면 이 부분 제거)

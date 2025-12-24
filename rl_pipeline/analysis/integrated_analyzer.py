@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,6 +18,20 @@ except ImportError:
     DEBUG_AVAILABLE = False
     RoutingDebugger = None
     AnalysisDebugger = None
+
+# 🔥 인터벌 프로필 import (안전한 fallback)
+try:
+    from rl_pipeline.core.interval_profiles import (
+        INTERVAL_PROFILES,
+        get_integration_weights,
+        get_interval_role
+    )
+    INTERVAL_PROFILES_AVAILABLE = True
+except ImportError:
+    logger.debug("interval_profiles 모듈을 찾을 수 없습니다. 동적 가중치 사용")
+    INTERVAL_PROFILES_AVAILABLE = False
+    get_integration_weights = None
+    get_interval_role = None
 
 # ---------------------------------------------------------------------
 # 외부 시스템 의존 모듈 (없을 수 있으므로 안전 가드)
@@ -43,15 +57,7 @@ except Exception as e:
     logger.debug(f"[통합분석기] 학습 시스템 모듈 미사용 (선택적): {e}")
     LEARNING_SYSTEMS_AVAILABLE = False
 
-# 분석 유틸 (이전 외부 모듈이 제거되었을 수 있어 더미 제공)
-def run_fractal_analysis(*_args, **_kwargs) -> Dict[str, float]:
-    return {"fractal_score": 0.5, "complexity": 0.5}
-
-def score_synergy(*_args, **_kwargs) -> Dict[str, float]:
-    return {"synergy_score": 0.5, "correlation": 0.5}
-
-def analyze_coin_indicator_correlations(*_args, **_kwargs) -> Dict[str, Any]:
-    return {"correlation_score": 0.5, "indicators": []}
+# 분석 유틸 함수들은 내부 메서드로 구현됨 (더미 함수 제거됨)
 
 # ---------------------------------------------------------------------
 # 데이터 클래스
@@ -140,7 +146,7 @@ class IntegratedAnalyzer:
     # ------------------------------
     # 코인별 전략 분석 (단일 인터벌)
     # ------------------------------
-    def analyze_coin_strategies(
+    def analyze_strategies(
         self,
         coin: str,
         interval: str,
@@ -166,6 +172,11 @@ class IntegratedAnalyzer:
                 fractal_ratios = stored_ratios.get("fractal_ratios", {})
                 multi_timeframe_ratios = stored_ratios.get("multi_timeframe_ratios", {})
                 indicator_cross_ratios = stored_ratios.get("indicator_cross_ratios", {})
+                # 🆕 저장된 비율 사용 시에도 선택된 모듈 로깅
+                if analysis_modules:
+                    logger.info(f"[{coin}-{interval}] 선택된 분석 모듈 (저장됨): {list(analysis_modules.keys())}")
+                else:
+                    logger.warning(f"[{coin}-{interval}] ⚠️ 저장된 분석 모듈이 비어있음, 기본값 사용")
             else:
                 logger.info(f"[{coin}] '{regime}' 최적 분석 비율 계산")
                 analysis_modules = self._select_optimal_analysis_modules(coin, interval, regime, candle_data)
@@ -185,24 +196,30 @@ class IntegratedAnalyzer:
                 analysis_results["fractal"] = self._analyze_fractal_patterns_with_ratios(
                     coin, interval, candle_data, fractal_ratios
                 )
+                logger.debug(f"[{coin}-{interval}] 프랙탈 분석 완료: {analysis_results['fractal']:.3f}")
             else:
                 analysis_results["fractal"] = 0.5
+                logger.warning(f"[{coin}-{interval}] ⚠️ 프랙탈 모듈 미선택, 기본값 0.5 사용")
 
             # 2) 다중시간대
             if "multi_timeframe" in analysis_modules:
                 analysis_results["multi_timeframe"] = self._analyze_multi_timeframe_with_ratios(
                     coin, interval, candle_data, multi_timeframe_ratios
                 )
+                logger.debug(f"[{coin}-{interval}] 멀티타임프레임 분석 완료: {analysis_results['multi_timeframe']:.3f}")
             else:
                 analysis_results["multi_timeframe"] = 0.5
+                logger.warning(f"[{coin}-{interval}] ⚠️ 멀티타임프레임 모듈 미선택, 기본값 0.5 사용")
 
             # 3) 지표 교차/상관
             if "indicator_cross" in analysis_modules:
                 analysis_results["indicator_cross"] = self._analyze_indicator_correlations_with_ratios(
                     coin, interval, candle_data, indicator_cross_ratios
                 )
+                logger.debug(f"[{coin}-{interval}] 지표교차 분석 완료: {analysis_results['indicator_cross']:.3f}")
             else:
                 analysis_results["indicator_cross"] = 0.5
+                logger.warning(f"[{coin}-{interval}] ⚠️ 지표교차 모듈 미선택, 기본값 0.5 사용")
 
             # 4) 코인 특화
             if "coin_specific" in analysis_modules:
@@ -440,7 +457,7 @@ class IntegratedAnalyzer:
                 if strategies:
                     first_interval = list(multi_interval_candle_data.keys())[0] if multi_interval_candle_data else '15m'
                     first_candle = multi_interval_candle_data.get(first_interval, pd.DataFrame())
-                    return self.analyze_coin_strategies(coin, first_interval, regime, strategies, first_candle)
+                    return self.analyze_strategies(coin, first_interval, regime, strategies, first_candle)
                 else:
                     return self._create_default_coin_signal_score(coin, '15m', regime)
             
@@ -680,20 +697,79 @@ class IntegratedAnalyzer:
                         'interval_confidence': 0.5,
                     }
             
-            # 2단계: 인터벌별 가중치 계산 (신뢰도 기반)
+            # 2단계: 인터벌별 가중치 계산
             interval_weights: Dict[str, float] = {}
-            total_confidence = sum(result['interval_confidence'] for result in interval_results.values())
-            
-            if total_confidence > 0:
-                for interval, result in interval_results.items():
-                    # 신뢰도 기반 가중치 (정규화)
-                    weight = result['interval_confidence'] / total_confidence
-                    interval_weights[interval] = weight
+
+            # 🔥 interval_profiles 가중치 우선 사용
+            if INTERVAL_PROFILES_AVAILABLE and get_integration_weights:
+                try:
+                    profile_weights = get_integration_weights()
+                    
+                    # None 체크
+                    if profile_weights is None:
+                        raise ValueError("get_integration_weights()가 None을 반환했습니다")
+                    
+                    # 사용 가능한 인터벌에 대해서만 가중치 적용
+                    total_weight = sum(profile_weights.get(iv, 0) for iv in available_intervals)
+
+                    if total_weight > 0:
+                        for interval in available_intervals:
+                            if interval in profile_weights:
+                                # 정규화된 가중치 사용
+                                interval_weights[interval] = profile_weights[interval] / total_weight
+                            else:
+                                interval_weights[interval] = 0
+
+                        logger.info(f"📊 [{coin}] interval_profiles 가중치 사용")
+                        if get_interval_role:
+                            for interval in available_intervals:
+                                try:
+                                    role = get_interval_role(interval)
+                                    if role and role != "Unknown role":
+                                        logger.debug(f"  {interval}: {role}")
+                                except (ValueError, TypeError) as role_err:
+                                    logger.debug(f"  {interval}: 역할 조회 실패: {role_err}")
+                    else:
+                        raise ValueError("profile_weights가 비어있음")
+
+                except (ValueError, TypeError, AttributeError) as e:
+                    logger.debug(f"interval_profiles 가중치 사용 실패, 동적 가중치로 폴백: {e}")
+                    # 폴백: 신뢰도 기반 동적 가중치
+                    total_confidence = sum(result['interval_confidence'] for result in interval_results.values())
+
+                    if total_confidence > 0:
+                        for interval, result in interval_results.items():
+                            weight = result['interval_confidence'] / total_confidence
+                            interval_weights[interval] = weight
+                    else:
+                        for interval in available_intervals:
+                            interval_weights[interval] = 1.0 / len(available_intervals)
+                except Exception as e:
+                    logger.warning(f"interval_profiles 가중치 사용 중 예상치 못한 오류: {e}", exc_info=True)
+                    # 폴백: 신뢰도 기반 동적 가중치
+                    total_confidence = sum(result['interval_confidence'] for result in interval_results.values())
+
+                    if total_confidence > 0:
+                        for interval, result in interval_results.items():
+                            weight = result['interval_confidence'] / total_confidence
+                            interval_weights[interval] = weight
+                    else:
+                        for interval in available_intervals:
+                            interval_weights[interval] = 1.0 / len(available_intervals)
             else:
-                # 신뢰도가 모두 0이면 균등 가중치
-                for interval in available_intervals:
-                    interval_weights[interval] = 1.0 / len(available_intervals)
-            
+                # interval_profiles 없을 때: 기존 신뢰도 기반 가중치
+                total_confidence = sum(result['interval_confidence'] for result in interval_results.values())
+
+                if total_confidence > 0:
+                    for interval, result in interval_results.items():
+                        # 신뢰도 기반 가중치 (정규화)
+                        weight = result['interval_confidence'] / total_confidence
+                        interval_weights[interval] = weight
+                else:
+                    # 신뢰도가 모두 0이면 균등 가중치
+                    for interval in available_intervals:
+                        interval_weights[interval] = 1.0 / len(available_intervals)
+
             # 🔥 소숫점 정리 (3자리) - numpy 타입을 float로 변환
             formatted_weights = {k: float(round(v, 3)) for k, v in interval_weights.items()}
             logger.info(f"📊 [{coin}] 인터벌별 가중치: {formatted_weights}")
@@ -896,17 +972,48 @@ class IntegratedAnalyzer:
             score_diff = abs(buy_score - sell_score)
     
             if buy_score > sell_score and score_diff > 0.05:
-                return 'buy'
+                preliminary_direction = 'buy'
             elif sell_score > buy_score and score_diff > 0.05:
-                return 'sell'
+                preliminary_direction = 'sell'
             else:
                 # RSI 중앙값으로 최종 결정
                 if rsi_midpoint < 48:
-                    return 'buy'
+                    preliminary_direction = 'buy'
                 elif rsi_midpoint > 52:
-                    return 'sell'
+                    preliminary_direction = 'sell'
                 else:
-                    return 'neutral'
+                    preliminary_direction = 'neutral'
+            
+            # 🔥 9. MFE/MAE 기반 방향성 검증 (근본적 개선)
+            # EntryScore가 음수면 해당 방향으로 진입 시 손해 → neutral로 변경
+            strategy_id = strategy.get('id', '')
+            if preliminary_direction != 'neutral' and strategy_id:
+                try:
+                    from rl_pipeline.core.strategy_grading import (
+                        get_strategy_mfe_stats, MFEGrading
+                    )
+                    
+                    mfe_stats = get_strategy_mfe_stats(strategy_id)
+                    if mfe_stats and mfe_stats.coverage_n >= 20:
+                        entry_score, risk_score, edge_score = MFEGrading.calculate_scores(mfe_stats)
+                        
+                        # 방향성 유효성 검증
+                        if not MFEGrading.validate_direction_by_mfe(entry_score, min_entry_score=0.0):
+                            # EntryScore가 음수 → 해당 방향 무효
+                            logger.debug(f"🚫 {strategy_id}: 방향 '{preliminary_direction}' 무효화 (EntryScore={entry_score:.4f} < 0)")
+                            return 'neutral'
+                        
+                        # 신뢰도가 너무 낮으면 neutral (0.2 미만)
+                        confidence = MFEGrading.get_directional_confidence(entry_score, edge_score)
+                        if confidence < 0.2:
+                            logger.debug(f"🚫 {strategy_id}: 방향 신뢰도 부족 (confidence={confidence:.3f} < 0.2)")
+                            return 'neutral'
+                            
+                except Exception as mfe_err:
+                    # MFE 검증 실패 시 기존 방향 유지 (graceful degradation)
+                    logger.debug(f"⚠️ MFE 검증 스킵 ({strategy_id}): {mfe_err}")
+            
+            return preliminary_direction
     
         except Exception as e:
             logger.debug(f"전략 방향 분류 실패 (무시): {e}")
@@ -3018,16 +3125,18 @@ class IntegratedAnalyzer:
             MIN_CONFIDENCE_FOR_TRADE = float(os.getenv('MIN_CONFIDENCE_FOR_TRADE', '0.65'))
             MIN_CONFIDENCE_FOR_STRONG_TRADE = float(os.getenv('MIN_CONFIDENCE_FOR_STRONG_TRADE', '0.75'))
 
-            # 레짐별 임계값
+            # 레짐별 임계값 (Trend Following & Safety First)
+            # 강세장: 매수 기준 완화, 매도 기준 강화
+            # 약세장: 매수 기준 강화, 매도 기준 완화
             thr = {
-                "extreme_bearish": {"buy": 0.3, "sell": 0.7},
-                "bearish": {"buy": 0.4, "sell": 0.6},
-                "sideways_bearish": {"buy": 0.45, "sell": 0.55},
-                "neutral": {"buy": 0.5, "sell": 0.5},
-                "sideways_bullish": {"buy": 0.55, "sell": 0.45},
-                "bullish": {"buy": 0.6, "sell": 0.4},
-                "extreme_bullish": {"buy": 0.7, "sell": 0.3},
-            }.get(regime, {"buy": 0.5, "sell": 0.5})
+                "extreme_bearish": {"buy": 0.85, "sell": 0.60},  # 매수 매우 엄격, 매도 쉬움 (0.6 이하)
+                "bearish": {"buy": 0.75, "sell": 0.55},          # 매수 엄격, 매도 약간 쉬움
+                "sideways_bearish": {"buy": 0.65, "sell": 0.50},
+                "neutral": {"buy": 0.60, "sell": 0.40},          # 기본: 0.6 이상 매수, 0.4 이하 매도
+                "sideways_bullish": {"buy": 0.55, "sell": 0.35},
+                "bullish": {"buy": 0.50, "sell": 0.30},          # 매수 쉬움 (0.5 이상), 매도 엄격
+                "extreme_bullish": {"buy": 0.45, "sell": 0.25},  # 매수 매우 쉬움, 매도 매우 엄격
+            }.get(regime, {"buy": 0.60, "sell": 0.40})
 
             # 예측 결정
             if signal_score >= thr["buy"]:
@@ -3254,14 +3363,44 @@ class IntegratedAnalyzer:
             return []
 
     def _get_top_intervals(self, coin_results: List[CoinSignalScore]) -> List[str]:
+        """인터벌별 점수를 interval_profiles 가중치로 조정하여 상위 인터벌 추출"""
         try:
             if not coin_results:
                 return []
+            
+            # 🔥 interval_profiles 가중치 로드
+            interval_weights = {}
+            if INTERVAL_PROFILES_AVAILABLE and get_integration_weights:
+                try:
+                    profile_weights = get_integration_weights()
+                    if profile_weights:
+                        interval_weights = profile_weights
+                        logger.debug(f"🎯 interval_profiles 가중치 적용: {interval_weights}")
+                except Exception as e:
+                    logger.debug(f"⚠️ interval_profiles 가중치 로드 실패: {e}")
+            
+            # 인터벌별 점수 수집
             bucket: Dict[str, List[float]] = {}
             for r in coin_results:
                 bucket.setdefault(r.interval, []).append(r.final_signal_score)
+            
+            # 평균 점수 계산
             avg = {k: sum(v) / len(v) for k, v in bucket.items()}
-            return [k for k, _ in sorted(avg.items(), key=lambda x: x[1], reverse=True)[:3]]
+            
+            # 🔥 interval_profiles 가중치 적용
+            if interval_weights:
+                weighted_avg = {}
+                for interval, score in avg.items():
+                    weight = interval_weights.get(interval, 0.0)
+                    # 가중치 적용: 점수 × 가중치
+                    weighted_avg[interval] = score * weight
+                    logger.debug(f"  📊 {interval}: 점수={score:.3f}, 가중치={weight:.3f}, 가중점수={weighted_avg[interval]:.3f}")
+                avg = weighted_avg
+            
+            # 상위 3개 인터벌 반환
+            top_intervals = [k for k, _ in sorted(avg.items(), key=lambda x: x[1], reverse=True)[:3]]
+            logger.debug(f"✅ Top 인터벌: {top_intervals}")
+            return top_intervals
         except Exception as e:
             logger.error(f"Top 인터벌 추출 실패: {e}")
             return []
@@ -3305,11 +3444,11 @@ class IntegratedAnalyzer:
 # ---------------------------------------------------------------------
 # 외부 노출 편의 함수
 # ---------------------------------------------------------------------
-def analyze_coin_strategies(
+def analyze_strategies(
     coin: str, interval: str, regime: str, strategies: List[Dict[str, Any]], candle_data: pd.DataFrame
 ) -> CoinSignalScore:
     analyzer = IntegratedAnalyzer()
-    return analyzer.analyze_coin_strategies(coin, interval, regime, strategies, candle_data)
+    return analyzer.analyze_strategies(coin, interval, regime, strategies, candle_data)
 
 def analyze_multi_interval_strategies(
     coin: str, regime: str, strategies: List[Dict[str, Any]], multi_interval_candle_data: Dict[str, pd.DataFrame]

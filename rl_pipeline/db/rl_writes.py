@@ -1,6 +1,10 @@
 """
 예측형 강화학습 시스템 DB 저장 유틸리티
 rl_episodes, rl_steps, rl_episode_summary 저장 함수
+
+핵심 설계:
+- coin → symbol 매핑
+- market_type, market 컬럼 추가
 """
 
 import logging
@@ -11,6 +15,10 @@ from rl_pipeline.db.connection_pool import get_optimized_db_connection
 from rl_pipeline.core.errors import DBWriteError
 
 logger = logging.getLogger(__name__)
+
+# 상수 정의
+DEFAULT_MARKET_TYPE = "COIN"
+DEFAULT_MARKET = "BITHUMB"
 
 
 def save_episode_prediction(
@@ -52,7 +60,11 @@ def save_episode_prediction(
             ts_entry = int(datetime.now().timestamp())
         
         if db_connection is None:
-            with get_optimized_db_connection("strategies") as conn:
+            # 🔥 코인별 DB 경로 사용
+            from rl_pipeline.core.env import config
+            coin_db_path = config.get_strategy_db_path(coin)
+            
+            with get_optimized_db_connection(coin_db_path) as conn:
                 return _save_episode_prediction_impl(
                     episode_id, coin, interval, strategy_id, state_key,
                     predicted_dir, predicted_conf, entry_price,
@@ -82,26 +94,31 @@ def _save_episode_prediction_impl(
     target_move_pct: float,
     horizon_k: int,
     ts_entry: int,
-    conn
+    conn,
+    market_type: str = DEFAULT_MARKET_TYPE,
+    market: str = DEFAULT_MARKET
 ) -> bool:
-    """에피소드 예측 저장 구현"""
+    """에피소드 예측 저장 구현 (coin → symbol 매핑)"""
     try:
         cursor = conn.cursor()
-        
+
+        # coin → symbol
+        symbol = coin
+
         cursor.execute("""
             INSERT OR REPLACE INTO rl_episodes (
-                episode_id, ts_entry, coin, interval, strategy_id, state_key,
+                episode_id, ts_entry, market_type, market, symbol, interval, strategy_id, state_key,
                 predicted_dir, predicted_conf, entry_price, target_move_pct, horizon_k
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            episode_id, ts_entry, coin, interval, strategy_id, state_key,
+            episode_id, ts_entry, market_type, market, symbol, interval, strategy_id, state_key,
             predicted_dir, predicted_conf, entry_price, target_move_pct, horizon_k
         ))
-        
+
         conn.commit()
         logger.debug(f"✅ 에피소드 예측 저장: {episode_id}")
         return True
-        
+
     except Exception as e:
         logger.error(f"❌ 에피소드 예측 저장 실패: {e}")
         conn.rollback()
@@ -151,7 +168,28 @@ def save_episode_step(
     """
     try:
         if db_connection is None:
-            with get_optimized_db_connection("strategies") as conn:
+            # 🔥 주의: rl_steps는 코인별 DB가 아닌 common_strategies.db에 있을 수도 있고, 
+            # 코인별 DB에 있을 수도 있음. 여기서는 episode_id만으로 코인을 알 수 없으므로
+            # 호출자가 db_connection을 넘겨주는 것이 안전함.
+            # 만약 db_connection이 없다면, 현재 구조상 어디에 저장해야 할지 모호함.
+            # 하지만 일반적으로 save_episode_step은 save_episode_prediction과 같은 컨텍스트에서 호출되므로
+            # 보통 db_connection이 전달됨.
+            # 전달되지 않는 경우를 위해 기본값(common)을 사용하되 경고 로그 출력.
+            # 하지만 rl_episodes 테이블과 같은 곳에 저장해야 하므로, 이 함수의 시그니처에 coin이 없는 것이 문제임.
+            # 일단 기존 로직("strategies") 유지하되, 가능하다면 호출측에서 conn을 넘겨야 함.
+            # 또는 이 함수를 호출하는 곳을 찾아서 coin 정보를 넘기도록 수정해야 함.
+            # 여기서는 일단 config.STRATEGIES_DB(common) 사용. 
+            # 만약 코인별 DB를 써야 한다면 호출부 수정 필요.
+            
+            # 다만, rl_pipeline 구조상 step 저장은 보통 메모리 상에서 처리되고 
+            # 최종적으로 batch write 되거나, 
+            # Orchestrator에서 connection을 관리하며 넘겨줄 것임.
+            
+            from rl_pipeline.core.env import config
+            # 여기서는 일단 기본 경로 사용 (코인 정보 부재)
+            # 실제로는 호출자가 db_connection을 제공해야 함
+            
+            with get_optimized_db_connection(config.STRATEGIES_DB) as conn:
                 return _save_episode_step_impl(
                     episode_id, ts, event, price, ret_raw, ret_signed,
                     dd_pct_norm, actual_move_pct, prox, dir_correct,
@@ -258,7 +296,11 @@ def save_episode_summary(
             ts_exit = int(datetime.now().timestamp())
         
         if db_connection is None:
-            with get_optimized_db_connection("strategies") as conn:
+            # 🔥 코인별 DB 경로 사용
+            from rl_pipeline.core.env import config
+            coin_db_path = config.get_strategy_db_path(coin)
+            
+            with get_optimized_db_connection(coin_db_path) as conn:
                 return _save_episode_summary_impl(
                     episode_id, ts_exit, first_event, t_hit,
                     realized_ret_signed, total_reward, acc_flag,
@@ -288,28 +330,33 @@ def _save_episode_summary_impl(
     interval: str,
     strategy_id: str,
     source_type: str,
-    conn
+    conn,
+    market_type: str = DEFAULT_MARKET_TYPE,
+    market: str = DEFAULT_MARKET
 ) -> bool:
-    """에피소드 요약 저장 구현"""
+    """에피소드 요약 저장 구현 (coin → symbol 매핑)"""
     try:
         cursor = conn.cursor()
-        
+
+        # coin → symbol
+        symbol = coin
+
         cursor.execute("""
             INSERT OR REPLACE INTO rl_episode_summary (
-                episode_id, ts_exit, first_event, t_hit,
-                realized_ret_signed, total_reward, acc_flag,
-                coin, interval, strategy_id, source_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                episode_id, ts_exit, market_type, market, symbol, interval,
+                strategy_id, first_event, t_hit,
+                realized_ret_signed, total_reward, acc_flag, source_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            episode_id, ts_exit, first_event, t_hit,
-            realized_ret_signed, total_reward, acc_flag,
-            coin, interval, strategy_id, source_type
+            episode_id, ts_exit, market_type, market, symbol, interval,
+            strategy_id, first_event, t_hit,
+            realized_ret_signed, total_reward, acc_flag, source_type
         ))
-        
+
         conn.commit()
         logger.debug(f"✅ 에피소드 요약 저장: {episode_id} (event={first_event}, acc={acc_flag})")
         return True
-        
+
     except Exception as e:
         logger.error(f"❌ 에피소드 요약 저장 실패: {e}")
         conn.rollback()

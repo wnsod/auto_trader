@@ -64,38 +64,59 @@ def _create_adjusted_config(
                     'hidden_dim': 128
                 },
                 'paths': {
-                    'checkpoints': '/workspace/rl_pipeline/artifacts/checkpoints',
-                    'db': '/workspace/data_storage/rl_strategies.db'
+                    'checkpoints': os.getenv('CHECKPOINTS_PATH', '/workspace/rl_pipeline/artifacts/checkpoints'),
+                    'db': os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')  # 하드코딩 삭제
                 }
             }
         
         # 하이퍼파라미터 조정
         train_config = config.setdefault('train', {})
+        attempt_no = max(1, previous_attempts)
+        updated = False
         
-        # 🔥 거래 0회 문제 해결: 학습률 및 탐험 증가
+        def _log_adjustment(name: str, before: Any, after: Any):
+            logger.info(f"🔧 {name} 조정: {before} → {after} (재시도: {attempt_no}회)")
+        
+        # 🔥 거래 부족/과적합 대응: 학습률은 재시도가 높을수록 줄여 안정화
         if suggestions.get('adjust_learning_rate'):
-            # 재시도 횟수에 따라 학습률 조정 (더 많은 재시도 = 더 작은 학습률)
             base_lr = train_config.get('lr', 0.0003)
-            if previous_attempts == 1:
-                # 첫 재시도: 학습률 약간 증가 (탐험 증가)
-                adjusted_lr = base_lr * 1.5  # 0.0003 → 0.00045
-            elif previous_attempts == 2:
-                # 두 번째 재시도: 학습률 더 증가
-                adjusted_lr = base_lr * 2.0  # 0.0003 → 0.0006
-            else:
-                # 세 번째 이상: 학습률 감소 (안정성 우선)
-                adjusted_lr = base_lr * 0.5  # 0.0003 → 0.00015
-            
-            train_config['lr'] = adjusted_lr
-            logger.info(f"🔧 학습률 조정: {base_lr:.6f} → {adjusted_lr:.6f} (재시도: {previous_attempts}회)")
+            decay_schedule = [0.8, 0.6, 0.4, 0.3]
+            factor = decay_schedule[min(attempt_no - 1, len(decay_schedule) - 1)]
+            adjusted_lr = max(5e-5, base_lr * factor)
+            if abs(adjusted_lr - base_lr) > 1e-10:
+                train_config['lr'] = adjusted_lr
+                _log_adjustment("학습률", f"{base_lr:.6f}", f"{adjusted_lr:.6f}")
+                updated = True
+        
+        # 🔥 탐험 증가: entropy_coef 확대 (단, 과도하게 커지지 않도록 제한)
+        if suggestions.get('adjust_entropy_coef'):
+            base_entropy = train_config.get('entropy_coef', 0.05)
+            entropy_factor = 1.0 + min(0.25 * attempt_no, 1.0)  # 최대 2배
+            adjusted_entropy = min(1.0, base_entropy * entropy_factor)
+            train_config['entropy_coef'] = adjusted_entropy
+            _log_adjustment("entropy_coef", f"{base_entropy:.4f}", f"{adjusted_entropy:.4f}")
+            updated = True
         
         # 🔥 하이퍼파라미터 조정: 에포크 수 증가 (더 많은 학습)
         if suggestions.get('adjust_hyperparameters'):
             base_epochs = train_config.get('epochs', 30)
-            # 재시도 횟수에 따라 에포크 수 증가
-            adjusted_epochs = base_epochs + (previous_attempts * 10)  # 재시도마다 10 에포크 추가
+            extra_epochs = min(60, attempt_no * 15)
+            adjusted_epochs = base_epochs + extra_epochs
             train_config['epochs'] = adjusted_epochs
-            logger.info(f"🔧 에포크 수 조정: {base_epochs} → {adjusted_epochs} (재시도: {previous_attempts}회)")
+            _log_adjustment("에포크 수", base_epochs, adjusted_epochs)
+            updated = True
+        
+        # 🔥 데이터가 적을 때는 배치 크기를 줄여 안정성 확보
+        if suggestions.get('adjust_batch_size'):
+            base_batch = train_config.get('batch_size', 4096)
+            adjusted_batch = max(512, int(base_batch / 2))
+            train_config['batch_size'] = adjusted_batch
+            _log_adjustment("배치 크기", base_batch, adjusted_batch)
+            updated = True
+        
+        if not updated:
+            logger.info("ℹ️ 적용할 하이퍼파라미터 조정이 없어 원본 설정을 그대로 사용합니다.")
+            return config_path
         
         # 임시 설정 파일 저장
         import tempfile
@@ -134,6 +155,24 @@ def collect_selfplay_data_for_training(
         학습용 에피소드 데이터 리스트
     """
     try:
+        # 🔥 interval_profiles 정보 로드
+        interval_profile = {}
+        interval_role = None
+        interval_weight = 0.0
+        try:
+            from rl_pipeline.core.interval_profiles import (
+                get_interval_profile,
+                get_interval_role,
+                get_integration_weights
+            )
+            interval_profile = get_interval_profile(interval) or {}
+            interval_role = get_interval_role(interval)
+            integration_weights = get_integration_weights() or {}
+            interval_weight = integration_weights.get(interval, 0.0)
+            logger.debug(f"✅ {coin}-{interval}: interval_profiles 정보 로드 완료 (role={interval_role}, weight={interval_weight:.2f})")
+        except Exception as e:
+            logger.debug(f"⚠️ {coin}-{interval}: interval_profiles 로드 실패 (무시): {e}")
+        
         episodes_data = []
         
         # cycle_results에서 데이터 추출
@@ -201,23 +240,23 @@ def collect_selfplay_data_for_training(
         # 🔥 디버깅: 첫 번째 cycle 상세 확인
         if cycle_results:
             first_cycle = cycle_results[0]
-            logger.warning(f"  🔍 {coin}-{interval}: 첫 번째 cycle 디버깅:")
-            logger.warning(f"     episode: {first_cycle.get('episode', 'N/A')}")
-            logger.warning(f"     results 타입: {type(first_cycle.get('results', {}))}")
+            logger.debug(f"  🔍 {coin}-{interval}: 첫 번째 cycle 디버깅:")
+            logger.debug(f"     episode: {first_cycle.get('episode', 'N/A')}")
+            logger.debug(f"     results 타입: {type(first_cycle.get('results', {}))}")
             results_raw = first_cycle.get('results', {})
-            logger.warning(f"     results 값 자체: {results_raw}")
-            logger.warning(f"     results 키 개수: {len(results_raw) if isinstance(results_raw, dict) else 'N/A'}")
+            logger.debug(f"     results 값 자체: {results_raw}")
+            logger.debug(f"     results 키 개수: {len(results_raw) if isinstance(results_raw, dict) else 'N/A'}")
             if isinstance(results_raw, dict) and results_raw:
                 first_agent_id = list(results_raw.keys())[0]
                 first_agent_result = results_raw[first_agent_id]
-                logger.warning(f"     첫 번째 agent_id: {first_agent_id}")
-                logger.warning(f"     첫 번째 agent 결과 타입: {type(first_agent_result)}")
-                logger.warning(f"     첫 번째 agent 결과 keys: {list(first_agent_result.keys()) if isinstance(first_agent_result, dict) else 'N/A'}")
+                logger.debug(f"     첫 번째 agent_id: {first_agent_id}")
+                logger.debug(f"     첫 번째 agent 결과 타입: {type(first_agent_result)}")
+                logger.debug(f"     첫 번째 agent 결과 keys: {list(first_agent_result.keys()) if isinstance(first_agent_result, dict) else 'N/A'}")
                 if isinstance(first_agent_result, dict):
-                    logger.warning(f"     total_pnl: {first_agent_result.get('total_pnl', 'N/A')}")
-                    logger.warning(f"     win_rate: {first_agent_result.get('win_rate', 'N/A')}")
-                    logger.warning(f"     trades 타입: {type(first_agent_result.get('trades', []))}")
-                    logger.warning(f"     trades 개수: {len(first_agent_result.get('trades', []))}")
+                    logger.debug(f"     total_pnl: {first_agent_result.get('total_pnl', 'N/A')}")
+                    logger.debug(f"     win_rate: {first_agent_result.get('win_rate', 'N/A')}")
+                    logger.debug(f"     trades 타입: {type(first_agent_result.get('trades', []))}")
+                    logger.debug(f"     trades 개수: {len(first_agent_result.get('trades', []))}")
             elif not results_raw:
                 logger.warning(f"     ⚠️ results가 비어있거나 None입니다!")
         
@@ -322,7 +361,12 @@ def collect_selfplay_data_for_training(
                         'buy': buy_strategies,
                         'sell': sell_strategies,
                         'neutral': neutral_strategies
-                    }
+                    },
+                    # 🔥 interval_profiles 정보 추가
+                    'interval_role': interval_role,
+                    'interval_weight': interval_weight,
+                    'interval_objectives': interval_profile.get('objectives', {}),
+                    'interval_label_type': interval_profile.get('labeling', {}).get('label_type', 'unknown')
                 }
                 episodes_data.append(episode_data)
                 
@@ -434,13 +478,36 @@ def auto_train_from_selfplay(
                     'hidden_dim': 128
                 },
                 'paths': {
-                    'checkpoints': '/workspace/rl_pipeline/artifacts/checkpoints',
-                    'db': '/workspace/data_storage/rl_strategies.db'
+                    'checkpoints': os.getenv('CHECKPOINTS_PATH', '/workspace/rl_pipeline/artifacts/checkpoints'),
+                    'db': os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
                 }
             }
         else:
             with open(config_path, 'r') as f:
                 config = json.load(f)
+        
+        # 🔥 DB 경로 보정 (설정 파일에 잘못된 경로가 있거나 없을 경우)
+        db_path_config = config.get('paths', {}).get('db')
+        env_db_path = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
+        
+        # 1. 경로가 없거나
+        # 2. 'rl_strategies.db'가 포함된 구형 경로이거나
+        # 3. 환경변수가 있고 설정파일 경로와 다르면 (환경변수 우선)
+        should_replace_db = False
+        if not db_path_config:
+            should_replace_db = True
+        elif 'rl_strategies.db' in db_path_config:
+            should_replace_db = True
+            logger.warning(f"⚠️ 설정 파일의 구형 DB 경로 감지: {db_path_config}")
+        elif env_db_path and env_db_path != db_path_config:
+            # 환경변수가 명시적으로 설정되어 있으면 우선 사용 (엔진화)
+            should_replace_db = True
+            
+        if should_replace_db and env_db_path:
+            if 'paths' not in config:
+                config['paths'] = {}
+            config['paths']['db'] = env_db_path
+            logger.info(f"🔧 DB 경로를 환경변수로 설정: {env_db_path}")
         
         # Trainer 초기화 및 학습
         logger.info(f"🚀 {coin}-{interval}: 신경망 학습 시작 ({len(episodes_data)}개 에피소드)")
@@ -689,33 +756,40 @@ def auto_train_from_integrated_analysis(
             # DB에서 최신 통합 분석 결과 조회 시도
             logger.debug(f"ℹ️ 분석 결과: PipelineResult 객체 감지 (타입: {type(analysis_result).__name__}), DB에서 최신 분석 결과 조회 시도")
             try:
-                from rl_pipeline.db.reads import fetch_integrated_analysis
-                from rl_pipeline.db.connection_pool import get_strategy_db_pool
+                from rl_pipeline.db.learning_results import load_integrated_analysis_results
                 
-                pool = get_strategy_db_pool()
-                with pool.get_connection() as conn:
-                    # 최신 통합 분석 결과 조회
-                    latest_analysis = fetch_integrated_analysis(conn, coin, 'all_intervals')
-                    if latest_analysis and isinstance(latest_analysis, dict):
-                        # fetch_integrated_analysis 반환 형식: multi_tf_score (multi_timeframe_score 아님)
-                        analysis_data = {
-                            'fractal_score': latest_analysis.get('fractal_score', 0.5),
-                            'multi_timeframe_score': latest_analysis.get('multi_tf_score', latest_analysis.get('multi_timeframe_score', 0.5)),
-                            'indicator_cross_score': latest_analysis.get('indicator_cross_score', 0.5),
-                            'ensemble_score': latest_analysis.get('score', latest_analysis.get('ensemble_score', 0.5)),
-                            'ensemble_confidence': latest_analysis.get('confidence', latest_analysis.get('signal_confidence', 0.5))
-                        }
-                        logger.info(f"✅ 분석 결과: DB에서 최신 통합 분석 결과 조회 성공 (프랙탈={analysis_data['fractal_score']:.3f}, 멀티TF={analysis_data['multi_timeframe_score']:.3f}, 앙상블={analysis_data['ensemble_score']:.3f})")
-                    else:
-                        # DB 조회 실패 시 기본값 사용
-                        analysis_data = {
-                            'fractal_score': 0.5,
-                            'multi_timeframe_score': 0.5,
-                            'indicator_cross_score': 0.5,
-                            'ensemble_score': 0.5,
-                            'ensemble_confidence': 0.5
-                        }
-                        logger.warning(f"⚠️ 분석 결과: PipelineResult 객체이지만 DB에서 분석 점수를 찾을 수 없음 (coin={coin}, interval=all_intervals), 기본값 사용")
+                latest_analysis = load_integrated_analysis_results(coin, 'all_intervals')
+                
+                # 인터벌별 분석이 있을 수도 있으므로 파이프라인 결과의 interval 사용
+                if not latest_analysis:
+                    inferred_interval = getattr(analysis_result, 'interval', None)
+                    if inferred_interval:
+                        # 🔥 스키마 변경: coin -> symbol
+                        latest_analysis = load_integrated_analysis_results(coin, inferred_interval)
+                
+                # 여전히 없으면 기본 인터벌(15m)로 시도
+                if not latest_analysis:
+                    latest_analysis = load_integrated_analysis_results(coin, '15m')
+
+                if latest_analysis and isinstance(latest_analysis, dict):
+                    analysis_data = {
+                        'fractal_score': latest_analysis.get('fractal_score', 0.5),
+                        'multi_timeframe_score': latest_analysis.get('multi_timeframe_score', 0.5),
+                        'indicator_cross_score': latest_analysis.get('indicator_cross_score', 0.5),
+                        'ensemble_score': latest_analysis.get('ensemble_score', latest_analysis.get('final_signal_score', 0.5)),
+                        'ensemble_confidence': latest_analysis.get('ensemble_confidence', latest_analysis.get('signal_confidence', 0.5))
+                    }
+                    logger.info(f"✅ 분석 결과: learning_results DB에서 최신 통합 분석 결과 조회 성공 (프랙탈={analysis_data['fractal_score']:.3f}, 멀티TF={analysis_data['multi_timeframe_score']:.3f}, 앙상블={analysis_data['ensemble_score']:.3f})")
+                else:
+                    analysis_data = {
+                        'fractal_score': 0.5,
+                        'multi_timeframe_score': 0.5,
+                        'indicator_cross_score': 0.5,
+                        'ensemble_score': 0.5,
+                        'ensemble_confidence': 0.5
+                    }
+                    # 🔥 symbol 조회 실패 시 로그만 남기고 기본값 사용 (첫 실행 시 정상)
+                    logger.warning(f"⚠️ 분석 결과: PipelineResult 객체이지만 learning_results DB에서 분석 점수를 찾을 수 없음 (coin={coin}), 기본값 사용")
             except Exception as db_err:
                 # DB 조회 실패 시 기본값 사용
                 analysis_data = {
@@ -725,7 +799,7 @@ def auto_train_from_integrated_analysis(
                     'ensemble_score': 0.5,
                     'ensemble_confidence': 0.5
                 }
-                logger.warning(f"⚠️ 분석 결과: PipelineResult 객체이지만 DB 조회 실패 ({type(db_err).__name__}: {str(db_err)[:100]}), 기본값 사용")
+                logger.warning(f"⚠️ 분석 결과: PipelineResult 객체이지만 통합 분석 DB 조회 실패 ({type(db_err).__name__}: {str(db_err)[:100]}), 기본값 사용")
         else:
             # 알 수 없는 형식
             result_type = type(analysis_result).__name__
@@ -748,10 +822,33 @@ def auto_train_from_integrated_analysis(
         all_episodes_data = []
         total_episodes = 0
         
+        # 🔥 interval_profiles 정보 로드 (전체 인터벌)
+        try:
+            from rl_pipeline.core.interval_profiles import (
+                get_interval_profile,
+                get_interval_role,
+                get_integration_weights
+            )
+            INTERVAL_PROFILES_AVAILABLE = True
+        except ImportError:
+            INTERVAL_PROFILES_AVAILABLE = False
+            logger.debug("⚠️ interval_profiles 모듈 없음 (학습 데이터에 인터벌 정보 미포함)")
+        
         for interval, selfplay_result in all_interval_selfplay.items():
             if not selfplay_result:
                 logger.debug(f"  ⚠️ {coin}-{interval}: selfplay_result가 비어있음, 스킵")
                 continue
+            
+            # 🔥 interval_profiles 정보 로드 및 로깅
+            if INTERVAL_PROFILES_AVAILABLE:
+                try:
+                    interval_profile = get_interval_profile(interval) or {}
+                    interval_role = get_interval_role(interval)
+                    integration_weights = get_integration_weights() or {}
+                    interval_weight = integration_weights.get(interval, 0.0)
+                    logger.info(f"  🎯 {coin}-{interval}: {interval_role} (가중치: {interval_weight:.2f})")
+                except Exception as e:
+                    logger.debug(f"  ⚠️ {coin}-{interval}: interval_profiles 로드 실패: {e}")
             
             # 🔥 디버깅: selfplay_result 구조 확인
             logger.info(f"  📊 {coin}-{interval}: selfplay_result 타입={type(selfplay_result)}, keys={list(selfplay_result.keys()) if isinstance(selfplay_result, dict) else 'N/A'}")
@@ -837,14 +934,25 @@ def auto_train_from_integrated_analysis(
             from rl_pipeline.db.connection_pool import get_optimized_db_connection
             min_training_interval_hours = int(os.getenv('MIN_TRAINING_INTERVAL_HOURS', '6'))  # 기본 6시간
             
-            with get_optimized_db_connection("strategies") as conn:
+            from rl_pipeline.core.env import config
+            # 🔥 코인별 DB 경로 사용
+            db_path = config.get_strategy_db_path(coin)
+            
+            with get_optimized_db_connection(db_path) as conn:
                 cursor = conn.cursor()
-                # 최근 학습 기록 조회
+                # 최근 학습 기록 조회 (policy_models 테이블 사용)
+                # hybrid_models 테이블은 존재하지 않으므로 policy_models로 대체
                 cursor.execute("""
                     SELECT MAX(created_at) as last_training
-                    FROM hybrid_models
-                    WHERE coin = ? AND status = 'completed'
-                """, (coin,))
+                    FROM policy_models
+                    WHERE market_type = 'COIN' 
+                    -- AND notes LIKE ?  -- 필요한 경우 코인 정보 필터링 (notes 컬럼 활용 등)
+                """)
+                
+                # 코인별 필터링이 어렵다면 전체 학습 빈도로 제한하거나, 
+                # policy_models에 코인 정보가 없다면 이 체크를 스킵하는 것이 안전함.
+                # 현재 스키마상 policy_models에는 coin/symbol 컬럼이 명시적으로 없음 (market_type만 존재)
+                # 따라서 여기서는 빈도 체크를 일단 패스하거나, 가장 최근 모델 생성 시간만 확인
                 
                 result = cursor.fetchone()
                 if result and result[0]:
@@ -857,12 +965,17 @@ def auto_train_from_integrated_analysis(
                     
                     time_since_last = datetime.now() - (last_training.replace(tzinfo=None) if last_training.tzinfo else last_training)
                     
-                    if time_since_last.total_seconds() < min_training_interval_hours * 3600:
+                    # 🔥 강제 재학습 환경변수 체크 (FORCE_RETRAIN=true)
+                    force_retrain = os.getenv('FORCE_RETRAIN', 'false').lower() == 'true'
+                    
+                    if not force_retrain and time_since_last.total_seconds() < min_training_interval_hours * 3600:
                         hours_remaining = (min_training_interval_hours * 3600 - time_since_last.total_seconds()) / 3600
                         logger.info(f"📊 {coin}: 최근 학습 후 {time_since_last.total_seconds()/3600:.1f}시간 경과, "
                                   f"최소 간격({min_training_interval_hours}시간) 미달로 학습 건너뜀 "
                                   f"(남은 시간: {hours_remaining:.1f}시간)")
                         return None
+                    elif force_retrain:
+                        logger.info(f"🔄 {coin}: 강제 재학습 활성화 (FORCE_RETRAIN=true), 최소 간격 무시")
         except Exception as e:
             logger.debug(f"⚠️ 학습 빈도 체크 실패 (무시하고 계속): {e}")
         
@@ -885,8 +998,8 @@ def auto_train_from_integrated_analysis(
                     'hidden_dim': 128
                 },
                 'paths': {
-                    'checkpoints': '/workspace/rl_pipeline/artifacts/checkpoints',
-                    'db': '/workspace/data_storage/rl_strategies.db'
+                    'checkpoints': os.getenv('CHECKPOINTS_PATH', '/workspace/rl_pipeline/artifacts/checkpoints'),
+                    'db': os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')  # 하드코딩 삭제
                 }
             }
         else:
@@ -1036,7 +1149,16 @@ def auto_train_from_integrated_analysis(
                                                 
                                                 # 🔥 재학습 시 하이퍼파라미터 조정 적용
                                                 adjusted_config_path = None
-                                                if suggestions.get('adjust_learning_rate') or suggestions.get('adjust_entropy_coef'):
+                                                needs_adjustment = any(
+                                                    suggestions.get(flag)
+                                                    for flag in [
+                                                        'adjust_learning_rate',
+                                                        'adjust_entropy_coef',
+                                                        'adjust_hyperparameters',
+                                                        'adjust_batch_size'
+                                                    ]
+                                                )
+                                                if needs_adjustment:
                                                     # 하이퍼파라미터 조정이 필요한 경우 임시 설정 파일 생성
                                                     adjusted_config_path = _create_adjusted_config(
                                                         config_path=config_path,
@@ -1256,8 +1378,8 @@ def auto_train_from_global_strategies(
                     'hidden_dim': 128
                 },
                 'paths': {
-                    'checkpoints': '/workspace/rl_pipeline/artifacts/checkpoints',
-                    'db': '/workspace/data_storage/rl_strategies.db'
+                    'checkpoints': os.getenv('CHECKPOINTS_PATH', '/workspace/rl_pipeline/artifacts/checkpoints'),
+                    'db': os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
                 }
             }
         else:
@@ -1267,6 +1389,25 @@ def auto_train_from_global_strategies(
             if 'train' in config:
                 config['train']['epochs'] = config['train'].get('epochs', 30) * 2  # 글로벌은 2배
                 config['train']['batch_size'] = config['train'].get('batch_size', 2048) * 2  # 2배
+        
+        # 🔥 DB 경로 보정 (설정 파일에 잘못된 경로가 있거나 없을 경우)
+        db_path_config = config.get('paths', {}).get('db')
+        env_db_path = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
+        
+        should_replace_db = False
+        if not db_path_config:
+            should_replace_db = True
+        elif 'rl_strategies.db' in db_path_config:
+            should_replace_db = True
+            logger.warning(f"⚠️ 글로벌 학습 설정의 구형 DB 경로 감지: {db_path_config}")
+        elif env_db_path and env_db_path != db_path_config:
+            should_replace_db = True
+            
+        if should_replace_db and env_db_path:
+            if 'paths' not in config:
+                config['paths'] = {}
+            config['paths']['db'] = env_db_path
+            logger.info(f"🔧 글로벌 학습 DB 경로를 환경변수로 설정: {env_db_path}")
         
         # Trainer 초기화 및 학습
         logger.info(f"🌍 글로벌 신경망 학습 시작 ({total_episodes}개 에피소드, {coins_processed}개 코인, 글로벌 분석 데이터 포함)")
@@ -1450,7 +1591,25 @@ def auto_evaluate_model(
             else:
                 config = {}
         
-        db_path = config.get('paths', {}).get('db', '/workspace/data_storage/rl_strategies.db')
+        # 🔥 DB 경로 결정 (강제 보정 및 환경변수 우선)
+        db_path_config = config.get('paths', {}).get('db')
+        env_db_path = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
+        
+        db_path = db_path_config
+        
+        # 1. 경로가 없거나
+        # 2. 구형 경로('rl_strategies.db')를 포함하거나
+        # 3. 환경변수가 있으면 우선 사용 (엔진화)
+        if not db_path or (db_path and 'rl_strategies.db' in db_path):
+            db_path = env_db_path
+            if db_path_config and 'rl_strategies.db' in db_path_config:
+                logger.warning(f"⚠️ 평가 설정의 구형 DB 경로 무시: {db_path_config} -> {db_path}")
+        elif env_db_path and env_db_path != db_path:
+             db_path = env_db_path
+             logger.info(f"🔧 평가 DB 경로를 환경변수로 대체: {env_db_path}")
+            
+        if not db_path:
+             raise ValueError("❌ DB 경로가 설정되지 않았습니다. STRATEGY_DB_PATH 환경변수를 설정하세요.")
         
         # A/B 평가 실행
         result = evaluate_ab(

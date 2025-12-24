@@ -233,12 +233,12 @@ def extract_routing_patterns_from_analysis(dna_analysis: Dict[str, Any], fractal
 
 
 
-def _analyze_global_params_from_strategies(all_coin_strategies) -> Dict[str, Any]:
+def _analyze_global_params_from_strategies(all_strategies) -> Dict[str, Any]:
 
     """self-play 결과에서 전역 파라미터 분석 - 양수 수익/상위 전략만 사용
     
     Args:
-        all_coin_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
+        all_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
     """
 
     try:
@@ -252,7 +252,7 @@ def _analyze_global_params_from_strategies(all_coin_strategies) -> Dict[str, Any
         
 
         # 🔥 두 가지 형태 지원: {coin: [strategies]} 또는 {coin: {interval: [strategies]}}
-        for coin, coin_data in all_coin_strategies.items():
+        for coin, coin_data in all_strategies.items():
             if isinstance(coin_data, list):
                 # {coin: [strategies]} 형태
                 strategies = coin_data
@@ -331,7 +331,7 @@ def _analyze_global_params_from_strategies(all_coin_strategies) -> Dict[str, Any
             all_strategies = []
 
             # 🔥 두 가지 형태 지원: {coin: [strategies]} 또는 {coin: {interval: [strategies]}}
-            for coin, coin_data in all_coin_strategies.items():
+            for coin, coin_data in all_strategies.items():
                 if isinstance(coin_data, list):
                     # {coin: [strategies]} 형태
                     strategies = coin_data
@@ -429,12 +429,12 @@ def _analyze_global_params_from_strategies(all_coin_strategies) -> Dict[str, Any
 
 
 
-def _analyze_common_strategy_patterns(all_coin_strategies: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+def _analyze_common_strategy_patterns(all_strategies: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
 
     """공통 전략 패턴 분석
     
     Args:
-        all_coin_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
+        all_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
     """
 
     try:
@@ -442,7 +442,7 @@ def _analyze_common_strategy_patterns(all_coin_strategies: Dict[str, List[Dict[s
         all_params = []
 
         # 🔥 두 가지 형태 지원: {coin: [strategies]} 또는 {coin: {interval: [strategies]}}
-        for coin, coin_data in all_coin_strategies.items():
+        for coin, coin_data in all_strategies.items():
             if isinstance(coin_data, list):
                 # {coin: [strategies]} 형태
                 strategies = coin_data
@@ -1065,7 +1065,7 @@ def _analyze_global_regime(all_coin_data: Dict[str, Dict[str, pd.DataFrame]]) ->
 
 
 
-def _analyze_strategy_quality_distribution(all_coin_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> Dict[str, Any]:
+def _analyze_strategy_quality_distribution(all_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> Dict[str, Any]:
 
     """전략 품질 분포 분석 (메타 분석)"""
 
@@ -1077,7 +1077,7 @@ def _analyze_strategy_quality_distribution(all_coin_strategies: Dict[str, Dict[s
 
         
 
-        for coin, intervals_data in all_coin_strategies.items():
+        for coin, intervals_data in all_strategies.items():
 
             for interval, strategies in intervals_data.items():
 
@@ -1121,12 +1121,12 @@ def _analyze_strategy_quality_distribution(all_coin_strategies: Dict[str, Dict[s
 
 
 
-def _analyze_regime_based_optimal_params(all_coin_strategies) -> Dict[str, Any]:
+def _analyze_regime_based_optimal_params(all_strategies) -> Dict[str, Any]:
 
     """레짐별 최적 파라미터 분석
     
     Args:
-        all_coin_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
+        all_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
     """
 
     try:
@@ -1134,7 +1134,7 @@ def _analyze_regime_based_optimal_params(all_coin_strategies) -> Dict[str, Any]:
         regime_performance = {}
 
         # 🔥 두 가지 형태 지원: {coin: [strategies]} 또는 {coin: {interval: [strategies]}}
-        for coin, coin_data in all_coin_strategies.items():
+        for coin, coin_data in all_strategies.items():
             if isinstance(coin_data, list):
                 # {coin: [strategies]} 형태
                 strategies = coin_data
@@ -1252,12 +1252,12 @@ def _analyze_regime_based_optimal_params(all_coin_strategies) -> Dict[str, Any]:
 
 
 
-def _analyze_parameter_performance_correlation(all_coin_strategies) -> Dict[str, Any]:
+def _analyze_parameter_performance_correlation(all_strategies) -> Dict[str, Any]:
 
     """파라미터-성과 상관관계 분석
     
     Args:
-        all_coin_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
+        all_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
     """
 
     try:
@@ -1275,7 +1275,7 @@ def _analyze_parameter_performance_correlation(all_coin_strategies) -> Dict[str,
         }
 
         # 🔥 두 가지 형태 지원: {coin: [strategies]} 또는 {coin: {interval: [strategies]}}
-        for coin, coin_data in all_coin_strategies.items():
+        for coin, coin_data in all_strategies.items():
             if isinstance(coin_data, list):
                 # {coin: [strategies]} 형태
                 strategies = coin_data
@@ -1369,12 +1369,12 @@ def _analyze_parameter_performance_correlation(all_coin_strategies) -> Dict[str,
 
 
 
-def _analyze_coin_group_performance_difference(all_coin_strategies) -> Dict[str, Any]:
+def _analyze_coin_group_performance_difference(all_strategies) -> Dict[str, Any]:
 
     """코인 그룹별 성과 차이 분석
     
     Args:
-        all_coin_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
+        all_strategies: {coin: [strategies]} 또는 {coin: {interval: [strategies]}} 형태
     """
 
     try:
@@ -1390,7 +1390,7 @@ def _analyze_coin_group_performance_difference(all_coin_strategies) -> Dict[str,
         mid_performances = []
 
         # 🔥 두 가지 형태 지원: {coin: [strategies]} 또는 {coin: {interval: [strategies]}}
-        for coin, coin_data in all_coin_strategies.items():
+        for coin, coin_data in all_strategies.items():
             coin_profits = []
             
             if isinstance(coin_data, list):
@@ -1441,7 +1441,7 @@ def _analyze_coin_group_performance_difference(all_coin_strategies) -> Dict[str,
         return {}
 
 
-def _categorize_coins_by_importance(all_coin_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> Dict[str, List[str]]:
+def _categorize_coins_by_importance(all_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> Dict[str, List[str]]:
     """코인을 중요도별로 그룹화 (메이저/중형)"""
     try:
         major_coins = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'SOL', 'DOGE', 'DOT', 'TRX', 'AVAX', 
@@ -1452,7 +1452,7 @@ def _categorize_coins_by_importance(all_coin_strategies: Dict[str, Dict[str, Lis
             'mid': []
         }
         
-        for coin in all_coin_strategies.keys():
+        for coin in all_strategies.keys():
             if coin in major_coins:
                 coin_groups['major'].append(coin)
             else:
@@ -1466,6 +1466,6 @@ def _categorize_coins_by_importance(all_coin_strategies: Dict[str, Dict[str, Lis
         logger.error(f"❌ 코인 그룹화 실패: {e}")
         # 폴백: 모든 코인을 메이저로 처리
         return {
-            'major': list(all_coin_strategies.keys()),
+            'major': list(all_strategies.keys()),
             'mid': []
         }

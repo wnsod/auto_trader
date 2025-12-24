@@ -75,18 +75,11 @@ class Config:
         self._validate()
     
     def _load_from_env(self):
-        """환경변수에서 설정 로드"""
-        # 데이터베이스 경로
-        self.RL_DB = os.getenv('CANDLES_DB_PATH', '/workspace/data_storage/rl_candles.db')
-        self.STRATEGIES_DB = os.getenv('STRATEGIES_DB_PATH', '/workspace/data_storage/rl_strategies.db')
-        # learning_results.db는 이제 rl_strategies.db로 통합됨
-        self.LEARNING_RESULTS_DB_PATH = self.STRATEGIES_DB
-        
+        """환경변수에서 설정 로드 (초기화 시 1회 실행)"""
         # 워크스페이스 경로
         self.WORKSPACE_ROOT = os.getenv('WORKSPACE_ROOT', '/workspace')
         self.AUTO_TRADER_ROOT = os.getenv('AUTO_TRADER_ROOT', '/workspace')
         self.RL_PIPELINE_ROOT = os.getenv('RL_PIPELINE_ROOT', '/workspace/rl_pipeline')
-        self.DATA_STORAGE_PATH = os.getenv('DATA_STORAGE_PATH', '/workspace/data_storage')
         
         # 성능 설정
         self.MAX_WORKERS = min(os.cpu_count() or 4, int(os.getenv('MAX_WORKERS', '16')))
@@ -123,6 +116,105 @@ class Config:
         # 하이브리드 설정
         self.ENABLE_HYBRID = os.getenv('USE_HYBRID', 'false').lower() == 'true'
         self.ENABLE_AUTO_TRAINING = os.getenv('ENABLE_AUTO_TRAINING', 'false').lower() == 'true'
+
+    # 🔥 동적 속성: 환경변수 변경을 실시간 반영 (엔진화 필수)
+    @property
+    def DATA_STORAGE_PATH(self):
+        """데이터 저장소 경로 (동적)"""
+        # 1. 환경변수 우선
+        _env_storage = os.getenv('DATA_STORAGE_PATH')
+        if _env_storage:
+            return _env_storage
+            
+        # 2. 전략 DB 경로 기반 추론
+        _strat_db = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
+        if _strat_db:
+            return os.path.dirname(_strat_db)
+            
+        # 3. 폴백: market/coin_market/data_storage 우선 확인 (프로젝트 구조 인식)
+        # 현재 위치에서 상대 경로로 market/coin_market 찾기 시도
+        current_dir = os.getcwd()
+        
+        # case A: 루트에서 실행 시
+        potential_path = os.path.join(current_dir, 'market', 'coin_market', 'data_storage')
+        if os.path.exists(os.path.dirname(potential_path)): # coin_market 폴더가 있으면
+            return potential_path
+            
+        # case B: market/coin_market 내부에서 실행 시 (이미 처리되겠지만)
+        if 'coin_market' in current_dir:
+            # 상위로 올라가서 data_storage 찾기 등 복잡한 로직보다는
+            # 보통 run_learning.py가 환경변수를 설정하므로 여기까지 올 일이 적음
+            pass
+
+        # 4. 최후의 수단 (현재 디렉토리)
+        return os.path.join(current_dir, 'data_storage')
+
+    @property
+    def RL_DB(self):
+        """RL 캔들 DB 경로 (동적)"""
+        return os.getenv('RL_DB_PATH', os.getenv('CANDLES_DB_PATH', os.path.join(self.DATA_STORAGE_PATH, 'rl_candles.db')))
+
+    @property
+    def STRATEGIES_DB(self):
+        """전략 DB 경로 (동적 - 파일 또는 디렉토리)"""
+        # 🔧 기본값을 디렉토리 모드로 변경 (learning_strategies 폴더)
+        path = os.getenv('STRATEGY_DB_PATH', os.getenv('STRATEGIES_DB_PATH', os.path.join(self.DATA_STORAGE_PATH, 'learning_strategies')))
+        
+        # 🔥 강제 보정: rl_strategies.db가 경로에 포함되어 있으면 learning_strategies로 교체 (레거시 호환성)
+        if 'rl_strategies.db' in path:
+            path = path.replace('rl_strategies.db', 'learning_strategies')
+            
+        return path
+
+    # 🔒 글로벌 전략용 예약어 (이 이름의 코인이 생기면 prefix 추가)
+    RESERVED_DB_NAMES = {'common', 'global', 'shared', 'system', '_global'}
+    
+    def get_strategy_db_path(self, coin: str = None) -> str:
+        """코인별 전략 DB 경로 반환 (Directory Mode 지원)
+        
+        Args:
+            coin: 코인 심볼 (예: 'BTC', 'ETH')
+            
+        Returns:
+            DB 파일 경로
+        """
+        base_path = self.STRATEGIES_DB
+        
+        # 1. 디렉토리 모드인지 확인 (확장자가 .db가 아니거나, 실제 디렉토리인 경우)
+        is_directory = not base_path.endswith('.db') or os.path.isdir(base_path)
+        
+        if is_directory:
+            if not coin:
+                # 코인이 지정되지 않았는데 디렉토리 모드인 경우, 기본/공용 파일 반환
+                return os.path.join(base_path, 'common_strategies.db')
+            
+            # 🔒 예약어 충돌 방지: common, global 등의 코인명은 prefix 추가
+            coin_lower = coin.lower()
+            if coin_lower in self.RESERVED_DB_NAMES:
+                # 예: common → coin_common_strategies.db (글로벌용 common_strategies.db와 구분)
+                return os.path.join(base_path, f"coin_{coin_lower}_strategies.db")
+            
+            # 코인별 파일명 생성 (소문자 변환)
+            return os.path.join(base_path, f"{coin_lower}_strategies.db")
+        
+        # 2. 단일 파일 모드 (기존 호환성)
+        return base_path
+
+    @property
+    def LEARNING_RESULTS_DB_PATH(self):
+        """학습 결과 DB 경로 (동적) - 전략 DB와 통합됨"""
+        base_path = self.STRATEGIES_DB
+        
+        # 디렉토리 모드인 경우, 공용 파일(common_strategies.db)을 반환
+        # 학습 결과, 파이프라인 로그 등은 코인에 종속되지 않는 경우가 많거나,
+        # 중앙에서 관리하는 것이 편하므로 공용 DB에 저장
+        is_directory = not base_path.endswith('.db') or os.path.isdir(base_path)
+        if is_directory:
+            # common_strategies.db가 없으면 생성하도록 유도할 수 있지만,
+            # 여기서는 경로만 반환
+            return os.path.join(base_path, 'common_strategies.db')
+            
+        return base_path
     
     def _apply_profile_config(self, profile_config: Dict[str, Any]):
         """프로파일 설정 적용"""
@@ -197,10 +289,12 @@ class Config:
 # 전역 설정 인스턴스 (레거시 호환성 - 기본 동작)
 config = Config(profile='auto', auto_detect=True)
 
-# 레거시 호환성을 위한 별칭
+# 레거시 호환성을 위한 별칭 (이제는 동적 프로퍼티 접근)
+# 주의: 모듈 레벨 변수는 import 시점에 고정되므로, 가능한 config.속성 으로 접근하는 것이 좋습니다.
 WORKSPACE_ROOT = config.WORKSPACE_ROOT
 AUTO_TRADER_ROOT = config.AUTO_TRADER_ROOT
 RL_PIPELINE_ROOT = config.RL_PIPELINE_ROOT
+# 아래 변수들은 이제 프로퍼티이므로 값 복사가 됨. 동적 반영을 위해선 config 객체 사용 권장
 DATA_STORAGE_PATH = config.DATA_STORAGE_PATH
 CANDLES_DB_PATH = config.RL_DB
 STRATEGIES_DB_PATH = config.STRATEGIES_DB

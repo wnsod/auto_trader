@@ -158,7 +158,7 @@ class StrategyAgent:
             
             # 6. 현재 포지션 확인 및 행동 결정
             if self.state.position is None:
-                # 🔥 7개 진입 조건 필터 추가
+                # 🔥 8개 진입 조건 필터 추가 (저점/고점 필터링 포함)
                 entry_filters_passed = []
 
                 # Filter 1: Trend Strength (추세 강도) - ADX > 20
@@ -212,6 +212,7 @@ class StrategyAgent:
                 required_buy_conditions = max(2, int(len(buy_conditions) * 0.2))
 
                 # 🔥 진입 조건 완화: 4개 이상 필터 통과 + 기존 조건 만족 시 매수
+                # 🆕 참고: 저점/고점 필터링은 전략 생성 시 이미 파라미터에 반영됨 (rsi_min, rsi_max 조정)
                 if buy_score >= required_buy_conditions and regime_confidence > 0.2 and enough_filters_passed:
                     # 거래 추적 정보 업데이트
                     self.last_trade_time = market_state.timestamp
@@ -394,6 +395,13 @@ class StrategyAgent:
             else:
                 sharpe_ratio = 0.0
             
+            # 🔥 MFE/MAE 평균 계산 (존재하는 경우만)
+            mfe_values = [t.get('mfe_pct', 0.0) for t in trades if 'mfe_pct' in t]
+            mae_values = [t.get('mae_pct', 0.0) for t in trades if 'mae_pct' in t]
+            
+            avg_mfe = np.mean(mfe_values) if mfe_values else 0.0
+            avg_mae = np.mean(mae_values) if mae_values else 0.0
+            
             return {
                 "total_trades": total_trades,
                 "win_rate": win_rate,
@@ -401,6 +409,8 @@ class StrategyAgent:
                 "avg_pnl_per_trade": avg_pnl_per_trade,
                 "max_drawdown": max_drawdown,
                 "sharpe_ratio": sharpe_ratio,
+                "avg_mfe": avg_mfe,
+                "avg_mae": avg_mae,
                 "final_balance": self.state.balance,
                 "current_value": equity_curve[-1] if equity_curve else 10000.0
             }

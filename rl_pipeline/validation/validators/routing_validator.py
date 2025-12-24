@@ -96,7 +96,12 @@ class RoutingValidator(BaseValidator):
     def _validate_regime_detection(self, data: Dict[str, Any], result: ValidationResult, context: ValidationContext):
         """레짐 판단 검증"""
         regime = data.get('regime', '').lower()
-        valid_regimes = ['bullish', 'bearish', 'neutral', 'volatile', 'trending', 'ranging']
+        # 🔥 7개 레짐 체계로 업데이트
+        valid_regimes = [
+            'extreme_bearish', 'bearish', 'sideways_bearish',
+            'neutral',
+            'sideways_bullish', 'bullish', 'extreme_bullish'
+        ]
 
         if regime not in valid_regimes:
             result.add_issue(ValidationIssue(
@@ -380,7 +385,7 @@ class RoutingValidator(BaseValidator):
                 """
                 SELECT routing_count, performance_score
                 FROM regime_routing_results
-                WHERE coin = ? AND interval = ? AND regime = ?
+                WHERE symbol = ? AND interval = ? AND regime = ?
                 AND created_at > datetime('now', '-14 days')
                 ORDER BY created_at DESC
                 LIMIT 10

@@ -41,39 +41,57 @@ def save_training_history(
         성공 여부
     """
     try:
+        import time
+        import random
         from rl_pipeline.db.connection_pool import get_strategy_db_pool
 
-        pool = get_strategy_db_pool()
-        with pool.get_connection() as conn:
-            cursor = conn.cursor()
+        # 최대 재시도 횟수 설정
+        max_retries = 5
+        
+        for attempt in range(max_retries):
+            try:
+                pool = get_strategy_db_pool()
+                with pool.get_connection() as conn:
+                    cursor = conn.cursor()
 
-            # 기존 이력이 있으면 업데이트, 없으면 삽입
-            cursor.execute("""
-                INSERT OR REPLACE INTO strategy_training_history (
-                    strategy_id,
-                    trained_at,
-                    training_episodes,
-                    avg_accuracy,
-                    parent_strategy_id,
-                    similarity_score,
-                    training_source,
-                    policy_data,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (
-                strategy_id,
-                datetime.now().isoformat(),
-                training_episodes,
-                avg_accuracy,
-                parent_strategy_id,
-                similarity_score,
-                training_source,
-                json.dumps(policy_data) if policy_data else None
-            ))
+                    # 기존 이력이 있으면 업데이트, 없으면 삽입
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO strategy_training_history (
+                            strategy_id,
+                            trained_at,
+                            training_episodes,
+                            avg_accuracy,
+                            parent_strategy_id,
+                            similarity_score,
+                            training_source,
+                            policy_data,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (
+                        strategy_id,
+                        datetime.now().isoformat(),
+                        training_episodes,
+                        avg_accuracy,
+                        parent_strategy_id,
+                        similarity_score,
+                        training_source,
+                        json.dumps(policy_data) if policy_data else None
+                    ))
 
-            conn.commit()
-            logger.info(f"✅ 학습 이력 저장: {strategy_id} ({training_source}, {training_episodes}ep, acc={avg_accuracy:.3f})")
-            return True
+                    conn.commit()
+                    logger.info(f"✅ 학습 이력 저장: {strategy_id} ({training_source}, {training_episodes}ep, acc={avg_accuracy:.3f})")
+                    return True
+            
+            except Exception as e:
+                is_locked = "database is locked" in str(e) or "disk I/O error" in str(e) or "malformed" in str(e)
+                if is_locked and attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0.1, 1.0)
+                    logger.warning(f"⚠️ 학습 이력 저장 일시적 실패 ({attempt+1}/{max_retries}), {wait_time:.2f}초 후 재시도: {strategy_id} - {e}")
+                    time.sleep(wait_time)
+                else:
+                    if attempt == max_retries - 1:
+                        logger.error(f"❌ 학습 이력 저장 실패 (최종): {strategy_id} - {e}")
+                    raise e
 
     except Exception as e:
         logger.error(f"❌ 학습 이력 저장 실패: {strategy_id} - {e}")

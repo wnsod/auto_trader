@@ -24,7 +24,7 @@ from rl_pipeline.db.schema import (
     create_strategy_lineage_table,
     create_segment_scores_table,
     setup_database_tables,
-    create_coin_strategies_table
+    create_strategies_table
 )
 from rl_pipeline.db.connection_pool import get_strategy_db_pool
 
@@ -35,10 +35,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def test_coin_strategies_columns():
-    """coin_strategies 테이블에 온라인 진화 컬럼이 추가되었는지 확인"""
+def test_strategies_columns():
+    """strategies 테이블에 온라인 진화 컬럼이 추가되었는지 확인"""
     logger.info("=" * 60)
-    logger.info("테스트 1: coin_strategies 테이블 컬럼 확인")
+    logger.info("테스트 1: strategies 테이블 컬럼 확인")
     logger.info("=" * 60)
     
     try:
@@ -48,7 +48,7 @@ def test_coin_strategies_columns():
             cursor = conn.cursor()
             
             # 테이블 정보 조회
-            cursor.execute("PRAGMA table_info(coin_strategies)")
+            cursor.execute("PRAGMA table_info(strategies)")
             columns = cursor.fetchall()
             
             # 컬럼명 리스트 추출
@@ -66,7 +66,7 @@ def test_coin_strategies_columns():
                 'consistency_score'
             ]
             
-            logger.info(f"✅ coin_strategies 테이블 총 컬럼 수: {len(column_names)}")
+            logger.info(f"✅ strategies 테이블 총 컬럼 수: {len(column_names)}")
             
             missing_columns = []
             for col in required_columns:
@@ -219,14 +219,14 @@ def test_insert_sample_data():
         with pool.get_connection() as conn:
             cursor = conn.cursor()
             
-            # 1. coin_strategies에 테스트 전략 생성 (이미 있으면 스킵)
+            # 1. strategies에 테스트 전략 생성 (이미 있으면 스킵)
             cursor.execute("""
-                SELECT id FROM coin_strategies 
+                SELECT id FROM strategies 
                 WHERE id = 'test_strategy_001'
             """)
             if not cursor.fetchone():
                 cursor.execute("""
-                    INSERT INTO coin_strategies (
+                    INSERT INTO strategies (
                         id, coin, interval, parent_id, version,
                         online_pf, online_return, consistency_score
                     ) VALUES (
@@ -244,7 +244,7 @@ def test_insert_sample_data():
             if not cursor.fetchone():
                 # 자식 전략 생성
                 cursor.execute("""
-                    INSERT INTO coin_strategies (
+                    INSERT INTO strategies (
                         id, coin, interval, parent_id, version
                     ) VALUES (
                         'test_strategy_002', 'BTC', '15m', 'test_strategy_001', 2
@@ -309,8 +309,8 @@ def run_all_tests():
     # 먼저 기본 테이블 생성 (없을 경우)
     logger.info("\n🔄 기본 테이블 생성 중...")
     try:
-        # coin_strategies 테이블이 없으면 생성
-        create_coin_strategies_table()
+        # strategies 테이블이 없으면 생성
+        create_strategies_table()
         logger.info("✅ 기본 테이블 생성 완료")
     except Exception as e:
         logger.warning(f"⚠️ 기본 테이블 생성 중 오류 (무시 가능): {e}")
@@ -327,7 +327,7 @@ def run_all_tests():
     
     # 테스트 실행
     tests = [
-        ("coin_strategies 컬럼 확인", test_coin_strategies_columns),
+        ("strategies 컬럼 확인", test_strategies_columns),
         ("strategy_lineage 테이블 확인", test_strategy_lineage_table),
         ("segment_scores 테이블 확인", test_segment_scores_table),
         ("샘플 데이터 삽입", test_insert_sample_data),

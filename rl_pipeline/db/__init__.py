@@ -27,7 +27,7 @@ from .writes import (
 )
 
 from .schema import (
-    ensure_indexes, create_candles_table, create_coin_strategies_table,
+    ensure_indexes, create_candles_table, create_strategies_table,
     create_strategy_dna_table, create_fractal_analysis_table,
     create_synergy_analysis_table, create_runs_table,
     setup_database_tables,
@@ -56,7 +56,7 @@ __all__ = [
     "transaction",
     
     # Schema
-    "ensure_indexes", "create_candles_table", "create_coin_strategies_table",
+    "ensure_indexes", "create_candles_table", "create_strategies_table",
     "create_strategy_dna_table", "create_fractal_analysis_table",
     "create_synergy_analysis_table", "create_runs_table",
     "setup_database_tables",

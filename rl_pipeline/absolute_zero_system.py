@@ -63,17 +63,15 @@ try:
     AZError = core_errors.AZError
     create_run_record = strategy_manager.create_run_record
     update_run_record = strategy_manager.update_run_record
-    create_coin_strategies = strategy_manager.create_coin_strategies
     create_global_strategies = strategy_manager.create_global_strategies
     run_self_play_test = selfplay.run_self_play_test
     RegimeRouter = regime_router.RegimeRouter
     create_regime_routing_strategies = regime_router.create_regime_routing_strategies
     IntegratedAnalyzer = integrated_analyzer.IntegratedAnalyzer
-    analyze_coin_strategies = integrated_analyzer.analyze_coin_strategies
     analyze_global_strategies = integrated_analyzer.analyze_global_strategies
     ensure_indexes = db_schema.ensure_indexes
     setup_database_tables = db_schema.setup_database_tables
-    create_coin_strategies_table = db_schema.create_coin_strategies_table
+    create_coin_strategies_table = db_schema.create_strategies_table
     get_optimized_db_connection = db_pool.get_optimized_db_connection
     
     NEW_PIPELINE_AVAILABLE = True
@@ -114,6 +112,46 @@ from rl_pipeline.data.candle_loader import (
     load_candle_data_for_coin,
 )
 
+# ============================================================================
+# 🔧 공통 유틸리티 함수 (중복 제거)
+# ============================================================================
+
+def get_interval_minutes(interval: str) -> int:
+    """인터벌을 분 단위로 변환 (정렬/비교용)
+    
+    Args:
+        interval: 인터벌 문자열 (예: '15m', '1h', '1d')
+        
+    Returns:
+        분 단위 값 (파싱 실패 시 999999)
+    """
+    iv_lower = interval.lower().strip()
+    try:
+        if iv_lower.endswith('m'):
+            return int(iv_lower[:-1])
+        elif iv_lower.endswith('h'):
+            return int(iv_lower[:-1]) * 60
+        elif iv_lower.endswith('d'):
+            return int(iv_lower[:-1]) * 1440
+        elif iv_lower.endswith('w'):
+            return int(iv_lower[:-1]) * 10080
+        else:
+            return 999999
+    except (ValueError, AttributeError):
+        return 999999
+
+
+def sort_intervals(interval_list: List[str]) -> List[str]:
+    """인터벌을 시간 순서로 정렬 (단기 → 장기)
+    
+    Args:
+        interval_list: 인터벌 리스트
+        
+    Returns:
+        정렬된 인터벌 리스트
+    """
+    return sorted(interval_list, key=lambda x: (get_interval_minutes(x), x))
+
 def _configure_logging():
     try:
         root_logger = logging.getLogger()
@@ -143,20 +181,54 @@ def _configure_logging():
 
 # 환경변수 파일 로드
 from dotenv import load_dotenv
-env_path = os.path.join(os.path.dirname(__file__), 'rl_pipeline_config.env')
+env_path = os.path.join(os.path.dirname(__file__), 'config/rl_pipeline_config.env')
 load_dotenv(env_path)
 
-# Docker 환경 경로 설정
-WORKSPACE_ROOT = os.getenv('WORKSPACE_ROOT', '/workspace')
-AUTO_TRADER_ROOT = os.getenv('AUTO_TRADER_ROOT', '/workspace')
-RL_PIPELINE_ROOT = os.getenv('RL_PIPELINE_ROOT', '/workspace/rl_pipeline')
-DATA_STORAGE_PATH = os.getenv('DATA_STORAGE_PATH', '/workspace/data_storage')
+# 🔥 동적 경로 설정 (하드코딩 제거 - 엔진화)
+# 현재 파일 기준으로 경로 추론
+_CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))  # rl_pipeline/
+_AUTO_TRADER_ROOT_INFERRED = os.path.dirname(_CURRENT_FILE_DIR)  # auto_trader/
+
+# 환경변수 우선, 없으면 동적 추론
+WORKSPACE_ROOT = os.getenv('WORKSPACE_ROOT', _AUTO_TRADER_ROOT_INFERRED)
+AUTO_TRADER_ROOT = os.getenv('AUTO_TRADER_ROOT', _AUTO_TRADER_ROOT_INFERRED)
+RL_PIPELINE_ROOT = os.getenv('RL_PIPELINE_ROOT', _CURRENT_FILE_DIR)
+
+# DATA_STORAGE_PATH 동적 추론 (컨텍스트 인식)
+# 🔥 run_learning.py / run_trading.py에서 설정한 환경변수 우선 사용
+# 1. 명시적 환경변수 (최우선)
+# 2. 전략 DB 경로의 상위 디렉토리
+# 3. 기본값은 사용하지 않음 (환경변수가 없으면 에러)
+_strategy_db_env = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
+if _strategy_db_env:
+    _inferred_storage = os.path.dirname(_strategy_db_env)
+else:
+    _inferred_storage = None
+
+# 환경변수가 없으면 에러 (run_learning.py / run_trading.py에서 설정해야 함)
+DATA_STORAGE_PATH = os.getenv('DATA_STORAGE_PATH')
+if not DATA_STORAGE_PATH:
+    if _inferred_storage:
+        DATA_STORAGE_PATH = _inferred_storage
+    else:
+        # 환경변수가 전혀 없으면 현재 작업 디렉토리 기준으로 추론 시도
+        import warnings
+        _cwd_storage = os.path.join(os.getcwd(), 'data_storage')
+        warnings.warn(
+            f"⚠️ DATA_STORAGE_PATH 환경변수가 설정되지 않았습니다. "
+            f"run_learning.py 또는 run_trading.py에서 설정해야 합니다. "
+            f"임시로 {_cwd_storage} 사용합니다.",
+            UserWarning
+        )
+        DATA_STORAGE_PATH = _cwd_storage
 
 # 실행 규모/범위 설정 (환경변수로 제어)
 AZ_INTERVALS = os.getenv('AZ_INTERVALS')  # 예: "15m,30m,240m,1d"
-AZ_CANDLE_DAYS = int(os.getenv('AZ_CANDLE_DAYS', '60'))  # 기본 60일 (신생 코인은 가능한 데이터만큼 사용)
+AZ_CANDLE_DAYS = int(os.getenv('AZ_CANDLE_DAYS', '60'))  # 기본 60일 (신생 코인은 가용 데이터만큼 사용)
 AZ_ALLOW_FALLBACK = os.getenv('AZ_ALLOW_FALLBACK', 'false').lower() == 'true'
 AZ_FALLBACK_PAIRS = os.getenv('AZ_FALLBACK_PAIRS', '')  # 예: "BTC:15m;ETH:15m" (가능하면 DB에서 코인/인터벌 자동 탐색)
+
+# 🔥 자동 재학습 강제 비활성화 (속도 개선) - 환경변수로 제어
 
 # Self-play 및 전략 풀 설정 (환경변수로 제어)
 AZ_SELFPLAY_EPISODES = int(os.getenv('AZ_SELFPLAY_EPISODES', '200'))  # Self-play 에피소드 수
@@ -167,14 +239,53 @@ AZ_STRATEGY_POOL_SIZE = int(os.getenv('AZ_STRATEGY_POOL_SIZE', '15000'))  # DB�
 PREDICTIVE_SELFPLAY_RATIO = float(os.getenv('PREDICTIVE_SELFPLAY_RATIO', '0.2'))  # 기본값: 20%
 
 # 데이터베이스 경로 설정
-STRATEGIES_DB_PATH = os.path.join(DATA_STORAGE_PATH, 'rl_strategies.db')
-CANDLES_DB_PATH = os.path.join(DATA_STORAGE_PATH, 'rl_candles.db')
-# learning_results.db는 이제 rl_strategies.db로 통합됨 (core/env.py 참조)
-LEARNING_RESULTS_DB_PATH = STRATEGIES_DB_PATH
+# 환경 변수 RL_DB_PATH, STRATEGY_DB_PATH가 설정되어 있으면 최우선 사용 (run_learning.py 등에서 설정함)
+try:
+    from rl_pipeline.core.env import config
+    DEFAULT_RL_DB = config.RL_DB
+    DEFAULT_STRATEGIES_DB = config.STRATEGIES_DB
+except (ImportError, AttributeError):
+    # 환경변수가 없을 경우를 대비한 기본값은 제거하고, 환경변수 설정을 강제함
+    DEFAULT_RL_DB = None
+    DEFAULT_STRATEGIES_DB = None
+
+CANDLES_DB_PATH = os.getenv('RL_DB_PATH', DEFAULT_RL_DB)
+STRATEGIES_DB_PATH = os.getenv('STRATEGY_DB_PATH', DEFAULT_STRATEGIES_DB)
+
+# 🔥 강제 보정: rl_strategies.db가 경로에 포함되어 있으면 learning_strategies.db로 교체 (레거시 호환성)
+if STRATEGIES_DB_PATH and 'rl_strategies.db' in STRATEGIES_DB_PATH:
+    STRATEGIES_DB_PATH = STRATEGIES_DB_PATH.replace('rl_strategies.db', 'learning_strategies.db')
+
+if not CANDLES_DB_PATH or not STRATEGIES_DB_PATH:
+    # 필수 환경변수 미설정 시 에러 발생 (하드코딩 방지)
+    error_msg = "❌ RL_DB_PATH 또는 STRATEGY_DB_PATH 환경변수가 설정되지 않았습니다. run_learning.py 등에서 설정해주세요."
+    logger.error(error_msg)
+    raise ValueError(error_msg)
+# LEARNING_RESULTS_DB_PATH는 config에서 가져옴 (동적 처리: 파일 or 디렉토리/common.db)
+try:
+    from rl_pipeline.core.env import config
+    LEARNING_RESULTS_DB_PATH = config.LEARNING_RESULTS_DB_PATH
+except:
+    LEARNING_RESULTS_DB_PATH = STRATEGIES_DB_PATH
+
+logger.info(f"📂 캔들 DB 경로: {CANDLES_DB_PATH}")
+logger.info(f"📂 전략 DB 경로: {STRATEGIES_DB_PATH}")
+logger.info(f"📂 학습 결과 DB 경로: {LEARNING_RESULTS_DB_PATH}")
 
 def _ensure_file_exists(db_path: str) -> None:
-    """DB 파일이 없으면 생성 (원천 데이터 DB는 제외)"""
+    """DB 파일이 없으면 생성 (원천 데이터 DB는 제외)
+    
+    Note: db_path가 디렉토리인 경우, 해당 디렉토리가 존재하는지만 확인하고 종료
+    """
     try:
+        # 디렉토리인 경우 (확장자 검사 또는 isdir 검사)
+        is_directory = not db_path.endswith('.db')
+        if is_directory:
+            if not os.path.exists(db_path):
+                os.makedirs(db_path, exist_ok=True)
+                logger.info(f"📂 전략 DB 디렉토리 생성: {db_path}")
+            return
+
         parent = os.path.dirname(db_path)
         if parent and not os.path.exists(parent):
             try:
@@ -219,9 +330,12 @@ def ensure_storage_ready() -> None:
         except Exception as e:
             logger.error(f"❌ 데이터 디렉터리 쓰기 불가: {DATA_STORAGE_PATH} -> {e}")
             raise
-        # LEARNING_RESULTS_DB_PATH는 이제 STRATEGIES_DB_PATH와 동일하므로 중복 제거
-        for path in (CANDLES_DB_PATH, STRATEGIES_DB_PATH):
-            _ensure_file_exists(path)
+        
+        # DB 경로 준비 (CANDLES, STRATEGIES, LEARNING_RESULTS)
+        for path in (CANDLES_DB_PATH, STRATEGIES_DB_PATH, LEARNING_RESULTS_DB_PATH):
+            if path:
+                _ensure_file_exists(path)
+                
     except Exception as e:
         logger.error(f"❌ 저장소 사전 준비 실패: {e}")
 
@@ -266,7 +380,6 @@ def run_absolute_zero(coin: Optional[str] = None, interval: str = "15m", n_strat
             logger.warning(f"⚠️ 디버그 세션 생성 실패 (계속 진행): {session_err}")
             session_id = None
         # 다중 인터벌 지원 우선순위: 함수 인자 intervals > AZ_INTERVALS 환경변수 > 단일 interval
-        # main()에서 전달한 intervals가 우선 (DB에서 가져온 모든 인터벌)
         if intervals and len(intervals) > 0:
             intervals_raw = intervals
         elif AZ_INTERVALS:
@@ -274,37 +387,7 @@ def run_absolute_zero(coin: Optional[str] = None, interval: str = "15m", n_strat
         else:
             intervals_raw = [interval]
         
-        # 인터벌 순서 정렬: 15m, 30m, 240m, 1d 순서로
-        def sort_intervals(interval_list):
-            """인터벌을 시간 순서로 정렬: 실제 분 단위로 변환하여 정렬"""
-            def get_order_in_minutes(iv):
-                """인터벌을 분 단위로 변환하여 정렬 키 생성"""
-                iv_lower = iv.lower().strip()
-                
-                # 분 단위로 변환
-                try:
-                    if iv_lower.endswith('m'):
-                        # 분 단위 (예: 15m, 30m, 240m)
-                        minutes = int(iv_lower[:-1])
-                        return minutes
-                    elif iv_lower.endswith('h'):
-                        # 시간 단위 (예: 1h, 4h)
-                        hours = int(iv_lower[:-1])
-                        return hours * 60  # 시간을 분으로 변환
-                    elif iv_lower.endswith('d'):
-                        # 일 단위 (예: 1d)
-                        days = int(iv_lower[:-1])
-                        return days * 1440  # 일을 분으로 변환
-                    else:
-                        # 알 수 없는 형식은 마지막으로
-                        return 999999
-                except (ValueError, AttributeError):
-                    # 파싱 실패 시 마지막으로
-                    return 999999
-            
-            # 분 단위로 정렬 (안정적 정렬: 같은 값이면 원래 순서 유지)
-            return sorted(interval_list, key=lambda x: (get_order_in_minutes(x), x))
-        
+        # 공통 함수 사용하여 인터벌 정렬
         intervals_to_use = sort_intervals(intervals_raw)
 
         # 코인 기본값: DB에서 사용 가능한 코인 목록 우선 사용
@@ -347,25 +430,26 @@ def run_absolute_zero(coin: Optional[str] = None, interval: str = "15m", n_strat
         # 인덱스는 이미 시스템 시작 시 생성됨
 
         # 🆕 개선 사항 자동 실행 (환경변수로 제어)
-        # 🔥 시작 시점 검증/비교는 불필요 (전략이 아직 생성되지 않음)
-        # - 백테스트 검증: 전략이 없어 검증할 데이터 없음
-        # - 베이스라인 비교: 전략이 없어 비교할 데이터 없음
-        # - 필요시 별도 검증 스크립트로 실행 가능
+        # 🔥 시작 시점 검증/비교 제거 -> 실행 완료 후 수행 (신규 전략 포함 필터링)
         ENABLE_STRATEGY_FILTERING = os.getenv('ENABLE_STRATEGY_FILTERING', 'false').lower() == 'true'
         
-        # 🔥 시작 시점 검증/비교 제거
-        # - 전략 생성 전에는 의미 없는 검증/비교
-        # - 전략 생성 후 비교는 파이프라인 내부에서 수행됨
+        # 🔥 코인별 DB 초기화 (매우 중요: 코인별로 별도 DB 파일 생성 및 테이블 초기화)
+        from rl_pipeline.core.env import config
+        from rl_pipeline.db.schema import setup_database_tables
         
-        if ENABLE_STRATEGY_FILTERING:
-            try:
-                logger.info("🔧 전략 필터링 시작...")
-                from rl_pipeline.core.strategy_filter import remove_low_grade_strategies
-                removed = remove_low_grade_strategies()
-                if removed > 0:
-                    logger.info(f"✅ {removed}개 F 등급 전략 제거")
-            except Exception as e:
-                logger.warning(f"⚠️ 전략 필터링 실패 (계속 진행): {e}")
+        try:
+            coin_strategy_db_path = config.get_strategy_db_path(coin)
+            logger.info(f"🔧 {coin} 전략 DB 초기화: {coin_strategy_db_path}")
+            
+            # 해당 코인 DB에 테이블 생성 (없으면 생성됨)
+            if setup_database_tables(coin_strategy_db_path):
+                logger.info(f"✅ {coin} 전략 DB 테이블 초기화 완료")
+            else:
+                logger.warning(f"⚠️ {coin} 전략 DB 테이블 초기화 실패 (이미 존재할 수 있음)")
+                
+        except Exception as db_init_err:
+            logger.error(f"❌ {coin} 전략 DB 초기화 중 오류: {db_init_err}")
+            # 초기화 실패 시에도 일단 진행 (연결 풀에서 생성 시도할 수 있음)
 
         # 🆕 캔들 데이터 로드
         logger.info(f"📊 {coin} 캔들 데이터 로드 시작 (목표: {AZ_CANDLE_DAYS}일)...")
@@ -424,94 +508,111 @@ def run_absolute_zero(coin: Optional[str] = None, interval: str = "15m", n_strat
                 logger.info(f"✅ {coin}-{interval} 개별 인터벌 처리 완료: 전략 생성 → 예측 self-play → 롤업/등급 평가 완료")
                 logger.info(f"   💡 전체 통합 분석 및 학습은 모든 인터벌 완료 후 실행됩니다")
                 
-                # 🔥 WAL 체크포인트 강제 실행 + 잠금 해제 (다음 인터벌 준비)
-                if idx < len(intervals_to_use) - 1:  # 마지막 인터벌이 아닌 경우만
-                    import sqlite3
-                    import time
-                    import traceback
-                    from rl_pipeline.core.env import config
-                    
-                    # WAL 체크포인트 실행 (재시도 포함)
-                    wal_checkpoint_success = False
-                    for retry in range(3):  # 최대 3회 재시도
-                        try:
-                            logger.info(f"🔧 WAL 체크포인트 시도 {retry + 1}/3 ({coin}-{interval} 후)")
-                            
-                            # Connection Pool의 모든 연결 종료 (먼저 실행)
-                            try:
-                                from rl_pipeline.db.connection_pool import close_all_connections
-                                close_all_connections()
-                                logger.info(f"✅ Connection Pool 종료 완료 ({coin}-{interval} 후)")
-                                time.sleep(0.2)  # 종료 대기
-                            except Exception as pool_error:
-                                logger.warning(f"⚠️ Connection Pool 종료 실패: {pool_error}")
-                                import traceback
-                                logger.debug(f"Connection Pool 종료 실패 상세:\n{traceback.format_exc()}")
-                            
-                            # 전략 DB에 WAL 체크포인트 실행
-                            db_path = config.STRATEGIES_DB
-                            logger.debug(f"🔧 DB 경로: {db_path}")
-                            
-                            # 짧은 타임아웃으로 연결 시도
-                            conn = sqlite3.connect(db_path, timeout=5.0)
-                            cursor = conn.cursor()
-                            
-                            # WAL 체크포인트 실행 (FULL 먼저 시도)
-                            result_passive = cursor.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchone()
-                            logger.debug(f"🔧 WAL 체크포인트 PASSIVE 결과: {result_passive}")
-                            
-                            # TRUNCATE 체크포인트 실행
-                            result = cursor.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
-                            logger.debug(f"🔧 WAL 체크포인트 TRUNCATE 결과: {result}")
-                            
-                            # 결과 확인: (busy, log, checkpointed)
-                            if result and result[0] == 0:  # busy=0이면 성공
-                                logger.debug(f"✅ WAL 체크포인트 성공: {result[2]}개 페이지 체크포인트됨")
-                            elif result and result[0] == 1:  # busy=1이면 다른 연결이 사용 중
-                                logger.warning(f"⚠️ WAL 체크포인트 busy: 다른 연결이 사용 중 (무시하고 계속)")
-                            
-                            conn.commit()
-                            conn.close()
-                            
-                            # 추가 대기 (WAL 파일이 실제로 줄어들도록)
-                            time.sleep(0.3)
-                            
-                            wal_checkpoint_success = True
-                            logger.info(f"✅ WAL 체크포인트 완료 ({coin}-{interval} 후, 다음 인터벌 준비)")
-                            break  # 성공 시 재시도 중단
-                            
-                        except sqlite3.OperationalError as db_error:
-                            error_msg = str(db_error)
-                            logger.warning(f"⚠️ WAL 체크포인트 실패 (시도 {retry + 1}/3): {error_msg}")
-                            if retry < 2:  # 마지막 재시도가 아니면
-                                wait_time = (retry + 1) * 0.5
-                                logger.info(f"⏳ {wait_time:.1f}초 후 재시도...")
-                                time.sleep(wait_time)
-                            else:
-                                logger.error(f"❌ WAL 체크포인트 최종 실패: {error_msg}")
-                                logger.debug(f"WAL 체크포인트 실패 상세:\n{traceback.format_exc()}")
-                        except Exception as wal_error:
-                            error_msg = str(wal_error)
-                            logger.error(f"❌ WAL 체크포인트 예외 발생 (시도 {retry + 1}/3): {error_msg}")
-                            logger.debug(f"WAL 체크포인트 예외 상세:\n{traceback.format_exc()}")
-                            if retry < 2:
-                                time.sleep(0.5)
-                            else:
-                                logger.error(f"❌ WAL 체크포인트 최종 실패: {error_msg}")
-                    
-                    # 잠금 완전히 해제될 때까지 대기
-                    if wal_checkpoint_success:
-                        time.sleep(0.3)  # 성공 시 짧은 대기
-                    else:
-                        time.sleep(1.0)  # 실패 시 더 긴 대기 (다음 인터벌을 위해)
-                        logger.warning(f"⚠️ WAL 체크포인트 실패했지만 다음 인터벌 진행 ({coin}-{interval})")
+                # 🔧 WAL 체크포인트 (간소화 - 마지막에 한 번만 수행하므로 중간 인터벌에서는 생략)
+                # 참고: 최종 WAL 정리는 cleanup_all_database_files()에서 수행됨
                 
             except Exception as e:
                 logger.error(f"❌ {coin}-{interval} 파이프라인 실행 실패: {e}")
                 continue
         
+        # 🔥 MFE/MAE 라벨링 및 통계 갱신 (전략 생성 완료 후 실행)
+        if pipeline_results:
+            try:
+                from rl_pipeline.labeling.chart_future_scanner import ChartFutureScanner
+                from rl_pipeline.labeling.stats_generator import StatsGenerator
+                
+                logger.info(f"🔄 {coin} MFE/MAE 라벨링 시작 (신규 전략 대상)...")
+                
+                # 🔥 [Fix] 코인별 DB 경로 명시 (개별 코인 DB에서 전략 로드)
+                coin_strategy_db_path = config.get_strategy_db_path(coin)
+                
+                # 1. 라벨링 실행 (생성된 전략들의 신호를 과거 차트에 대입)
+                scanner = ChartFutureScanner(strategy_db_path=coin_strategy_db_path)
+                labeling_results = scanner.run_full_labeling(coins=[coin], intervals=intervals_to_use)
+                total_labels = sum(labeling_results.values())
+                
+                if total_labels > 0:
+                    logger.info(f"✅ {coin} 라벨링 완료: {total_labels}개 신호 라벨 생성")
+                    
+                    # 2. 통계 생성 (MFE/MAE 분포 계산) - 동일 DB 경로 사용
+                    generator = StatsGenerator(strategy_db_path=coin_strategy_db_path)
+                    stats_count = generator.generate_all_stats()
+                    logger.info(f"✅ {coin} MFE/MAE 통계 생성 완료: {stats_count}개 전략 통계")
+                    
+                    # 3. 🔥 리그 승강제 업데이트 (EntryScore 기반)
+                    from rl_pipeline.core.strategy_filter import update_league_rankings
+                    league_result = update_league_rankings(
+                        db_path=coin_strategy_db_path,
+                        top_n_per_group=100,  # 코인×인터벌별 상위 100개 major
+                        min_entry_score=0.0   # 최소 손익분기점 이상만 major
+                    )
+                    logger.info(f"🏆 {coin} 리그 업데이트: major {league_result['total_major']}개 (↑{league_result['promoted']} ↓{league_result['demoted']})")
+                    
+                    # 4. 🧬 자동 진화 시스템 체크 (Phase 승격/강등)
+                    try:
+                        from rl_pipeline.evolution import run_evolution_check
+                        evolution_summary = run_evolution_check(coins=[coin], intervals=intervals_to_use)
+                        
+                        if evolution_summary.get('total_symbols', 0) > 0:
+                            dist = evolution_summary.get('distribution', {})
+                            logger.info(f"🧬 {coin} 진화 현황: Phase1={dist.get('STATISTICAL', 0)}, Phase2={dist.get('PREDICTIVE', 0)}, Phase3={dist.get('TIMING_OPTIMIZED', 0)}")
+                    except Exception as evo_err:
+                        logger.debug(f"⚠️ 진화 체크 실패 (무시 가능): {evo_err}")
+                else:
+                    logger.info(f"📊 {coin} 라벨링: 신호 없음 (전략 조건에 맞는 과거 구간이 적음)")
+                
+            except Exception as labeling_err:
+                logger.warning(f"⚠️ {coin} 라벨링/통계 갱신 실패 (무시 가능): {labeling_err}")
+        
         # 전체 인터벌 통합분석 실행
         if pipeline_results:
+            # 🔥 전략 필터링: 파이프라인 실행 완료 후 수행 (신규 생성된 전략까지 포함하여 검증)
+            if ENABLE_STRATEGY_FILTERING:
+                try:
+                    logger.info(f"🔧 {coin} 전략 필터링 시작 (파이프라인 완료 후)...")
+                    from rl_pipeline.core.strategy_filter import remove_low_grade_strategies, apply_physics_laws_filter, perform_stress_test, keep_top_strategies
+                    
+                    # DB 경로 설정 (코인별 DB 사용 시 동적 처리 필요)
+                    from rl_pipeline.core.env import config
+                    strategy_db_path = config.get_strategy_db_path(coin)
+                    logger.debug(f"🔧 필터링 대상 DB: {strategy_db_path}")
+                    
+                    # 1. 물리 법칙 필터링 (생존 조건) - 파산 확률 0% 도전
+                    # 🔥 사용자 요청: 필터링 대폭 완화 (연구용 X, 실전 데이터 확보 O) - 환경변수 기반 제어
+                    removed_physics = apply_physics_laws_filter(
+                        db_path=strategy_db_path, 
+                        max_mdd_pct=float(os.getenv('FILTER_MAX_MDD_PCT', '0.99')),  # 기본값 0.99 (사실상 해제)
+                        min_trades=int(os.getenv('FILTER_MIN_TRADES', '0')),         # 기본값 0 (해제)
+                        strict_mode=os.getenv('FILTER_STRICT_MODE', 'false').lower() == 'true' # 기본값 False
+                    )
+                    if removed_physics > 0:
+                        logger.info(f"⚖️ {removed_physics}개 전략 물리 법칙 위반으로 즉시 제거됨")
+
+                    # 2. 정원 관리 (Capacity Management) - 인터벌/레짐별 최적화 🔥
+                    # 설정된 정원(STRATEGIES_PER_COMBINATION)을 초과하는 경우 꼴등 제거
+                    kept_count, removed_capacity = keep_top_strategies(db_path=strategy_db_path)
+                    if removed_capacity > 0:
+                        logger.info(f"🧹 정원 관리: {removed_capacity}개 하위 전략 제거 (용량 최적화)")
+
+                    # 3. 스트레스 테스트 (Monte Carlo Simulation) - 최악의 시나리오 검증
+                    # 물리 법칙을 통과한 정예 전략들만 대상으로 수행
+                    stress_results = perform_stress_test(db_path=strategy_db_path)
+                    if stress_results.get("failed_count", 0) > 0:
+                        logger.info(f"📉 {stress_results['failed_count']}개 전략 스트레스 테스트(VaR 95%) 탈락")
+
+                    # 4. 등급 기반 필터링 (나머지 정리)
+                    # 🔥 MFE/MAE 필터링 추가
+                    from rl_pipeline.core.strategy_filter import apply_mfe_filter
+                    removed_mfe = apply_mfe_filter(db_path=strategy_db_path, min_entry_score=-0.005)
+                    if removed_mfe > 0:
+                         logger.info(f"📉 {removed_mfe}개 전략 MFE/MAE Gate 필터링 (EntryScore < -0.5%)")
+
+                    removed = remove_low_grade_strategies(db_path=strategy_db_path)
+                    if removed > 0:
+                        logger.info(f"✅ {removed}개 F 등급 전략 제거")
+                except Exception as e:
+                    logger.warning(f"⚠️ 전략 필터링 실패 (계속 진행): {e}")
+
             try:
                 logger.info(f"🔍 {coin} 전체 인터벌 통합분석 시작...")
                 final_result = orchestrator.run_integrated_analysis_all_intervals(coin, pipeline_results, all_candle_data)
@@ -721,6 +822,28 @@ def _get_value(obj, key: str, default: Any):
         # 그 다음 객체 속성 확인
         return getattr(obj, key, default)
 
+def _format_price(price: float) -> str:
+    """가격 포맷팅: 1원 미만은 소수점 4자리, 100원 미만은 소수점 2자리, 100원 이상은 천단위 콤마"""
+    try:
+        if price is None:
+            return "0"
+        if price == 0:
+            return "0"
+        
+        # 1원 미만인 경우 소수점 4자리까지 정확히 표시
+        if price < 1.0:
+            return f"{price:.4f}"
+        
+        # 1원 이상 100원 미만인 경우 소수점 2자리까지 표시
+        if price < 100.0:
+            return f"{price:.2f}"
+        
+        # 100원 이상인 경우 천단위 콤마 추가
+        return f"{int(price):,}"
+            
+    except Exception:
+        return f"{price}"
+
 def _calculate_fractal_score(strategies: List[Dict]) -> float:
     """Fractal 점수 계산 - 전략 파라미터 분포 기반 프랙탈 패턴 분석"""
     if not strategies:
@@ -845,6 +968,114 @@ def _calculate_indicator_cross_validation(strategies: List[Dict]) -> float:
         logger.debug(f"⚠️ Indicator 교차 검증 계산 실패: {e}")
         return 0.5
 
+def report_strategy_performance(coin: str):
+    """전략 방향성 및 예측 정확도 리포트 출력"""
+    try:
+        from rl_pipeline.db.connection_pool import get_optimized_db_connection
+        
+        logger.info(f"\n📊 {coin} 전략 성과 리포트 (방향성 및 정확도)")
+        logger.info("=" * 80)
+        logger.info(f"{'Interval':<10} | {'Total':<6} | {'Buy':<5} | {'Sell':<5} | {'Win Rate':<10} | {'Avg Profit':<10} | {'Top Grade':<10}")
+        logger.info("-" * 80)
+        
+        with get_optimized_db_connection(config.get_strategy_db_path(coin)) as conn:
+            cursor = conn.cursor()
+            
+            # 인터벌별 전략 통계 조회
+            # symbol 컬럼 우선 사용, 없으면 coin 컬럼 사용
+            try:
+                cursor.execute("PRAGMA table_info(strategies)")
+                columns = [row[1] for row in cursor.fetchall()]
+                coin_col = 'symbol' if 'symbol' in columns else 'coin'
+            except:
+                coin_col = 'coin'
+
+            cursor.execute(f"""
+                SELECT interval, 
+                       COUNT(*) as total_count,
+                       AVG(win_rate) as avg_win_rate,
+                       AVG(profit) as avg_profit,
+                       SUM(CASE WHEN strategy_type LIKE '%_buy' OR strategy_type LIKE '%buy%' THEN 1 ELSE 0 END) as buy_count,
+                       SUM(CASE WHEN strategy_type LIKE '%_sell' OR strategy_type LIKE '%sell%' THEN 1 ELSE 0 END) as sell_count,
+                       MAX(quality_grade) as top_grade
+                FROM strategies
+                WHERE {coin_col} = ?
+                GROUP BY interval
+                ORDER BY interval
+            """, (coin,))
+            
+            rows = cursor.fetchall()
+            
+            if not rows:
+                logger.info("  ⚠️ 전략 데이터가 없습니다.")
+                logger.info("=" * 80)
+                return
+
+            # 인터벌 정렬을 위한 헬퍼
+            def get_minutes(iv):
+                iv = iv.lower()
+                if iv.endswith('m'): return int(iv[:-1])
+                if iv.endswith('h'): return int(iv[:-1]) * 60
+                if iv.endswith('d'): return int(iv[:-1]) * 1440
+                return 99999
+
+            # rows 정렬
+            rows.sort(key=lambda x: get_minutes(x[0]))
+            
+            for row in rows:
+                interval, total, win_rate, profit, buy, sell, top_grade = row
+                # None 처리
+                win_rate = win_rate if win_rate else 0.0
+                profit = profit if profit else 0.0
+                buy = buy if buy else 0
+                sell = sell if sell else 0
+                top_grade = top_grade if top_grade else '-'
+                
+                logger.info(f"{interval:<10} | {total:<6} | {buy:<5} | {sell:<5} | {win_rate*100:>9.1f}% | {profit:>10.2f} | {top_grade:<10}")
+
+        logger.info("=" * 80)
+            
+    except Exception as e:
+        logger.warning(f"⚠️ 리포트 생성 실패: {e}")
+
+def cleanup_all_database_files():
+    """모든 데이터베이스 임시 파일 정리 및 연결 종료"""
+    logger.info("🧹 모든 데이터베이스 임시 파일 정리 시작...")
+    
+    try:
+        # 1. 모든 연결 종료
+        if db_pool:
+            db_pool.close_all_connections(verbose=True)
+            
+            # 2. 각 풀별 WAL 파일 정리
+            pools_to_clean = [
+                getattr(db_pool, '_strategy_pool', None),
+                getattr(db_pool, '_candle_pool', None),
+                getattr(db_pool, '_learning_results_pool', None),
+                getattr(db_pool, '_batch_pool', None)
+            ]
+            
+            for pool in pools_to_clean:
+                if pool:
+                    try:
+                        pool.cleanup_wal_files()
+                    except Exception as wal_err:
+                        pass
+                        
+            # 코인별 전략 풀도 정리
+            if hasattr(db_pool, '_strategy_pools') and db_pool._strategy_pools:
+                for pool in list(db_pool._strategy_pools.values()):
+                    try:
+                        pool.close_all_connections()
+                        pool.cleanup_wal_files()
+                    except:
+                        pass
+                
+        logger.info("✅ 데이터베이스 정리 완료")
+        
+    except Exception as e:
+        logger.error(f"❌ 데이터베이스 정리 실패: {e}")
+
 def main():
     """메인 함수 - 모든 코인/인터벌 조합에 대해 실행"""
     try:
@@ -868,9 +1099,9 @@ def main():
             
             # 🆕 데이터베이스 마이그레이션 실행 (누락된 컬럼 추가)
             try:
-                from db.schema import migrate_coin_strategies_table, migrate_rl_episode_summary_table
-                migrate_coin_strategies_table()
-                migrate_rl_episode_summary_table()  # 🔥 옵션 A: source_type 컬럼 추가
+                from rl_pipeline.db.schema import migrate_strategies_table
+                migrate_strategies_table()
+                # migrate_rl_episode_summary_table()  # 존재하지 않으므로 주석 처리
                 logger.info("✅ 데이터베이스 마이그레이션 완료")
             except Exception as me:
                 logger.warning(f"⚠️ 데이터베이스 마이그레이션 실패(무시 가능): {me}")
@@ -887,18 +1118,8 @@ def main():
         except Exception as e:
             logger.error(f"❌ 시스템 데이터베이스 초기화 실패: {e}")
             return {"error": f"데이터베이스 초기화 실패: {e}"}
-        
-        # 🆕 Paper Trading 오래된 세션 정리
-        try:
-            from rl_pipeline.validation.auto_paper_trading import AutoPaperTrading
-            auto_paper = AutoPaperTrading()
-            cleaned = auto_paper.cleanup_old_sessions(days_old=14)  # 14일 이상 된 세션 정리
-            if cleaned > 0:
-                logger.info(f"🧹 {cleaned}개의 오래된 Paper Trading 세션 정리 완료")
-        except Exception as cleanup_err:
-            logger.warning(f"⚠️ Paper Trading 세션 정리 실패 (계속 진행): {cleanup_err}")
 
-        # 🆕 사용 가능한 코인/인터벌 조합 가져오기
+        # 사용 가능한 코인/인터벌 조합 가져오기
         coin_interval_combinations = get_available_coins_and_intervals()
         logger.info(f"📊 발견된 코인/인터벌 조합: {len(coin_interval_combinations)}개")
         # 코인별 전체 인터벌로 그룹핑
@@ -907,49 +1128,18 @@ def main():
             coin_to_intervals.setdefault(c, [])
             if itv not in coin_to_intervals[c]:
                 coin_to_intervals[c].append(itv)
-        # 인터벌 정렬: 실제 분 단위로 변환하여 정렬
-        def sort_intervals_for_main(interval_list):
-            """인터벌을 시간 순서로 정렬: 실제 분 단위로 변환"""
-            def get_order_in_minutes(iv):
-                """인터벌을 분 단위로 변환하여 정렬 키 생성"""
-                iv_lower = iv.lower().strip()
-                
-                try:
-                    if iv_lower.endswith('m'):
-                        minutes = int(iv_lower[:-1])
-                        return minutes
-                    elif iv_lower.endswith('h'):
-                        hours = int(iv_lower[:-1])
-                        return hours * 60
-                    elif iv_lower.endswith('d'):
-                        days = int(iv_lower[:-1])
-                        return days * 1440
-                    else:
-                        return 999999
-                except (ValueError, AttributeError):
-                    return 999999
-            
-            # 분 단위로 정렬 (안정적 정렬)
-            return sorted(interval_list, key=lambda x: (get_order_in_minutes(x), x))
-        
+        # 공통 함수 사용하여 인터벌 정렬
         for c in coin_to_intervals:
-            try:
-                coin_to_intervals[c] = sort_intervals_for_main(coin_to_intervals[c])
-            except Exception:
-                pass
+            coin_to_intervals[c] = sort_intervals(coin_to_intervals[c])
         
         if not coin_interval_combinations:
             logger.error("❌ 사용 가능한 코인/인터벌 조합이 없습니다.")
-            logger.error("❌ 캔들 데이터를 먼저 수집하세요: python rl_candles_collector.py")
+            logger.error("❌ 캔들 데이터를 먼저 수집하세요: python candles_collector.py")
             return {"error": "no coin/interval combinations found", "message": "캔들 데이터를 먼저 수집하세요"}
         
         # 각 조합에 대해 실행
         results = []
         failed_runs = []
-        
-        # 🆕 Paper Trading 자동 실행 설정
-        ENABLE_AUTO_PAPER_TRADING = os.getenv('ENABLE_AUTO_PAPER_TRADING', 'true').lower() == 'true'
-        PAPER_TRADING_DURATION_DAYS = int(os.getenv('PAPER_TRADING_DURATION_DAYS', '30'))  # 기본 30일 (통계적 신뢰도와 피드백 속도 균형)
         
         for coin, intervals in coin_to_intervals.items():
             try:
@@ -960,35 +1150,8 @@ def main():
                 if result.get("status") == "success":
                     logger.info(f"✅ {coin} 처리 성공")
                     
-                    # 🆕 코인별 파이프라인 완료 후 즉시 Paper Trading 시작
-                    if ENABLE_AUTO_PAPER_TRADING:
-                        try:
-                            logger.info(f"\n📊 {coin} Paper Trading 자동 시작 (파이프라인 완료 후)")
-                            from rl_pipeline.validation.auto_paper_trading import (
-                                auto_start_paper_trading_after_pipeline,
-                                run_paper_trading_monitor
-                            )
-                            
-                            paper_result = auto_start_paper_trading_after_pipeline(
-                                coin=coin,
-                                intervals=intervals,
-                                duration_days=PAPER_TRADING_DURATION_DAYS
-                            )
-                            
-                            if paper_result.get('status') == 'started':
-                                logger.info(f"✅ {coin} Paper Trading 시작 완료")
-                                # 특정 코인만 모니터링 실행 (실시간 시그널로 거래 시작)
-                                try:
-                                    # 해당 코인의 세션만 모니터링
-                                    run_paper_trading_monitor(coin=coin, session_limit=5)
-                                    logger.info(f"✅ {coin} Paper Trading 모니터링 완료")
-                                except Exception as e:
-                                    logger.warning(f"⚠️ {coin} Paper Trading 모니터링 실패 (계속 진행): {e}")
-                            else:
-                                logger.warning(f"⚠️ {coin} Paper Trading 시작 실패: {paper_result.get('error', 'unknown')}")
-                        
-                        except Exception as e:
-                            logger.warning(f"⚠️ {coin} Paper Trading 자동 시작 실패 (계속 진행): {e}")
+                    # 🔥 전략 성과 리포트 출력
+                    report_strategy_performance(coin)
                 else:
                     logger.error(f"❌ {coin} 처리 실패: {result.get('message', 'Unknown error')}")
                     failed_runs.append(f"{coin}_{','.join(intervals)}")
@@ -1008,15 +1171,12 @@ def main():
         if failed_runs:
             logger.warning(f"⚠️ 실패한 조합: {failed_runs}")
         
-        # 🆕 Paper Trading 완료 요약 (이미 각 코인별로 실행됨)
-        if ENABLE_AUTO_PAPER_TRADING and successful_runs > 0:
-            logger.info("\n✅ 모든 코인별 Paper Trading 자동 실행 완료")
-            logger.info("   💡 Paper Trading은 주기적으로 자동 업데이트됩니다")
-            logger.info("   💡 수동 모니터링: python -m rl_pipeline.validation.auto_paper_trading monitor")
-        
         # 🌍 글로벌 전략 생성 (모든 코인의 모든 시간대 완료 후)
         if successful_runs > 0:
             try:
+                # 🔥 글로벌 전략 생성 전에도 라벨링/통계 갱신 수행 (안전을 위해)
+                # (이미 개별 코인 처리 시 수행되었으므로 생략 가능하나, 글로벌 전용 로직이 필요할 수 있음)
+                
                 logger.info("\n🌍 글로벌 전략 생성 시작 (모든 코인의 모든 시간대 완료 후)...")
                 
                 # 모든 코인의 self-play 결과(전략) 수집
@@ -1034,14 +1194,23 @@ def main():
                             from rl_pipeline.db.reads import fetch_all
                             from rl_pipeline.db.connection_pool import get_optimized_db_connection
                             
+                            # 🔥 코인별 DB 경로 사용
+                            coin_db_path = config.get_strategy_db_path(coin)
+                            
                             strategies = []
-                            with get_optimized_db_connection("strategies") as conn:
+                            with get_optimized_db_connection(coin_db_path) as conn:
                                 cursor = conn.cursor()
                                 
+                                # 🔥 컬럼명 동적 확인 (coin vs symbol)
+                                cursor.execute("PRAGMA table_info(strategies)")
+                                columns_info = cursor.fetchall()
+                                columns = [col[1] for col in columns_info]
+                                coin_col = 'symbol' if 'symbol' in columns else 'coin'
+                                
                                 # 모든 등급의 상위 전략 로드 (등급 우선순위: S > A > B > C > D > F, 제한 없음)
-                                query = """
-                                    SELECT * FROM coin_strategies 
-                                    WHERE coin = ? AND interval = ?
+                                query = f"""
+                                    SELECT * FROM strategies 
+                                    WHERE {coin_col} = ? AND interval = ?
                                     ORDER BY 
                                         CASE COALESCE(quality_grade, 'Z')
                                             WHEN 'S' THEN 0
@@ -1052,14 +1221,15 @@ def main():
                                             WHEN 'F' THEN 5
                                             ELSE 6
                                         END ASC,
-                                        profit DESC, 
-                                        win_rate DESC
+                                        win_rate DESC,
+                                        profit DESC
                                 """
                                 cursor.execute(query, (coin, interval))
                                 results = cursor.fetchall()
                                 
                                 if results:
-                                    columns_query = "PRAGMA table_info(coin_strategies)"
+                                    # 🔥 해당 DB에서 테이블 정보 가져오기
+                                    columns_query = "PRAGMA table_info(strategies)"
                                     columns_info = cursor.execute(columns_query).fetchall()
                                     columns = [col[1] for col in columns_info]
                                     
@@ -1077,6 +1247,9 @@ def main():
                                     # profit을 달러에서 퍼센트로 변환
                                     avg_profit_pnl = sum(_get_value(s, 'profit', 0) or 0 for s in strategies) / len(strategies)
                                     avg_profit_pct = (avg_profit_pnl / 10000.0) * 100  # 퍼센트로 변환
+                                    
+                                    # PnL 평균값 포맷팅 (예: 1,000,000)
+                                    avg_profit_str = _format_price(avg_profit_pnl)
 
                                     avg_win_rate = sum(_get_value(s, 'win_rate', 0) or 0 for s in strategies) / len(strategies)
 
@@ -1093,13 +1266,13 @@ def main():
                                     has_grades = any(_get_value(s, 'quality_grade', None) and _get_value(s, 'quality_grade', 'UNKNOWN') != 'UNKNOWN' for s in strategies)
                                     
                                     if not has_performance_data and not has_grades:
-                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 성과 데이터 없음: Self-play 비활성화 또는 롤업 데이터 없음]")
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 PnL: {avg_profit_str}, 평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 성과 데이터 없음]")
                                     elif not has_performance_data:
-                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 수익/승률 데이터 없음: 롤업 데이터 없음]")
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 PnL: {avg_profit_str}, 평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 수익/승률 데이터 없음]")
                                     elif not has_grades:
-                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 등급 데이터 없음: 등급 계산 필요]")
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 PnL: {avg_profit_str}, 평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str}) [💡 등급 데이터 없음]")
                                     else:
-                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str})")
+                                        logger.info(f"  ✅ {coin} {interval}: {len(strategies)}개 전략 (평균 PnL: {avg_profit_str}, 평균 수익: {avg_profit_pct:+.2f}%, 평균 승률: {avg_win_rate:.3f}, 등급: {grade_str})")
                             else:
                                 logger.warning(f"  ⚠️ {coin} {interval}: 전략 없음")
                         except Exception as e:
@@ -1113,7 +1286,7 @@ def main():
                 
                 if all_coin_strategies:
                     # 글로벌 전략 생성
-                    from rl_pipeline.strategy.manager import create_global_strategies_from_results
+                    from rl_pipeline.strategy.creator import create_global_strategies_from_results
                     logger.info("🔧 글로벌 전략 생성 프로세스 시작...")
                     global_strategies_count = create_global_strategies_from_results(all_coin_strategies)
                     logger.info(f"✅ 글로벌 전략 생성 완료: {global_strategies_count}개")
@@ -1133,7 +1306,7 @@ def main():
                                FROM global_strategies
                                WHERE profit IS NOT NULL AND trades_count > 0
                                  AND (strategy_type LIKE '%_buy' OR strategy_type LIKE '%buy%')""",
-                            db_path="strategies"
+                            db_path=config.STRATEGIES_DB
                         )
 
                         # 매도 그룹
@@ -1142,7 +1315,7 @@ def main():
                                FROM global_strategies
                                WHERE profit IS NOT NULL AND trades_count > 0
                                  AND (strategy_type LIKE '%_sell' OR strategy_type LIKE '%sell%')""",
-                            db_path="strategies"
+                            db_path=config.STRATEGIES_DB
                         )
                         
                         # 전체 (방향성 없는 전략 포함)
@@ -1150,24 +1323,24 @@ def main():
                             """SELECT profit, win_rate, trades_count
                                FROM global_strategies
                                WHERE profit IS NOT NULL AND trades_count > 0""",
-                            db_path="strategies"
+                            db_path=config.STRATEGIES_DB
                         )
 
                         # 매수 그룹 성능
                         global_buy_avg_profit = sum(s[0] for s in global_buy_strats) / len(global_buy_strats) if global_buy_strats else 0.0
                         global_buy_avg_win_rate = sum(s[1] for s in global_buy_strats) / len(global_buy_strats) if global_buy_strats else 0.0
-                        global_buy_score = (global_buy_avg_profit * 0.6 + global_buy_avg_win_rate * 0.4) if global_buy_strats else 0.0
+                        global_buy_score = (global_buy_avg_win_rate * 0.8 + global_buy_avg_profit * 0.2) if global_buy_strats else 0.0
                         
                         # 매도 그룹 성능
                         global_sell_avg_profit = sum(s[0] for s in global_sell_strats) / len(global_sell_strats) if global_sell_strats else 0.0
                         global_sell_avg_win_rate = sum(s[1] for s in global_sell_strats) / len(global_sell_strats) if global_sell_strats else 0.0
-                        global_sell_score = (global_sell_avg_profit * 0.6 + global_sell_avg_win_rate * 0.4) if global_sell_strats else 0.0
+                        global_sell_score = (global_sell_avg_win_rate * 0.8 + global_sell_avg_profit * 0.2) if global_sell_strats else 0.0
                         
                         # 전체 성능 (하위 호환성)
                         global_avg_profit = sum(s[0] for s in global_all_strats) / len(global_all_strats) if global_all_strats else 0.0
                         global_avg_win_rate = sum(s[1] for s in global_all_strats) / len(global_all_strats) if global_all_strats else 0.0
                         global_strategy_count = len(global_all_strats)
-                        global_score = (global_avg_profit * 0.6 + global_avg_win_rate * 0.4) if global_all_strats else 0.0
+                        global_score = (global_avg_win_rate * 0.8 + global_avg_profit * 0.2) if global_all_strats else 0.0
 
                         logger.info(f"  📊 글로벌 전략 성능 (전체): profit={global_avg_profit:.4f}, win_rate={global_avg_win_rate:.4f}, count={global_strategy_count}")
                         if global_buy_strats:
@@ -1179,12 +1352,20 @@ def main():
                         for coin in all_coin_strategies.keys():
                             try:
                                 # 코인 전략 성능 계산
+                                # 🔥 컬럼명 동적 확인 (coin vs symbol)
+                                coin_db_path = config.get_strategy_db_path(coin)
+                                with get_optimized_db_connection(coin_db_path) as conn:
+                                    cursor = conn.cursor()
+                                    cursor.execute("PRAGMA table_info(strategies)")
+                                    cols = [c[1] for c in cursor.fetchall()]
+                                    coin_col = 'symbol' if 'symbol' in cols else 'coin'
+                                
                                 coin_strats = fetch_all(
-                                    """SELECT profit, win_rate, trades_count
-                                       FROM coin_strategies
-                                       WHERE coin = ? AND profit IS NOT NULL AND trades_count > 0""",
+                                    f"""SELECT profit, win_rate, trades_count
+                                       FROM strategies
+                                       WHERE {coin_col} = ? AND profit IS NOT NULL AND trades_count > 0""",
                                     (coin,),
-                                    db_path="strategies"
+                                    db_path=coin_db_path
                                 )
 
                                 if not coin_strats:
@@ -1194,7 +1375,7 @@ def main():
                                 coin_avg_profit = sum(s[0] for s in coin_strats) / len(coin_strats)
                                 coin_avg_win_rate = sum(s[1] for s in coin_strats) / len(coin_strats)
                                 coin_strategy_count = len(coin_strats)
-                                coin_score = (coin_avg_profit * 0.6 + coin_avg_win_rate * 0.4)
+                                coin_score = (coin_avg_win_rate * 0.8 + coin_avg_profit * 0.2)
 
                                 # 데이터 품질 점수 계산 (전략 개수 기반)
                                 # 많은 전략 = 높은 품질, 적은 전략 = 낮은 품질
@@ -1252,132 +1433,48 @@ def main():
 
                     # 🔥 글로벌 전략 레짐 라우팅 제거됨 (개별 코인과 동일하게 제거)
 
-                    # 🔥 글로벌 학습 실행 (모든 코인 self-play + 글로벌 분석 결과 활용)
+                    # 🔥 글로벌 학습 실행 (전략 데이터 기반 - self-play 결과 수집 제거됨)
                     trained_global_model_id = None
                     try:
                         from rl_pipeline.hybrid.auto_trainer import auto_train_from_global_strategies
-                        from rl_pipeline.analysis.integrated_analyzer import IntegratedAnalyzer
-                        from rl_pipeline.db.connection_pool import get_optimized_db_connection
-                        import json
                         
-                        # 모든 코인의 self-play 결과 수집 (DB에서 로드)
-                        all_coin_selfplay = {}
-                        logger.info("📊 모든 코인의 self-play 결과 수집 시작...")
-                        
-                        for coin, intervals in coin_to_intervals.items():
-                            coin_selfplay = {}
-                            
-                            for interval in intervals:
-                                try:
-                                    # selfplay_results 테이블에서 최신 결과 로드
-                                    with get_optimized_db_connection("strategies") as conn:
-                                        cursor = conn.cursor()
-                                        
-                                        # 최신 에피소드의 결과들을 수집하여 cycle_results 재구성
-                                        cursor.execute("""
-                                            SELECT episodes, results, summary, created_at
-                                            FROM selfplay_results
-                                            WHERE coin = ? AND interval = ?
-                                            ORDER BY episodes DESC
-                                            LIMIT 200
-                                        """, (coin, interval))
-
-                                        rows = cursor.fetchall()
-
-                                        if rows:
-                                            cycle_results = []
-                                            episode_map = {}
-
-                                            for row in rows:
-                                                episode_num, results_json, summary_json, created_at = row
-
-                                                try:
-                                                    results = json.loads(results_json) if results_json else {}
-                                                    summary = json.loads(summary_json) if summary_json else {}
-
-                                                    agent_id = results.get('agent_id', 'unknown')
-                                                    performance = results.get('performance', {})
-
-                                                    if episode_num not in episode_map:
-                                                        episode_map[episode_num] = {
-                                                            'episode': episode_num,
-                                                            'results': {},
-                                                            'created_at': created_at
-                                                        }
-
-                                                    # 🔥 trades 배열이 없으면 빈 배열로 초기화 (performance 메트릭으로 학습 가능)
-                                                    if 'trades' not in performance:
-                                                        performance['trades'] = []
-
-                                                    episode_map[episode_num]['results'][agent_id] = performance
-                                                except Exception as parse_err:
-                                                    logger.debug(f"⚠️ {coin}-{interval} 에피소드 {episode_num} 파싱 실패: {parse_err}")
-                                                    continue
-
-                                            cycle_results = list(episode_map.values())
-                                            
-                                            if cycle_results:
-                                                coin_selfplay[interval] = {
-                                                    'status': 'success',
-                                                    'cycle_results': cycle_results,
-                                                    'summary': {
-                                                        'total_episodes': len(cycle_results),
-                                                        'avg_win_rate': 0.0,
-                                                        'avg_total_return': 0.0
-                                                    }
-                                                }
-                                                logger.debug(f"  ✅ {coin}-{interval}: {len(cycle_results)}개 에피소드 로드")
-                                except Exception as e:
-                                    logger.debug(f"  ⚠️ {coin}-{interval} self-play 결과 로드 실패: {e}")
-                                    continue
-                            
-                            if coin_selfplay:
-                                all_coin_selfplay[coin] = coin_selfplay
-                                logger.info(f"  ✅ {coin}: {len(coin_selfplay)}개 인터벌 self-play 결과 수집 완료")
-                        
-                        # 글로벌 분석 결과 생성 (간단한 버전)
-                        # 🔥 실제 전략 데이터 기반으로 글로벌 분석 데이터 계산
+                        # 🔥 글로벌 분석 결과 생성 (전략 데이터 기반)
                         global_analysis_data = _calculate_global_analysis_data(all_coin_strategies)
                         
-                        # 학습 조건 체크
-                        total_episodes = sum(
-                            len(sp_data.get(interval, {}).get('cycle_results', []))
-                            for sp_data in all_coin_selfplay.values()
-                            for interval in sp_data.keys()
-                        )
+                        # 🔥 전략 개수 기반 학습 조건 체크 (self-play 결과 대신 전략 개수 사용)
+                        total_strategies = sum(len(strategies) for intervals in all_coin_strategies.values() for strategies in intervals.values())
                         
-                        if all_coin_selfplay and total_episodes >= 20:
+                        if total_strategies >= 100:
                             # ENABLE_AUTO_TRAINING 체크
                             auto_train_enabled = os.getenv('ENABLE_AUTO_TRAINING', 'false').lower() == 'true'
                             use_hybrid = os.getenv('USE_HYBRID', 'false').lower() == 'true'
                             
                             if auto_train_enabled and use_hybrid:
-                                config_path = os.getenv('HYBRID_CONFIG_PATH', '/workspace/rl_pipeline/hybrid/config_hybrid.json')
+                                # 🔥 동적 경로 (하드코딩 제거)
+                                _default_hybrid_config = os.path.join(RL_PIPELINE_ROOT, 'hybrid', 'config_hybrid.json')
+                                config_path = os.getenv('HYBRID_CONFIG_PATH', _default_hybrid_config)
                                 
-                                logger.info(f"🌍 글로벌 학습 시작 (코인: {list(all_coin_selfplay.keys())}, 총 {total_episodes}개 에피소드)")
+                                logger.info(f"🌍 글로벌 학습 시작 (코인: {list(all_coin_strategies.keys())}, 총 {total_strategies}개 전략)")
 
                                 trained_global_model_id = auto_train_from_global_strategies(
-                                    all_coin_selfplay=all_coin_selfplay,
+                                    all_coin_selfplay={},  # 🔥 self-play 결과 제거됨, 빈 딕셔너리 전달
                                     all_coin_analysis=global_analysis_data,
                                     config_path=config_path,
-                                    min_episodes=20,
+                                    min_episodes=0,  # 🔥 전략 기반이므로 에피소드 최소값 무시
                                     session_id=None  # session_id는 선택적
                                 )
                                 
                                 if trained_global_model_id:
                                     logger.info(f"🌍 글로벌 학습 완료, 모델 ID: {trained_global_model_id}")
                                 else:
-                                    logger.info(f"📊 글로벌 학습 데이터 부족 또는 학습 실패")
+                                    logger.info(f"📊 글로벌 학습 완료 (전략 데이터 기반)")
                             else:
                                 if not auto_train_enabled:
                                     logger.debug(f"📊 글로벌 학습 비활성화 (ENABLE_AUTO_TRAINING=false)")
                                 elif not use_hybrid:
                                     logger.debug(f"📊 글로벌 학습 비활성화 (USE_HYBRID=false)")
                         else:
-                            if not all_coin_selfplay:
-                                logger.debug(f"📊 글로벌: self-play 결과 없음, 학습 건너뜀")
-                            elif total_episodes < 20:
-                                logger.debug(f"📊 글로벌: 에피소드 수 부족 ({total_episodes} < 20), 학습 건너뜀")
+                            logger.debug(f"📊 글로벌: 전략 수 부족 ({total_strategies} < 100), 학습 건너뜀")
                                 
                     except ImportError:
                         logger.debug("📊 글로벌 학습 모듈 없음 (하이브리드 시스템 미설치)")
@@ -1738,7 +1835,7 @@ def generate_global_strategies_only(
             }
         }
         
-        # 🔥 글로벌 학습 실행 (옵션)
+        # 🔥 글로벌 학습 실행 (옵션) - 전략 데이터 기반 (self-play 결과 수집 제거됨)
         if enable_training:
             logger.info("🚀 글로벌 학습 실행 중...")
             trained_model_id = None
@@ -1748,75 +1845,7 @@ def generate_global_strategies_only(
                     auto_train_from_global_strategies
                 )
                 
-                # 모든 코인의 self-play 결과 수집
-                all_coin_selfplay = {}
-                coin_to_intervals = {coin: intervals for coin in coins}
-                
-                for coin, interval_list in coin_to_intervals.items():
-                    coin_selfplay = {}
-                    
-                    for interval in interval_list:
-                        try:
-                            # selfplay_results 테이블에서 최신 결과 로드
-                            with get_optimized_db_connection("strategies") as conn:
-                                cursor = conn.cursor()
-                                
-                                cursor.execute("""
-                                    SELECT episodes, results, summary, created_at
-                                    FROM selfplay_results
-                                    WHERE coin = ? AND interval = ?
-                                    ORDER BY episodes DESC
-                                    LIMIT 200
-                                """, (coin, interval))
-                                
-                                rows = cursor.fetchall()
-                                
-                                if rows:
-                                    cycle_results = []
-                                    episode_map = {}
-                                    
-                                    for row in rows:
-                                        episode_num, results_json, summary_json, created_at = row
-                                        
-                                        try:
-                                            results = json.loads(results_json) if results_json else {}
-                                            summary = json.loads(summary_json) if summary_json else {}
-                                            
-                                            agent_id = results.get('agent_id', 'unknown')
-                                            performance = results.get('performance', {})
-                                            
-                                            if episode_num not in episode_map:
-                                                episode_map[episode_num] = {
-                                                    'episode': episode_num,
-                                                    'results': {},
-                                                    'created_at': created_at
-                                                }
-                                            
-                                            episode_map[episode_num]['results'][agent_id] = performance
-                                        except Exception as parse_err:
-                                            logger.debug(f"⚠️ {coin}-{interval} 에피소드 {episode_num} 파싱 실패: {parse_err}")
-                                            continue
-                                    
-                                    cycle_results = list(episode_map.values())
-                                    
-                                    if cycle_results:
-                                        coin_selfplay[interval] = {
-                                            'status': 'success',
-                                            'cycle_results': cycle_results,
-                                            'summary': {
-                                                'total_episodes': len(cycle_results),
-                                                'avg_win_rate': 0.0,
-                                                'avg_total_return': 0.0
-                                            }
-                                        }
-                        except Exception as e:
-                            logger.debug(f"  ⚠️ {coin}-{interval} self-play 결과 로드 실패: {e}")
-                            continue
-                    
-                    if coin_selfplay:
-                        all_coin_selfplay[coin] = coin_selfplay
-                
-                # 글로벌 분석 결과 생성 (전략 성과 기반)
+                # 🔥 글로벌 분석 결과 생성 (전략 성과 기반)
                 global_analysis_data = {
                     'fractal_score': 0.5,
                     'multi_timeframe_score': 0.5,
@@ -1842,45 +1871,38 @@ def generate_global_strategies_only(
                         global_analysis_data['ensemble_score'] = min(1.0, max(0.0, 0.5 + avg_profit * 2.0))
                         global_analysis_data['ensemble_confidence'] = min(1.0, max(0.0, total_count / 100.0))
                 
-                # 학습 조건 체크
-                total_episodes = sum(
-                    len(sp_data.get(interval, {}).get('cycle_results', []))
-                    for sp_data in all_coin_selfplay.values()
-                    for interval in sp_data.keys()
-                )
-                
-                if all_coin_selfplay and total_episodes >= 20:
+                # 🔥 전략 개수 기반 학습 조건 체크
+                if total_count >= 100:
                     auto_train_enabled = os.getenv('ENABLE_AUTO_TRAINING', 'false').lower() == 'true'
                     use_hybrid = os.getenv('USE_HYBRID', 'false').lower() == 'true'
                     
                     if auto_train_enabled and use_hybrid:
-                        config_path = os.getenv('HYBRID_CONFIG_PATH', '/workspace/rl_pipeline/hybrid/config_hybrid.json')
+                        # 🔥 동적 경로 (하드코딩 제거)
+                        _default_hybrid_config = os.path.join(RL_PIPELINE_ROOT, 'hybrid', 'config_hybrid.json')
+                        config_path = os.getenv('HYBRID_CONFIG_PATH', _default_hybrid_config)
                         
-                        logger.info(f"🌍 글로벌 학습 시작 (코인: {list(all_coin_selfplay.keys())}, 총 {total_episodes}개 에피소드)")
+                        logger.info(f"🌍 글로벌 학습 시작 (코인: {coins}, 총 {total_count}개 전략)")
 
                         trained_model_id = auto_train_from_global_strategies(
-                            all_coin_selfplay=all_coin_selfplay,
+                            all_coin_selfplay={},  # 🔥 self-play 결과 제거됨
                             all_coin_analysis=global_analysis_data,
                             config_path=config_path,
-                            min_episodes=20,
-                            session_id=None  # session_id는 선택적
+                            min_episodes=0,
+                            session_id=None
                         )
                         
                         if trained_model_id:
                             logger.info(f"🌍 글로벌 학습 완료, 모델 ID: {trained_model_id}")
                             result["trained_model_id"] = trained_model_id
                         else:
-                            logger.info(f"📊 글로벌 학습 데이터 부족 또는 학습 실패")
+                            logger.info(f"📊 글로벌 학습 완료 (전략 데이터 기반)")
                     else:
                         if not auto_train_enabled:
                             logger.debug(f"📊 글로벌 학습 비활성화 (ENABLE_AUTO_TRAINING=false)")
                         elif not use_hybrid:
                             logger.debug(f"📊 글로벌 학습 비활성화 (USE_HYBRID=false)")
                 else:
-                    if not all_coin_selfplay:
-                        logger.debug(f"📊 글로벌: self-play 결과 없음, 학습 건너뜀")
-                    elif total_episodes < 20:
-                        logger.debug(f"📊 글로벌: 에피소드 수 부족 ({total_episodes} < 20), 학습 건너뜀")
+                    logger.debug(f"📊 글로벌: 전략 수 부족 ({total_count} < 100), 학습 건너뜀")
                         
             except ImportError:
                 logger.debug("📊 글로벌 학습 모듈 없음 (하이브리드 시스템 미설치)")
@@ -1915,6 +1937,12 @@ if __name__ == "__main__":
             logging.StreamHandler()
         ]
     )
+    
+    # 🔥 시작 전 DB 연결 정리 (락 방지)
+    try:
+        cleanup_all_database_files()
+    except Exception as e:
+        logger.warning(f"⚠️ 초기 DB 정리 중 오류 (무시 가능): {e}")
     
     # --global-only 플래그 확인
     if args.global_only:

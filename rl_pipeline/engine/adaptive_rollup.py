@@ -56,7 +56,10 @@ def calculate_adaptive_rollup_days(
     """
     try:
         if db_connection is None:
-            with get_optimized_db_connection("strategies") as conn:
+            # 🔥 코인별 DB 경로 사용
+            from rl_pipeline.core.env import config
+            db_path = config.get_strategy_db_path(coin)
+            with get_optimized_db_connection(db_path) as conn:
                 return _calculate_adaptive_rollup_days_impl(coin, interval, conn)
         else:
             return _calculate_adaptive_rollup_days_impl(coin, interval, db_connection)
@@ -143,7 +146,7 @@ def count_recent_episodes(
         cursor.execute("""
             SELECT COUNT(*) 
             FROM rl_episode_summary
-            WHERE coin = ? AND interval = ? AND ts_exit >= ?
+            WHERE symbol = ? AND interval = ? AND ts_exit >= ?
         """, (coin, interval, cutoff_ts))
         
         result = cursor.fetchone()
@@ -209,7 +212,10 @@ def create_adaptive_rollup_view(
         optimal_days = calculate_adaptive_rollup_days(coin, interval, db_connection)
         
         if db_connection is None:
-            with get_optimized_db_connection("strategies") as conn:
+            # 🔥 코인별 DB 경로 사용
+            from rl_pipeline.core.env import config
+            db_path = config.get_strategy_db_path(coin)
+            with get_optimized_db_connection(db_path) as conn:
                 return _create_adaptive_rollup_view_impl(coin, interval, optimal_days, conn)
         else:
             return _create_adaptive_rollup_view_impl(coin, interval, optimal_days, db_connection)
@@ -240,7 +246,7 @@ def _create_adaptive_rollup_view_impl(
         CREATE VIEW {view_name} AS
         SELECT *
         FROM rl_episode_summary
-        WHERE coin = '{coin}' 
+        WHERE symbol = '{coin}' 
           AND interval = '{interval}'
           AND ts_exit >= strftime('%s','now','-{optimal_days} days')
         """

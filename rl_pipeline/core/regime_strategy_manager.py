@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 MIN_STRATEGIES_PER_REGIME = 100
 MAX_STRATEGIES_PER_REGIME = 300
-DEFAULT_REGIME = "ranging"
+DEFAULT_REGIME = "neutral"  # 🔥 7개 레짐 체계에 맞춤
 
 
 # ============================================================================
@@ -46,13 +46,17 @@ def count_strategies_by_regime(coin: str, interval: str) -> Dict[str, int]:
         레짐별 전략 수 딕셔너리
     """
     try:
-        with get_optimized_db_connection("strategies") as conn:
+        # 🔥 코인별 DB 경로 사용
+        from rl_pipeline.core.env import config
+        coin_db_path = config.get_strategy_db_path(coin)
+        
+        with get_optimized_db_connection(coin_db_path) as conn:
             cursor = conn.cursor()
 
             cursor.execute("""
                 SELECT regime, COUNT(*) as count
-                FROM coin_strategies
-                WHERE coin = ? AND interval = ?
+                FROM strategies
+                WHERE symbol = ? AND interval = ?
                 GROUP BY regime
             """, (coin, interval))
 
@@ -85,12 +89,16 @@ def get_total_strategy_count(coin: str, interval: str) -> int:
         총 전략 수
     """
     try:
-        with get_optimized_db_connection("strategies") as conn:
+        # 🔥 코인별 DB 경로 사용
+        from rl_pipeline.core.env import config
+        coin_db_path = config.get_strategy_db_path(coin)
+        
+        with get_optimized_db_connection(coin_db_path) as conn:
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT COUNT(*) FROM coin_strategies
-                WHERE coin = ? AND interval = ?
+                SELECT COUNT(*) FROM strategies
+                WHERE symbol = ? AND interval = ?
             """, (coin, interval))
 
             return cursor.fetchone()[0]
@@ -182,13 +190,17 @@ def limit_strategies_per_regime(
         삭제된 전략 수
     """
     try:
-        with get_optimized_db_connection("strategies") as conn:
+        # 🔥 코인별 DB 경로 사용
+        from rl_pipeline.core.env import config
+        coin_db_path = config.get_strategy_db_path(coin)
+        
+        with get_optimized_db_connection(coin_db_path) as conn:
             cursor = conn.cursor()
 
             # 현재 전략 수 확인
             cursor.execute("""
-                SELECT COUNT(*) FROM coin_strategies
-                WHERE coin = ? AND interval = ? AND regime = ?
+                SELECT COUNT(*) FROM strategies
+                WHERE symbol = ? AND interval = ? AND regime = ?
             """, (coin, interval, regime))
 
             current_count = cursor.fetchone()[0]
@@ -209,10 +221,10 @@ def limit_strategies_per_regime(
                 # 등급 기반 삭제: F > D > C > UNKNOWN > B > A > S
                 # 같은 등급 내에서는 profit이 낮은 순서로 삭제
                 cursor.execute("""
-                    DELETE FROM coin_strategies
+                    DELETE FROM strategies
                     WHERE id IN (
-                        SELECT id FROM coin_strategies
-                        WHERE coin = ? AND interval = ? AND regime = ?
+                        SELECT id FROM strategies
+                        WHERE symbol = ? AND interval = ? AND regime = ?
                         ORDER BY
                             CASE quality_grade
                                 WHEN 'F' THEN 1
@@ -231,10 +243,10 @@ def limit_strategies_per_regime(
             else:
                 # 수익 기반 삭제 (기존 방식)
                 cursor.execute("""
-                    DELETE FROM coin_strategies
+                    DELETE FROM strategies
                     WHERE id IN (
-                        SELECT id FROM coin_strategies
-                        WHERE coin = ? AND interval = ? AND regime = ?
+                        SELECT id FROM strategies
+                        WHERE symbol = ? AND interval = ? AND regime = ?
                         ORDER BY profit ASC
                         LIMIT ?
                     )

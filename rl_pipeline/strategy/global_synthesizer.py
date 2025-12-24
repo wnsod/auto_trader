@@ -69,7 +69,7 @@ class GlobalStrategySynthesizer:
         max_dd: float = 0.6
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        개별 코인 전략 수집
+        개별 코인 전략 수집 (Directory Mode 지원)
         
         Args:
             coins: 특정 코인만 필터링 (None이면 전체)
@@ -83,62 +83,93 @@ class GlobalStrategySynthesizer:
             logger.info(f"📊 개별 전략 수집 시작 (min_trades={min_trades}, max_dd={max_dd})")
             
             pool = defaultdict(list)
+            import os
+            import glob
             
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                
-                # 코인 필터링 조건
-                where_conditions = []
-                params = []
-                
-                # 코인 필터
+            # Directory Mode인지 확인 (디렉토리이거나 확장자가 없는 경우 디렉토리로 간주)
+            is_directory_mode = os.path.isdir(self.db_path) or not self.db_path.endswith('.db')
+            
+            db_files = []
+            
+            if is_directory_mode:
+                if not os.path.exists(self.db_path):
+                    logger.warning(f"⚠️ 전략 DB 디렉토리가 존재하지 않습니다: {self.db_path}")
+                    return {}
+                    
+                # 코인 필터가 있으면 해당 코인 파일만 찾기
                 if coins:
-                    placeholders = ','.join(['?' for _ in coins])
-                    where_conditions.append(f"coin IN ({placeholders})")
-                    params.extend(coins)
-                
-                # 품질 등급 필터 완화 (UNKNOWN 포함)
-                # 초기 전략은 UNKNOWN 등급이 많으므로 모든 등급 허용
-                # where_conditions.append("quality_grade IN ('S', 'A', 'B', 'UNKNOWN')")
-                
-                # 성능 필터
-                where_conditions.append("trades_count >= ?")
-                params.append(min_trades)
-                
-                where_conditions.append("max_drawdown <= ?")
-                params.append(max_dd)
-                
-                query = f"""
-                    SELECT * FROM coin_strategies
-                    WHERE {' AND '.join(where_conditions)}
-                    ORDER BY 
-                        CASE quality_grade
-                            WHEN 'S' THEN 0
-                            WHEN 'A' THEN 1
-                            WHEN 'B' THEN 2
-                            ELSE 3
-                        END,
-                        profit DESC,
-                        win_rate DESC
-                """
-                
-                cursor.execute(query, params)
-                results = cursor.fetchall()
-                
-                logger.info(f"📊 수집된 전략: {len(results)}개")
-                
-                for row in results:
-                    strategy = dict(row)
-                    interval = strategy.get('interval', '15m')
-                    pool[interval].append(strategy)
-                
-                # 통계 출력
-                for interval, strategies in pool.items():
-                    logger.info(f"  ✅ {interval}: {len(strategies)}개 전략")
-                
-                logger.info(f"✅ 개별 전략 수집 완료: {sum(len(s) for s in pool.values())}개")
-                return dict(pool)
+                    for coin in coins:
+                        # 대소문자 무시 매칭을 위해 glob 사용보다는 직접 구성 시도
+                        # 하지만 파일시스템 대소문자 구분 여부에 따라 다를 수 있음
+                        # 여기선 소문자 변환하여 시도
+                        fpath = os.path.join(self.db_path, f"{coin.lower()}_strategies.db")
+                        if os.path.exists(fpath):
+                            db_files.append(fpath)
+                else:
+                    # 모든 *_strategies.db 파일 찾기
+                    db_files = glob.glob(os.path.join(self.db_path, "*_strategies.db"))
+            else:
+                # Single File Mode
+                if os.path.exists(self.db_path):
+                    db_files = [self.db_path]
+                else:
+                    logger.warning(f"⚠️ 전략 DB 파일이 존재하지 않습니다: {self.db_path}")
+                    return {}
+            
+            total_loaded = 0
+            
+            for db_file in db_files:
+                try:
+                    with sqlite3.connect(db_file) as conn:
+                        conn.row_factory = sqlite3.Row
+                        cursor = conn.cursor()
+                        
+                        # 쿼리 실행
+                        # 코인 필터는 파일 선택 단계에서 이미 적용되었거나(Directory Mode),
+                        # Single File Mode에서는 쿼리로 적용해야 함
+                        
+                        where_clauses = ["trades_count >= ?", "max_drawdown <= ?"]
+                        params = [min_trades, max_dd]
+                        
+                        if not is_directory_mode and coins:
+                            placeholders = ','.join(['?' for _ in coins])
+                            where_clauses.append(f"coin IN ({placeholders})")
+                            params.extend(coins)
+                        
+                        query = f"""
+                            SELECT * FROM strategies
+                            WHERE {' AND '.join(where_clauses)}
+                            ORDER BY 
+                                CASE quality_grade
+                                    WHEN 'S' THEN 0
+                                    WHEN 'A' THEN 1
+                                    WHEN 'B' THEN 2
+                                    ELSE 3
+                                END,
+                                profit DESC,
+                                win_rate DESC
+                        """
+                        
+                        cursor.execute(query, params)
+                        results = cursor.fetchall()
+                        
+                        for row in results:
+                            strategy = dict(row)
+                            interval = strategy.get('interval', '15m')
+                            pool[interval].append(strategy)
+                            total_loaded += 1
+                            
+                except Exception as db_err:
+                    # 개별 DB 로드 실패는 로그만 남기고 계속 진행
+                    # logger.debug(f"⚠️ DB 로드 실패 ({os.path.basename(db_file)}): {db_err}")
+                    pass
+            
+            # 통계 출력
+            for interval, strategies in pool.items():
+                logger.info(f"  ✅ {interval}: {len(strategies)}개 전략")
+            
+            logger.info(f"✅ 개별 전략 수집 완료: {total_loaded}개 (총 {len(db_files)}개 파일 스캔)")
+            return dict(pool)
                 
         except Exception as e:
             logger.error(f"❌ 개별 전략 수집 실패: {e}")
@@ -463,6 +494,13 @@ class GlobalStrategySynthesizer:
         """
         try:
             logger.info("💾 글로벌 전략 저장 시작")
+
+            # 🔥 테이블 존재 보장 (엔진화 대응)
+            try:
+                from rl_pipeline.db.schema import create_global_strategies_table
+                create_global_strategies_table()
+            except Exception as e:
+                logger.warning(f"⚠️ 테이블 생성 시도 중 오류 (무시 가능): {e}")
             
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()

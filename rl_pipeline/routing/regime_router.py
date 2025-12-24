@@ -674,7 +674,7 @@ class RegimeRouter:
                         AVG(regime_performance) as avg_performance,
                         COUNT(*) as test_count
                     FROM regime_routing_results
-                    WHERE coin = ? AND interval = ?
+                    WHERE symbol = ? AND interval = ?
                       AND created_at >= datetime('now', '-' || ? || ' days')
                     GROUP BY routed_strategy, regime
                     HAVING test_count >= 1
@@ -770,7 +770,7 @@ class RegimeRouter:
                         AVG(routing_score) as avg_score,
                         MAX(created_at) as last_seen
                     FROM regime_routing_results
-                    WHERE coin = ? AND interval = ?
+                    WHERE symbol = ? AND interval = ?
                       AND (routed_strategy LIKE ? OR routed_strategy LIKE ?)
                     GROUP BY regime
                     ORDER BY count DESC

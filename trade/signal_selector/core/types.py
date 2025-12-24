@@ -77,4 +77,6 @@ class SignalInfo:
     coin_tuned: bool = False
     walk_forward_performance: Optional[Dict[str, float]] = field(default=None)
     regime_coverage: Optional[Dict[str, float]] = field(default=None)
+    target_price: float = 0.0  # 🆕 예상 목표가 (AI/기술적 분석 기반)
+    source_type: str = 'quant' # 🆕 시그널 출처 (quant, ai, hybrid)
 

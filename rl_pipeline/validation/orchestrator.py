@@ -36,9 +36,9 @@ class ValidationOrchestrator:
         if db_connections is None:
             base_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data_storage')
             db_connections = {
-                'strategies': os.path.join(base_path, 'rl_strategies.db'),
-                # learning_results는 이제 rl_strategies.db로 통합됨
-                'learning_results': os.path.join(base_path, 'rl_strategies.db')
+                'strategies': os.path.join(base_path, 'learning_strategies.db'),
+                # learning_results는 이제 learning_strategies.db로 통합됨
+                'learning_results': os.path.join(base_path, 'learning_strategies.db')
             }
 
         self.db_connections = db_connections

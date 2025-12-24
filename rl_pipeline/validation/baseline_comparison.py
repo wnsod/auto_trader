@@ -17,7 +17,7 @@ def compare_with_baseline(
     coin: str,
     interval: str,
     test_period_days: int = 30,
-    db_path: str = "data_storage/rl_strategies.db",
+    db_path: str = "data_storage/learning_strategies.db",
     candles_db_path: str = "data_storage/rl_candles.db"
 ) -> Dict:
     """현재 전략 vs 베이스라인 전략 비교"""
@@ -98,7 +98,7 @@ def calculate_buy_hold_return(
         query = """
             SELECT timestamp, close
             FROM candles
-            WHERE coin = ? AND interval = ?
+            WHERE symbol = ? AND interval = ?
             ORDER BY timestamp DESC
             LIMIT ?
         """
@@ -129,7 +129,7 @@ def calculate_buy_hold_return(
 def calculate_current_strategy_avg(
     coin: str,
     interval: str,
-    db_path: str = "data_storage/rl_strategies.db"
+    db_path: str = "data_storage/learning_strategies.db"
 ) -> Optional[float]:
     """현재 전략 평균 수익률"""
     
@@ -138,8 +138,8 @@ def calculate_current_strategy_avg(
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT AVG(profit) FROM coin_strategies
-            WHERE coin = ? AND interval = ?
+            SELECT AVG(profit) FROM strategies
+            WHERE symbol = ? AND interval = ?
             AND profit IS NOT NULL
         """, (coin, interval))
         

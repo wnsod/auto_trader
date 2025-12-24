@@ -32,7 +32,7 @@ class DatabaseConnectionPool:
     
     def _initialize_pool(self):
         """연결 풀 초기화 - 최적화된 연결 수"""
-        logger.info(f"🔧 데이터베이스 연결 풀 초기화 중... ({self.db_path})")
+        logger.debug(f"🔧 데이터베이스 연결 풀 초기화 중... ({self.db_path})")
         
         # 동적 연결 풀 크기: 최소 5개, 최대의 절반, 최대값 이하
         initial_connections = min(
@@ -78,13 +78,13 @@ class DatabaseConnectionPool:
             else:
                 # 락 문제 해결을 위한 최적화 설정 (WAL 모드)
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA synchronous=FULL")
             
             # 공통 최적화 설정
             conn.execute("PRAGMA cache_size=10000")
             conn.execute("PRAGMA temp_store=MEMORY")
             conn.execute("PRAGMA mmap_size=268435456")  # 256MB
-            conn.execute("PRAGMA busy_timeout=10000")  # 10초 대기 (최적화: 60초 → 10초)
+            conn.execute("PRAGMA busy_timeout=120000")  # 120초 대기 (최적화: 60초 → 120초)
             conn.execute("PRAGMA optimize")
             if not is_candles_db:
                 conn.execute("PRAGMA wal_autocheckpoint=1000")  # WAL 체크포인트 자동화 (캔들 DB 제외)
@@ -134,11 +134,11 @@ class DatabaseConnectionPool:
             # 연결 풀이 가득 찬 경우 대기
             logger.warning(f"⚠️ 연결 풀 가득 참, 대기 중... (활성: {self.active_connections})")
             try:
-                conn = self.connections.get(timeout=30.0)  # 30초 대기
+                conn = self.connections.get(timeout=60.0)  # 60초 대기
                 logger.debug(f"⏳ 대기 후 연결 획득 (남은 연결: {self.connections.qsize()})")
                 return conn
             except Empty:
-                raise DBReadError("연결 풀에서 연결을 가져올 수 없습니다 (30초 타임아웃)")
+                raise DBReadError("연결 풀에서 연결을 가져올 수 없습니다 (60초 타임아웃)")
     
     def _return_connection(self, conn: sqlite3.Connection):
         """연결을 풀로 반환"""
@@ -289,18 +289,8 @@ class BatchLoadingConnectionPool:
                         logger.info(f"✅ 배치 DB 디렉토리 생성 완료: {db_dir}")
                     except Exception as dir_err:
                         logger.warning(f"⚠️ 배치 DB 디렉토리 생성 실패: {db_dir} - {dir_err}")
-                        # 폴백: RL_PIPELINE_ROOT 하위에 생성 시도
-                        try:
-                            from rl_pipeline.core.env import config as _cfg
-                            fallback_dir = _cfg.RL_PIPELINE_ROOT
-                            fallback_path = os.path.join(fallback_dir, os.path.basename(self.db_path))
-                            logger.info(f"🔄 폴백 경로로 시도: {fallback_path}")
-                            self.db_path = fallback_path
-                            db_dir = os.path.dirname(fallback_path)
-                            if db_dir and not os.path.exists(db_dir):
-                                os.makedirs(db_dir, exist_ok=True)
-                        except Exception as fallback_err:
-                            logger.debug(f"⚠️ 폴백 경로도 실패: {fallback_err}")
+                        # 폴백 로직 제거: 상위 호출자(get_batch_loading_pool)에서 이미 올바른 경로를 보장해야 함
+                        raise
             
             conn = sqlite3.connect(
                 self.db_path,
@@ -310,11 +300,11 @@ class BatchLoadingConnectionPool:
             
             # 배치 로딩용 성능 최적화 설정 + 락 문제 해결
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")  # 안정성을 위해 NORMAL로 변경
+            conn.execute("PRAGMA synchronous=FULL")  # 안정성을 위해 NORMAL로 변경
             conn.execute("PRAGMA cache_size=50000")  # 더 큰 캐시
             conn.execute("PRAGMA temp_store=MEMORY")
             conn.execute("PRAGMA mmap_size=536870912")  # 512MB
-            conn.execute("PRAGMA busy_timeout=60000")  # 60초 대기 (개선: 30초 → 60초)
+            conn.execute("PRAGMA busy_timeout=120000")  # 120초 대기 (개선: 60초 → 120초)
             conn.execute("PRAGMA wal_autocheckpoint=1000")  # WAL 체크포인트 자동화
             conn.execute("PRAGMA optimize")
             
@@ -479,6 +469,20 @@ _candle_pool: Optional[DatabaseConnectionPool] = None
 _strategy_pool: Optional[DatabaseConnectionPool] = None
 _learning_results_pool: Optional[DatabaseConnectionPool] = None
 _batch_pool: Optional[BatchLoadingConnectionPool] = None
+# 🔥 코인별 전략 DB 연결 풀 캐싱 (메모리 누수 방지 및 재사용)
+_strategy_pools: Dict[str, DatabaseConnectionPool] = {}
+
+def close_and_remove_strategy_pool(db_path: str):
+    """특정 전략 DB 풀을 닫고 전역 캐시에서 제거 (리소스 누수 방지)"""
+    global _strategy_pools
+    if db_path in _strategy_pools:
+        try:
+            pool = _strategy_pools[db_path]
+            pool.close_all_connections()
+            del _strategy_pools[db_path]
+            # logger.debug(f"🗑️ 전략 DB 풀 메모리 해제 완료: {db_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ 전략 DB 풀 제거 실패: {e}")
 
 def get_candle_db_pool() -> DatabaseConnectionPool:
     """캔들 데이터베이스 연결 풀 반환"""
@@ -487,47 +491,67 @@ def get_candle_db_pool() -> DatabaseConnectionPool:
         _candle_pool = DatabaseConnectionPool(config.RL_DB)
     return _candle_pool
 
-def get_strategy_db_pool() -> DatabaseConnectionPool:
+def get_strategy_db_pool(db_path: str = None) -> DatabaseConnectionPool:
     """전략 데이터베이스 연결 풀 반환"""
-    global _strategy_pool
-    if _strategy_pool is None:
-        # 전략 DB 파일이 없으면 자동으로 생성 (SQLite가 생성하도록 위임) + 실패 시 폴백 경로 사용
+    global _strategy_pool, _strategy_pools
+    
+    # db_path가 명시적으로 주어지면(예: 코인별 DB) 새로운 풀 사용 (또는 캐싱된 풀)
+    if db_path:
+        if db_path in _strategy_pools:
+            return _strategy_pools[db_path]
+            
+        # 캐싱되지 않은 경우 새로 생성
+        
+        # 해당 DB 파일이 없으면 생성
         import os, sqlite3
-        primary_path = config.STRATEGIES_DB
-        candidate_paths = [primary_path]
-        # 폴백 경로: RL_PIPELINE_ROOT 하위 (일반적으로 쓰기 가능)
         try:
-            from rl_pipeline.core.env import config as _cfg
-            fallback_path = os.path.join(_cfg.RL_PIPELINE_ROOT, 'rl_strategies.db')
-            if fallback_path not in candidate_paths:
-                candidate_paths.append(fallback_path)
-        except Exception:
-            candidate_paths.append('/workspace/rl_pipeline/rl_strategies.db')
-
-        last_error = None
-        chosen_path = None
-        for db_path in candidate_paths:
-            try:
-                db_dir = os.path.dirname(db_path)
-                if db_dir and not os.path.exists(db_dir):
-                    os.makedirs(db_dir, exist_ok=True)
-                    logger.info(f"✅ 전략 DB 디렉토리 생성 완료: {db_dir}")
-                logger.info(f"🔧 전략 DB 준비: {db_path}")
+            db_dir = os.path.dirname(db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+                logger.info(f"✅ 코인별 전략 DB 디렉토리 생성 완료: {db_dir}")
+            
+            if not os.path.exists(db_path):
+                logger.info(f"🔧 코인별 전략 DB 준비: {db_path}")
                 conn = sqlite3.connect(db_path)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.close()
-                chosen_path = db_path
-                break
-            except Exception as e:
-                last_error = e
-                # 🔧 폴백 경로 시도 중이므로 경고로 처리 (치명적 에러 아님)
-                logger.debug(f"⚠️ 전략 DB 준비 시도 (폴백 경로로 계속 시도): {db_path} - {e}")
-                continue
+        except Exception as e:
+            logger.error(f"❌ 코인별 전략 DB 준비 실패: {db_path} - {e}")
+            raise DBReadError(f"전략 DB를 준비할 수 없습니다: {e}")
+            
+        # 풀 생성 및 캐싱
+        pool = DatabaseConnectionPool(db_path)
+        _strategy_pools[db_path] = pool
+        return pool
 
-        if not chosen_path:
-            raise DBReadError(f"전략 DB를 준비할 수 없습니다: {last_error}")
+    if _strategy_pool is None:
+        # 🔥 config.STRATEGIES_DB는 이제 동적 속성이므로 항상 최신 환경변수를 반영함
+        # 따라서 복잡한 폴백 로직 없이 config를 신뢰하면 됨
+        db_path = config.STRATEGIES_DB
+        
+        # 디렉토리인 경우 기본 파일명 사용 (common_strategies.db)
+        import os
+        if os.path.isdir(db_path) or not db_path.endswith('.db'):
+            db_path = os.path.join(db_path, 'common_strategies.db')
+        
+        import sqlite3
+        try:
+            db_dir = os.path.dirname(db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+                logger.info(f"✅ 전략 DB 디렉토리 생성 완료: {db_dir}")
+            
+            logger.info(f"🔧 전략 DB 준비: {db_path}")
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.close()
+            
+            _strategy_pool = DatabaseConnectionPool(db_path)
+            
+        except Exception as e:
+            logger.error(f"❌ 전략 DB 준비 실패: {db_path} - {e}")
+            raise DBReadError(f"전략 DB를 준비할 수 없습니다: {e}")
 
-        _strategy_pool = DatabaseConnectionPool(chosen_path)
     return _strategy_pool
 
 def get_learning_results_db_pool() -> DatabaseConnectionPool:
@@ -559,31 +583,37 @@ def get_learning_results_db_pool() -> DatabaseConnectionPool:
 def get_batch_loading_pool(db_path: str = None) -> BatchLoadingConnectionPool:
     """배치 로딩 연결 풀 반환"""
     global _batch_pool
-    if _batch_pool is None:
-        db_path = db_path or config.RL_DB
-        
-        # 🔧 DB 경로 폴백 처리 (디렉토리 생성 실패 시)
+    
+    # db_path가 명시적으로 주어지면 해당 경로 사용
+    target_path = db_path or config.RL_DB
+    
+    import os
+    # 경로가 디렉토리인 경우, 적절한 파일명 붙여줌 (배치 로딩은 보통 단일 파일 대상)
+    if os.path.isdir(target_path):
+        # strategies 디렉토리인 경우 common_strategies.db를 기본값으로
+        if 'strategies' in target_path:
+            target_path = os.path.join(target_path, 'common_strategies.db')
+        else:
+            # 기타 디렉토리인 경우 에러 또는 기본 파일명
+            logger.warning(f"⚠️ 배치 로딩 경로가 디렉토리입니다: {target_path}. 'common.db'를 기본값으로 사용합니다.")
+            target_path = os.path.join(target_path, 'common.db')
+
+    if _batch_pool is None or (db_path and _batch_pool.db_path != target_path):
+        # 🔧 DB 디렉토리 확인 및 생성
         try:
-            import os
-            db_dir = os.path.dirname(db_path)
+            db_dir = os.path.dirname(target_path)
             if db_dir and not os.path.exists(db_dir):
-                try:
-                    os.makedirs(db_dir, exist_ok=True)
-                except Exception as dir_err:
-                    logger.debug(f"⚠️ 배치 DB 디렉토리 생성 실패, 폴백 경로 사용: {db_dir} - {dir_err}")
-                    # 폴백: RL_PIPELINE_ROOT 하위에 생성
-                    try:
-                        from rl_pipeline.core.env import config as _cfg
-                        fallback_path = os.path.join(_cfg.RL_PIPELINE_ROOT, os.path.basename(db_path))
-                        logger.info(f"🔄 배치 DB 폴백 경로: {fallback_path}")
-                        db_path = fallback_path
-                    except Exception:
-                        logger.warning(f"⚠️ 폴백 경로도 실패, 원래 경로 사용")
+                os.makedirs(db_dir, exist_ok=True)
         except Exception as e:
-            # 전체 폴백 처리 실패 시 원래 경로 사용
-            logger.debug(f"⚠️ 배치 DB 경로 처리 중 오류 (원래 경로 사용): {e}")
+            logger.error(f"❌ 배치 DB 디렉토리 생성 실패: {target_path} - {e}")
+            raise DBWriteError(f"배치 DB 경로를 준비할 수 없습니다: {e}")
+
+        # 새 풀 생성 (이전 풀이 있다면 닫아야 함 - 여기서는 생략하지만 주의 필요)
+        if _batch_pool:
+            _batch_pool.close_all_connections()
+            
+        _batch_pool = BatchLoadingConnectionPool(target_path)
         
-        _batch_pool = BatchLoadingConnectionPool(db_path)
     return _batch_pool
 
 def close_all_pools():
@@ -606,7 +636,7 @@ def close_all_pools():
         _batch_pool.close_all_connections()
         _batch_pool = None
 
-def close_all_connections():
+def close_all_connections(verbose: bool = False):
     """
     모든 활성 데이터베이스 연결을 종료합니다.
     인터벌 처리 사이 또는 에러 발생 시 사용.
@@ -614,19 +644,21 @@ def close_all_connections():
     이 함수는 모든 연결 풀의 연결을 종료하여 잠금을 해제합니다.
     """
     try:
-        logger.info("🔧 모든 데이터베이스 연결 종료 중...")
+        if verbose:
+            logger.info("🔧 모든 데이터베이스 연결 종료 중...")
 
         # 모든 연결 풀의 연결 종료
         if _strategy_pool:
-            _strategy_pool.close_all_connections()
+            _strategy_pool.close_all_connections(verbose=verbose)
         if _learning_results_pool:
-            _learning_results_pool.close_all_connections()
+            _learning_results_pool.close_all_connections(verbose=verbose)
         if _candle_pool:
-            _candle_pool.close_all_connections()
+            _candle_pool.close_all_connections(verbose=verbose)
         if _batch_pool:
-            _batch_pool.close_all_connections()
+            _batch_pool.close_all_connections(verbose=verbose)
 
-        logger.info("✅ 모든 데이터베이스 연결 종료 완료")
+        if verbose:
+            logger.info("✅ 모든 데이터베이스 연결 종료 완료")
         return True
     except Exception as e:
         logger.warning(f"⚠️ 연결 종료 중 오류 (무시 가능): {e}")
@@ -816,8 +848,6 @@ def auto_validate_pipeline_step(step_name: str, results: Any) -> Dict[str, Any]:
         logger.error(f"❌ {step_name} 자동 검증 실패: {e}")
         return {'overall_status': 'FAIL', 'issues_found': [f'Validation error: {e}']}
 
-logger.info("✅ 모든 데이터베이스 연결 풀이 종료되었습니다")
-
 def cleanup_all_database_files():
     """모든 데이터베이스 임시 파일 정리"""
     logger.info("🧹 모든 데이터베이스 임시 파일 정리 시작...")
@@ -839,19 +869,81 @@ def cleanup_all_database_files():
     except Exception as e:
         logger.error(f"❌ 데이터베이스 파일 정리 실패: {e}")
 
+def repair_corrupted_db(db_path: str):
+    """🚑 손상된 DB 자동 복구 시도"""
+    try:
+        logger.warning(f"🚑 DB 손상 감지! 자동 복구 시도 중... ({db_path})")
+        import os
+        
+        # 1. 연결 풀에서 해당 DB의 연결 강제 종료
+        if db_path in _strategy_pools:
+            _strategy_pools[db_path].close_all_connections()
+        elif db_path == config.STRATEGIES_DB or 'strategies' in db_path:
+            if _strategy_pool:
+                _strategy_pool.close_all_connections()
+        
+        # 2. WAL/SHM 파일 강제 삭제
+        wal_path = f"{db_path}-wal"
+        shm_path = f"{db_path}-shm"
+        
+        if os.path.exists(wal_path):
+            try:
+                os.remove(wal_path)
+                logger.info(f"✅ 손상된 WAL 파일 삭제 완료: {wal_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ WAL 파일 삭제 실패: {e}")
+
+        if os.path.exists(shm_path):
+            try:
+                os.remove(shm_path)
+                logger.info(f"✅ 손상된 SHM 파일 삭제 완료: {shm_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ SHM 파일 삭제 실패: {e}")
+                
+        # 3. VACUUM 시도
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute("VACUUM")
+            conn.close()
+            logger.info(f"✅ DB VACUUM 복구 성공: {db_path}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ DB VACUUM 복구 실패: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ DB 복구 프로세스 실패: {e}")
+        return False
+
 @contextmanager
 def get_optimized_db_connection(db_path: str, write_only: bool = False):
     """최적화된 데이터베이스 연결 컨텍스트 매니저 - 트랜잭션 안전"""
     # db_path에 따라 적절한 풀 선택 - 더 정확한 매칭
-    if db_path == config.STRATEGIES_DB or 'strategies' in db_path.lower():
-        pool = get_strategy_db_pool()
-    elif db_path == config.LEARNING_RESULTS_DB_PATH or 'learning_results' in db_path.lower():
+    
+    # 🔥 코인별 DB 파일인 경우 (직접 경로가 넘어온 경우)
+    # config.STRATEGIES_DB가 디렉토리일 수 있으므로 포함 관계 확인
+    strategies_root = config.STRATEGIES_DB
+    is_strategy_db = False
+    
+    if db_path == strategies_root:
+        is_strategy_db = True
+    elif 'strategies' in db_path.lower() and (strategies_root in db_path or 'learning_strategies' in db_path):
+        is_strategy_db = True
+        
+    if is_strategy_db:
+        # db_path를 인자로 넘겨서 코인별 풀(또는 새 연결)을 가져옴
+        pool = get_strategy_db_pool(db_path)
+    elif db_path == config.LEARNING_RESULTS_DB_PATH or 'learning_results' in db_path.lower() or 'common_strategies' in db_path.lower():
+        # 학습 결과 DB (또는 공용 전략 DB) 풀 사용
         pool = get_learning_results_db_pool()
+    elif db_path == "strategies":
+        # 🔥 "strategies" 문자열이 직접 넘어온 경우 (레거시 호환성) - 전략 DB 풀 사용
+        pool = get_strategy_db_pool()
     else:
         pool = get_candle_db_pool()
 
     with pool.get_connection() as conn:
         # 트랜잭션 내에서 안전한 기본 설정만 적용
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=60000")  # 60초 대기 (개선: 30초 → 60초)
+        # WAL 모드는 연결 생성 시 이미 설정되므로 중복 설정 제거 (락 방지)
+        conn.execute("PRAGMA busy_timeout=60000")  # 60초 대기
         yield conn

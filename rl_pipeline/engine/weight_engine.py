@@ -238,10 +238,10 @@ def _get_strategy_weight_from_db(
             acc_adaptive = grade_result[0] if grade_result[0] is not None else 0.5
             grade_score = grade_result[1] if grade_result[1] is not None else 0.5
         else:
-            # strategy_grades에 없으면 coin_strategies에서 조회
+            # strategy_grades에 없으면 strategies에서 조회
             cursor.execute("""
                 SELECT quality_grade, score
-                FROM coin_strategies
+                FROM strategies
                 WHERE id = ? AND coin = ? AND interval = ?
             """, (strategy_id, coin, interval))
             
@@ -260,7 +260,7 @@ def _get_strategy_weight_from_db(
         cursor.execute("""
             SELECT predicted_conf
             FROM realtime_predictions
-            WHERE coin = ? AND interval = ?
+            WHERE symbol = ? AND interval = ?
             ORDER BY ts DESC
             LIMIT 1
         """, (coin, interval))

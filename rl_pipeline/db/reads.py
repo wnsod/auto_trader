@@ -1,5 +1,10 @@
 """
 데이터베이스 읽기 전용 커넥션 및 표준 조회 헬퍼
+
+핵심 설계:
+- 테이블명 매핑 (strategies → strategies)
+- coin → symbol 매핑 (호환성 뷰 사용)
+- market_type, market 필터 지원
 """
 
 import json
@@ -8,11 +13,26 @@ import sqlite3
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 from contextlib import contextmanager
-from rl_pipeline.db.connection_pool import get_candle_db_pool, get_strategy_db_pool
+from rl_pipeline.db.connection_pool import get_candle_db_pool, get_strategy_db_pool, repair_corrupted_db
 from rl_pipeline.core.errors import DBReadError
 from rl_pipeline.core.utils import safe_json_loads
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 상수 정의
+# ============================================================================
+
+DEFAULT_MARKET_TYPE = "COIN"
+DEFAULT_MARKET = "BITHUMB"
+
+# 테이블명 매핑
+TABLE_MAPPING = {
+    'strategies': 'strategies',
+    'rl_strategy_rollup': 'strategy_performance_rl',
+    'coin_analysis_ratios': 'analysis_ratios',
+    'coin_global_weights': 'symbol_global_weights'
+}
 
 def _select_pool_by_query(db_path: str, query: str):
     """쿼리/명시 경로 기준으로 적절한 풀 선택"""
@@ -20,7 +40,19 @@ def _select_pool_by_query(db_path: str, query: str):
         return get_candle_db_pool() if 'candles' in db_path else get_strategy_db_pool()
     # 쿼리 기반 휴리스틱: 전략 테이블 키워드가 있으면 전략 DB
     q = (query or '').lower()
-    strategy_markers = ['coin_strategies', 'strategy_dna', 'fractal_analysis', 'synergy_analysis', 'runs', 'replay_results', 'simulation_results', 'dna_analysis', 'global_strategies', 'performance_monitoring']
+    # 테이블명
+    strategy_markers = [
+        # 핵심 테이블
+        'strategies', 'strategy_performance_rl', 'strategy_grades',
+        'rl_episodes', 'rl_episode_summary', 'rl_steps', 'rl_state_ensemble',
+        'global_strategies', 'analysis_ratios', 'symbol_global_weights',
+        'runs', 'run_records', 'pipeline_execution_logs',
+        'policy_models', 'evaluation_results', 'strategy_training_history',
+        'integrated_analysis_results',
+        # 호환성 뷰
+        'strategies', 'strategy_dna', 'fractal_analysis', 'synergy_analysis',
+        'coin_analysis_ratios', 'coin_global_weights', 'rl_strategy_rollup'
+    ]
     if any(marker in q for marker in strategy_markers):
         return get_strategy_db_pool()
     return get_candle_db_pool()
@@ -89,62 +121,101 @@ def fetch_all(query: str, params: Tuple = (), db_path: str = None) -> List[Tuple
         raise DBReadError(f"모든 행 조회 실패: {e}") from e
 
 def get_candle_data(coin: str, interval: str, days: int = 30, limit: int = None) -> pd.DataFrame:
-    """캔들 데이터 조회"""
-    query = """
-    SELECT * FROM candles 
-    WHERE coin = ? AND interval = ? 
-    ORDER BY timestamp DESC
-    """
-    params = (coin, interval)
-    
-    if limit:
-        query += f" LIMIT {limit}"
-    else:
-        query += f" LIMIT {days * 24 * 4}"  # 15분 간격 기준
-    
-    return fetch_df(query, params)
+    """캔들 데이터 조회 (symbol/coin 컬럼 자동 감지)"""
+    try:
+        # DB 풀 선택 (candles 테이블이므로 candle_db_pool)
+        pool = get_candle_db_pool()
+        
+        with pool.get_connection() as conn:
+            cursor = conn.cursor()
+            # 컬럼 확인
+            cursor.execute("PRAGMA table_info(candles)")
+            columns = [info[1] for info in cursor.fetchall()]
+            
+            target_col = 'symbol' if 'symbol' in columns else 'coin'
+            
+            query = f"""
+            SELECT * FROM candles 
+            WHERE {target_col} = ? AND interval = ? 
+            ORDER BY timestamp DESC
+            """
+            
+            params = (coin, interval)
+            
+            if limit:
+                query += f" LIMIT {limit}"
+            else:
+                query += f" LIMIT {days * 24 * 4}"
+            
+            df = pd.read_sql_query(query, conn, params=params)
+            logger.debug(f"✅ 캔들 데이터 조회 완료 ({target_col}={coin}): {len(df)}행")
+            return df
+            
+    except Exception as e:
+        logger.error(f"❌ 캔들 데이터 조회 실패: {e}")
+        raise DBReadError(f"캔들 데이터 조회 실패: {e}") from e
 
-def get_strategy_data(coin: str = None, interval: str = None, limit: int = None) -> pd.DataFrame:
-    """전략 데이터 조회"""
-    query = "SELECT * FROM coin_strategies WHERE 1=1"
+def get_strategy_data(coin: str = None, interval: str = None, limit: int = None,
+                     market_type: str = DEFAULT_MARKET_TYPE,
+                     market: str = DEFAULT_MARKET) -> pd.DataFrame:
+    """전략 데이터 조회 (coin → symbol 매핑)"""
+    # coin → symbol
+    symbol = coin
+
+    query = "SELECT *, symbol AS coin FROM strategies WHERE 1=1"
     params = []
-    
-    if coin:
-        query += " AND coin = ?"
-        params.append(coin)
-    
+
+    # market_type, market 필터
+    query += " AND market_type = ? AND market = ?"
+    params.extend([market_type, market])
+
+    if symbol:
+        query += " AND symbol = ?"
+        params.append(symbol)
+
     if interval:
         query += " AND interval = ?"
         params.append(interval)
-    
+
     query += " ORDER BY created_at DESC"
-    
+
     if limit:
         query += f" LIMIT {limit}"
-    
+
     return fetch_df(query, tuple(params), db_path="strategies")
 
-def get_top_strategies(coin: str, interval: str, limit: int = 100, min_trades: int = 10) -> pd.DataFrame:
-    """상위 전략 조회"""
+def get_top_strategies(coin: str, interval: str, limit: int = 100, min_trades: int = 10,
+                      market_type: str = DEFAULT_MARKET_TYPE,
+                      market: str = DEFAULT_MARKET) -> pd.DataFrame:
+    """상위 전략 조회 (coin → symbol 매핑)"""
+    # coin → symbol
+    symbol = coin
+
     query = """
-    SELECT * FROM coin_strategies 
-    WHERE coin = ? AND interval = ? AND trades_count >= ?
+    SELECT *, symbol AS coin FROM strategies
+    WHERE market_type = ? AND market = ? AND symbol = ? AND interval = ? AND trades_count >= ?
     ORDER BY profit DESC, win_rate DESC
     LIMIT ?
     """
-    params = (coin, interval, min_trades, limit)
-    
+    params = (market_type, market, symbol, interval, min_trades, limit)
+
     return fetch_df(query, params, db_path="strategies")
 
 def get_strategy_by_id(strategy_id: str) -> Optional[Dict[str, Any]]:
     """ID로 전략 조회"""
-    query = "SELECT * FROM coin_strategies WHERE id = ?"
+    query = "SELECT *, symbol AS coin FROM strategies WHERE id = ?"
     result = fetch_one(query, (strategy_id,), db_path="strategies")
-    
+
     if result:
-        columns = [desc[0] for desc in fetch_one("PRAGMA table_info(coin_strategies)", db_path="strategies")]
+        # 테이블 컬럼 정보 조회
+        pool = get_strategy_db_pool()
+        with pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(strategies)")
+            table_info = cursor.fetchall()
+            columns = [col[1] for col in table_info] + ['coin']  # coin 별칭 추가
         return dict(zip(columns, result))
-    
+
     return None
 
 def get_dna_data(coin: str = None, limit: int = 100) -> pd.DataFrame:
@@ -236,8 +307,8 @@ def load_strategies_by_grade(coin: str, interval: str, grade: str, limit: int = 
         # grade가 None인 경우 등급이 없는 전략들 조회
         if grade is None:
             query = """
-            SELECT * FROM coin_strategies 
-            WHERE coin = ? AND interval = ? AND quality_grade IS NULL
+            SELECT * FROM strategies 
+            WHERE symbol = ? AND interval = ? AND quality_grade IS NULL
             ORDER BY created_at DESC, profit DESC, win_rate DESC
             LIMIT ? OFFSET ?
             """
@@ -245,8 +316,8 @@ def load_strategies_by_grade(coin: str, interval: str, grade: str, limit: int = 
         else:
             # quality_grade 컬럼을 사용하여 조회
             query = """
-            SELECT * FROM coin_strategies 
-            WHERE coin = ? AND interval = ? AND quality_grade = ?
+            SELECT * FROM strategies 
+            WHERE symbol = ? AND interval = ? AND quality_grade = ?
             ORDER BY profit DESC, win_rate DESC
             LIMIT ? OFFSET ?
             """
@@ -256,7 +327,7 @@ def load_strategies_by_grade(coin: str, interval: str, grade: str, limit: int = 
         
         if results:
             # 컬럼 정보 가져오기
-            columns_query = "PRAGMA table_info(coin_strategies)"
+            columns_query = "PRAGMA table_info(strategies)"
             column_info = fetch_all(columns_query, db_path="strategies")
             columns = [col[1] for col in column_info]  # col[1]은 컬럼명
             
@@ -274,8 +345,8 @@ def load_strategies_by_grade(coin: str, interval: str, grade: str, limit: int = 
     
     # quality_grade 컬럼이 없거나 조회 실패 시 최신 전략들 반환
     query = """
-    SELECT * FROM coin_strategies 
-    WHERE coin = ? AND interval = ?
+    SELECT * FROM strategies 
+    WHERE symbol = ? AND interval = ?
     ORDER BY created_at DESC, profit DESC, win_rate DESC
     LIMIT ?
     """
@@ -285,7 +356,7 @@ def load_strategies_by_grade(coin: str, interval: str, grade: str, limit: int = 
     
     if results:
         # 컬럼 정보 가져오기
-        columns_query = "PRAGMA table_info(coin_strategies)"
+        columns_query = "PRAGMA table_info(strategies)"
         column_info = fetch_all(columns_query, db_path="strategies")
         columns = [col[1] for col in column_info]  # col[1]은 컬럼명
         
@@ -305,8 +376,8 @@ def load_strategies_by_market_condition(coin: str, interval: str, market_conditi
     """시장 상황별 전략 조회"""
     try:
         query = """
-        SELECT * FROM coin_strategies 
-        WHERE coin = ? AND interval = ? AND market_condition = ?
+        SELECT * FROM strategies 
+        WHERE symbol = ? AND interval = ? AND market_condition = ?
         ORDER BY profit DESC, win_rate DESC
         LIMIT ?
         """
@@ -316,7 +387,7 @@ def load_strategies_by_market_condition(coin: str, interval: str, market_conditi
         
         if results:
             # 컬럼 정보 가져오기
-            columns_query = "PRAGMA table_info(coin_strategies)"
+            columns_query = "PRAGMA table_info(strategies)"
             column_info = fetch_all(columns_query, db_path="strategies")
             columns = [col[1] for col in column_info]
             
@@ -355,8 +426,8 @@ def load_strategies_by_interval_and_market(coin: str, interval: str, market_cond
         
         # 등급별 전략도 없으면 최신 전략 반환
         query = """
-        SELECT * FROM coin_strategies 
-        WHERE coin = ? AND interval = ?
+        SELECT * FROM strategies 
+        WHERE symbol = ? AND interval = ?
         ORDER BY created_at DESC, profit DESC, win_rate DESC
         LIMIT ?
         """
@@ -365,7 +436,7 @@ def load_strategies_by_interval_and_market(coin: str, interval: str, market_cond
         results = fetch_all(query, params, db_path="strategies")
         
         if results:
-            columns_query = "PRAGMA table_info(coin_strategies)"
+            columns_query = "PRAGMA table_info(strategies)"
             column_info = fetch_all(columns_query, db_path="strategies")
             columns = [col[1] for col in column_info]
             strategies = []
@@ -399,9 +470,14 @@ def load_strategies_pool(coin: str, interval: Optional[str] = None, limit: int =
     """
     try:
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
+        from rl_pipeline.core.env import config
         
         strategies = []
-        with get_optimized_db_connection("strategies") as conn:
+        
+        # 🔥 코인별 DB 경로 사용
+        coin_db_path = config.get_strategy_db_path(coin)
+        
+        with get_optimized_db_connection(coin_db_path) as conn:
             cursor = conn.cursor()
             
             # 🔥 UNKNOWN 등급 포함 여부에 따라 쿼리 조건 추가
@@ -412,8 +488,8 @@ def load_strategies_pool(coin: str, interval: Optional[str] = None, limit: int =
                 if include_unknown:
                     # 모든 등급 포함 (UNKNOWN 포함)
                     query = f"""
-                        SELECT * FROM coin_strategies 
-                        WHERE coin = ? AND interval = ?
+                        SELECT * FROM strategies 
+                        WHERE symbol = ? AND interval = ?
                         ORDER BY {order_by}
                     """
                     if limit > 0:
@@ -424,8 +500,8 @@ def load_strategies_pool(coin: str, interval: Optional[str] = None, limit: int =
                 else:
                     # UNKNOWN 제외
                     query = f"""
-                        SELECT * FROM coin_strategies 
-                        WHERE coin = ? AND interval = ? 
+                        SELECT * FROM strategies 
+                        WHERE symbol = ? AND interval = ? 
                         AND (quality_grade IS NOT NULL AND quality_grade != 'UNKNOWN')
                         ORDER BY {order_by}
                     """
@@ -438,8 +514,8 @@ def load_strategies_pool(coin: str, interval: Optional[str] = None, limit: int =
                 if include_unknown:
                     # 모든 등급 포함 (UNKNOWN 포함)
                     query = f"""
-                        SELECT * FROM coin_strategies 
-                        WHERE coin = ?
+                        SELECT * FROM strategies 
+                        WHERE symbol = ?
                         ORDER BY {order_by}
                     """
                     if limit > 0:
@@ -450,8 +526,8 @@ def load_strategies_pool(coin: str, interval: Optional[str] = None, limit: int =
                 else:
                     # UNKNOWN 제외
                     query = f"""
-                        SELECT * FROM coin_strategies 
-                        WHERE coin = ? 
+                        SELECT * FROM strategies 
+                        WHERE symbol = ? 
                         AND (quality_grade IS NOT NULL AND quality_grade != 'UNKNOWN')
                         ORDER BY {order_by}
                     """
@@ -464,13 +540,25 @@ def load_strategies_pool(coin: str, interval: Optional[str] = None, limit: int =
             results = cursor.fetchall()
             
             # 컬럼 정보 가져오기
-            columns_query = "PRAGMA table_info(coin_strategies)"
+            columns_query = "PRAGMA table_info(strategies)"
             columns_info = cursor.execute(columns_query).fetchall()
             columns = [col[1] for col in columns_info]
             
             # 딕셔너리 리스트로 변환
             for row in results:
                 strategy_dict = dict(zip(columns, row))
+                
+                # 🆕 전략 params JSON 파싱 (필요시)
+                if 'strategy_conditions' in strategy_dict and isinstance(strategy_dict['strategy_conditions'], str):
+                    try:
+                        params = json.loads(strategy_dict['strategy_conditions'])
+                        strategy_dict['params'] = params
+                    except json.JSONDecodeError:
+                        logger.debug(f"⚠️ 전략 {strategy_dict.get('id')}의 strategy_conditions JSON 파싱 실패")
+                elif 'params' not in strategy_dict:
+                    # params가 없으면 개별 컬럼에서 복원 시도 (필요한 경우)
+                    pass
+                    
                 strategies.append(strategy_dict)
         
         logger.debug(f"✅ {coin}{f'-{interval}' if interval else ''} 전략 {len(strategies)}개 로드 완료")
@@ -509,7 +597,7 @@ def get_database_status() -> Dict[str, int]:
     
     # 주요 테이블들의 행 수 조회
     tables = [
-        'candles', 'coin_strategies', 'strategy_dna', 
+        'candles', 'strategies', 'strategy_dna', 
         'fractal_analysis', 'synergy_analysis', 'runs'
     ]
     
@@ -526,6 +614,22 @@ def get_database_status() -> Dict[str, int]:
     
     return status
 
+def _get_default_analysis_ratios() -> Dict[str, Any]:
+    """분석 비율 기본값 반환"""
+    return {
+        'fractal_ratios': {'5m': 0.5, '15m': 0.5, '30m': 0.5, '1h': 0.5, '4h': 0.5, '1d': 0.5, '1w': 0.5},
+        'multi_timeframe_ratios': {'short': 0.5, 'medium': 0.5, 'long': 0.5},
+        'indicator_cross_ratios': {'rsi': 0.5, 'macd': 0.5, 'bb': 0.5},
+        'coin_specific_ratios': {'btc': 0.5, 'eth': 0.5, 'altcoin': 0.5},
+        'volatility_ratios': {'low': 0.5, 'medium': 0.5, 'high': 0.5},
+        'volume_ratios': {'low': 0.5, 'medium': 0.5, 'high': 0.5},
+        'optimal_modules': {'fractal': 0.6, 'multi_timeframe': 0.6, 'indicator_cross': 0.6},
+        'interval_weights': {},
+        'performance_score': 0.0,
+        'accuracy_score': 0.0,
+        'updated_at': None
+    }
+
 def get_coin_analysis_ratios(coin: str, interval: str, analysis_type: str = "default") -> Dict[str, Any]:
     """🚀 코인별 분석 비율 조회"""
     try:
@@ -534,12 +638,31 @@ def get_coin_analysis_ratios(coin: str, interval: str, analysis_type: str = "def
         with pool.get_connection() as conn:
             cursor = conn.cursor()
             
-            query = """
+            # 🔧 테이블 및 컬럼명 호환성 확인 (analysis_ratios vs coin_analysis_ratios, symbol vs coin)
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('analysis_ratios', 'coin_analysis_ratios')")
+            available_tables = [row[0] for row in cursor.fetchall()]
+            
+            if not available_tables:
+                # 테이블이 없으면 기본값 반환
+                return _get_default_analysis_ratios()
+            
+            # 새 테이블 우선, 없으면 구 테이블
+            table_name = 'analysis_ratios' if 'analysis_ratios' in available_tables else 'coin_analysis_ratios'
+            
+            # 컬럼명 확인 (symbol vs coin)
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [col[1] for col in cursor.fetchall()]
+            coin_column = 'symbol' if 'symbol' in columns else 'coin'
+            
+            # 🔧 coin_specific_ratios vs symbol_specific_ratios 호환성
+            specific_ratios_col = 'symbol_specific_ratios' if 'symbol_specific_ratios' in columns else 'coin_specific_ratios'
+            
+            query = f"""
             SELECT fractal_ratios, multi_timeframe_ratios, indicator_cross_ratios,
-                   coin_specific_ratios, volatility_ratios, volume_ratios,
+                   {specific_ratios_col}, volatility_ratios, volume_ratios,
                    optimal_modules, interval_weights, performance_score, accuracy_score, updated_at
-            FROM coin_analysis_ratios
-            WHERE coin = ? AND interval = ? AND analysis_type = ?
+            FROM {table_name}
+            WHERE {coin_column} = ? AND interval = ? AND analysis_type = ?
             ORDER BY updated_at DESC
             LIMIT 1
             """
@@ -563,36 +686,12 @@ def get_coin_analysis_ratios(coin: str, interval: str, analysis_type: str = "def
                 }
             else:
                 # 기본값 반환
-                return {
-                    'fractal_ratios': {'5m': 0.5, '15m': 0.5, '30m': 0.5, '1h': 0.5, '4h': 0.5, '1d': 0.5, '1w': 0.5},
-                    'multi_timeframe_ratios': {'short': 0.5, 'medium': 0.5, 'long': 0.5},
-                    'indicator_cross_ratios': {'rsi': 0.5, 'macd': 0.5, 'bb': 0.5},
-                    'coin_specific_ratios': {'btc': 0.5, 'eth': 0.5, 'altcoin': 0.5},
-                    'volatility_ratios': {'low': 0.5, 'medium': 0.5, 'high': 0.5},
-                    'volume_ratios': {'low': 0.5, 'medium': 0.5, 'high': 0.5},
-                    'optimal_modules': {'fractal': 0.6, 'multi_timeframe': 0.6, 'indicator_cross': 0.6},
-                    'interval_weights': {},
-                    'performance_score': 0.0,
-                    'accuracy_score': 0.0,
-                    'updated_at': None
-                }
+                return _get_default_analysis_ratios()
 
     except Exception as e:
         logger.error(f"❌ {coin} {interval} 분석 비율 조회 실패: {e}")
         # 기본값 반환
-        return {
-            'fractal_ratios': {'5m': 0.5, '15m': 0.5, '30m': 0.5, '1h': 0.5, '4h': 0.5, '1d': 0.5, '1w': 0.5},
-            'multi_timeframe_ratios': {'short': 0.5, 'medium': 0.5, 'long': 0.5},
-            'indicator_cross_ratios': {'rsi': 0.5, 'macd': 0.5, 'bb': 0.5},
-            'coin_specific_ratios': {'btc': 0.5, 'eth': 0.5, 'altcoin': 0.5},
-            'volatility_ratios': {'low': 0.5, 'medium': 0.5, 'high': 0.5},
-            'volume_ratios': {'low': 0.5, 'medium': 0.5, 'high': 0.5},
-            'optimal_modules': {'fractal': 0.6, 'multi_timeframe': 0.6, 'indicator_cross': 0.6},
-            'interval_weights': {},
-            'performance_score': 0.0,
-            'accuracy_score': 0.0,
-            'updated_at': None
-        }
+        return _get_default_analysis_ratios()
 
 def get_all_coin_analysis_ratios(coin: str = None) -> List[Dict[str, Any]]:
     """🚀 모든 코인의 분석 비율 조회 (또는 특정 코인)"""
@@ -602,23 +701,38 @@ def get_all_coin_analysis_ratios(coin: str = None) -> List[Dict[str, Any]]:
         with pool.get_connection() as conn:
             cursor = conn.cursor()
             
+            # 🔧 테이블 및 컬럼명 호환성 확인
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('analysis_ratios', 'coin_analysis_ratios')")
+            available_tables = [row[0] for row in cursor.fetchall()]
+            
+            if not available_tables:
+                return []
+            
+            table_name = 'analysis_ratios' if 'analysis_ratios' in available_tables else 'coin_analysis_ratios'
+            
+            # 컬럼명 확인
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [col[1] for col in cursor.fetchall()]
+            coin_column = 'symbol' if 'symbol' in columns else 'coin'
+            specific_ratios_col = 'symbol_specific_ratios' if 'symbol_specific_ratios' in columns else 'coin_specific_ratios'
+            
             if coin:
-                query = """
-                SELECT coin, interval, analysis_type, fractal_ratios, multi_timeframe_ratios,
-                       indicator_cross_ratios, coin_specific_ratios, volatility_ratios,
+                query = f"""
+                SELECT {coin_column}, interval, analysis_type, fractal_ratios, multi_timeframe_ratios,
+                       indicator_cross_ratios, {specific_ratios_col}, volatility_ratios,
                        volume_ratios, optimal_modules, performance_score, accuracy_score, updated_at
-                FROM coin_analysis_ratios 
-                WHERE coin = ?
+                FROM {table_name} 
+                WHERE {coin_column} = ?
                 ORDER BY updated_at DESC
                 """
                 cursor.execute(query, (coin,))
             else:
-                query = """
-                SELECT coin, interval, analysis_type, fractal_ratios, multi_timeframe_ratios,
-                       indicator_cross_ratios, coin_specific_ratios, volatility_ratios,
+                query = f"""
+                SELECT {coin_column}, interval, analysis_type, fractal_ratios, multi_timeframe_ratios,
+                       indicator_cross_ratios, {specific_ratios_col}, volatility_ratios,
                        volume_ratios, optimal_modules, performance_score, accuracy_score, updated_at
-                FROM coin_analysis_ratios 
-                ORDER BY coin, interval, updated_at DESC
+                FROM {table_name} 
+                ORDER BY {coin_column}, interval, updated_at DESC
                 """
                 cursor.execute(query)
             
@@ -681,7 +795,7 @@ def get_coin_global_weights(coin: str) -> Dict[str, Any]:
                    coin_avg_profit, global_avg_profit, coin_win_rate, global_win_rate,
                    updated_at
             FROM coin_global_weights
-            WHERE coin = ?
+            WHERE symbol = ?
             """
 
             cursor.execute(query, (coin,))
@@ -802,16 +916,17 @@ def fetch_integrated_analysis(
         cursor = conn.cursor()
         interval_filter = interval if interval else 'all_intervals'
 
-        # 🔥 스키마 확인: learning_results.py의 integrated_analysis_results 테이블 구조
-        # 컬럼 순서: coin, interval, regime, fractal_score, multi_timeframe_score, 
-        #           indicator_cross_score, ensemble_score, ensemble_confidence,
-        #           final_signal_score, signal_confidence, signal_action, created_at
+        # 🔥 스키마 변경: coin → symbol
+        # symbol 컬럼을 사용하여 조회 (coin 호환성 유지)
+        
+        # 1. integrated_analysis_results (최신 테이블) 또는 coin_integrated_analysis_results (뷰) 사용
+        # 먼저 실제 테이블에서 symbol로 조회를 시도
         query = '''
-            SELECT coin, interval, signal_action, final_signal_score,
+            SELECT symbol, interval, signal_action, final_signal_score,
                    fractal_score, multi_timeframe_score, indicator_cross_score,
                    created_at
             FROM integrated_analysis_results
-            WHERE coin = ? AND interval = ?
+            WHERE symbol = ? AND interval = ?
             ORDER BY created_at DESC LIMIT 1
         '''
 
@@ -821,15 +936,19 @@ def fetch_integrated_analysis(
 
             if not row:
                 # 🔥 더 자세한 디버깅 정보 출력
-                cursor.execute("SELECT COUNT(*) FROM integrated_analysis_results WHERE coin = ?", (coin,))
-                coin_count = cursor.fetchone()[0]
-                cursor.execute("SELECT DISTINCT interval FROM integrated_analysis_results WHERE coin = ?", (coin,))
-                available_intervals = [r[0] for r in cursor.fetchall()]
-                logger.debug(f"⚠️ {coin} {interval_filter} 통합 분석 결과 없음 (코인별 총 {coin_count}개, 사용 가능한 인터벌: {available_intervals})")
+                # symbol 기준 조회
+                try:
+                    cursor.execute("SELECT COUNT(*) FROM integrated_analysis_results WHERE symbol = ?", (coin,))
+                    count = cursor.fetchone()[0]
+                    cursor.execute("SELECT DISTINCT interval FROM integrated_analysis_results WHERE symbol = ?", (coin,))
+                    intervals = [r[0] for r in cursor.fetchall()]
+                    logger.debug(f"⚠️ {coin} {interval_filter} 통합 분석 결과 없음 (symbol 기준 총 {count}개, 사용 가능한 인터벌: {intervals})")
+                except Exception:
+                    pass
                 return None
 
             result = {
-                'coin': row[0],
+                'coin': row[0],  # symbol을 coin 키로 매핑
                 'interval': row[1],
                 'signal': row[2],  # signal_action을 signal로 매핑 (하위 호환성)
                 'score': row[3],  # final_signal_score를 score로 매핑
@@ -839,19 +958,34 @@ def fetch_integrated_analysis(
                 'created_at': row[7]
             }
         except sqlite3.OperationalError as schema_err:
-            # 🔥 스키마 불일치: 컬럼이 없으면 안전하게 처리
+            # 🔥 스키마 오류: symbol 컬럼이 없거나 테이블 문제가 있는 경우
+            # 구버전 스키마(coin 컬럼) 시도
             if 'no such column' in str(schema_err).lower():
-                logger.warning(f"⚠️ {coin} {interval_filter} 통합 분석 스키마 불일치: {schema_err}")
-                # 기본값 반환
-                return {
-                    'coin': coin,
-                    'interval': interval_filter,
-                    'signal': 'HOLD',
-                    'score': 0.5,
-                    'fractal_score': 0.5,
-                    'multi_tf_score': 0.5,
-                    'indicator_cross_score': 0.5,
-                    'created_at': None
+                logger.warning(f"⚠️ {coin} {interval_filter} 통합 분석 스키마 불일치, coin 컬럼으로 재시도: {schema_err}")
+                
+                legacy_query = '''
+                    SELECT coin, interval, signal_action, final_signal_score,
+                           fractal_score, multi_timeframe_score, indicator_cross_score,
+                           created_at
+                    FROM integrated_analysis_results
+                    WHERE symbol = ? AND interval = ?
+                    ORDER BY created_at DESC LIMIT 1
+                '''
+                cursor.execute(legacy_query, (coin, interval_filter))
+                row = cursor.fetchone()
+                
+                if not row:
+                    return None
+                    
+                result = {
+                    'coin': row[0],
+                    'interval': row[1],
+                    'signal': row[2],
+                    'score': row[3],
+                    'fractal_score': row[4],
+                    'multi_tf_score': row[5],
+                    'indicator_cross_score': row[6],
+                    'created_at': row[7]
                 }
             else:
                 raise
@@ -862,3 +996,115 @@ def fetch_integrated_analysis(
     except Exception as e:
         logger.error(f"❌ {coin} {interval_filter} 통합 분석 조회 실패: {e}")
         return None
+
+
+def fetch_selfplay_training_data(coin: str, interval: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Self-play 학습용 데이터 조회 (rl_episodes + rl_episode_summary 조인)
+    
+    Args:
+        coin: 코인 심볼
+        interval: 시간 간격
+        limit: 최대 조회 개수
+        
+    Returns:
+        cycle_results 리스트 (auto_trainer 호환 형식)
+    """
+    from rl_pipeline.core.env import config
+    from rl_pipeline.db.connection_pool import get_optimized_db_connection
+    
+    # 코인별 전략 DB 경로
+    db_path = config.get_strategy_db_path(coin)
+    
+    def _execute_query(connection):
+        cursor = connection.cursor()
+        
+        # rl_episodes와 rl_episode_summary 조인
+        query = """
+            SELECT 
+                e.episode_id, 
+                e.ts_entry, 
+                e.strategy_id,
+                e.predicted_dir,
+                s.total_reward,
+                s.realized_ret_signed,
+                s.acc_flag,
+                s.first_event
+            FROM rl_episodes e
+            LEFT JOIN rl_episode_summary s ON e.episode_id = s.episode_id
+            WHERE e.symbol = ? AND e.interval = ?
+            ORDER BY e.ts_entry DESC
+            LIMIT ?
+        """
+        
+        cursor.execute(query, (coin, interval, limit))
+        return cursor.fetchall()
+
+    try:
+        with get_optimized_db_connection(db_path) as conn:
+            rows = _execute_query(conn)
+            
+    except Exception as e:
+        # 🚑 malformed disk image 에러 감지 시 자동 복구 시도
+        if "malformed" in str(e) or "disk image" in str(e):
+            logger.error(f"🚨 {coin}-{interval} DB 손상 감지! 자동 복구 시도 중...")
+            
+            # 복구 시도
+            if repair_corrupted_db(db_path):
+                logger.info(f"♻️ {coin}-{interval} DB 복구 성공, 데이터 재조회 시도...")
+                try:
+                    # 재시도
+                    with get_optimized_db_connection(db_path) as conn:
+                        rows = _execute_query(conn)
+                except Exception as retry_err:
+                    logger.error(f"❌ 재조회 실패: {retry_err}")
+                    return []
+            else:
+                logger.critical(f"💥 {coin}-{interval} DB 복구 실패. 관리자 개입 필요.")
+                return []
+        else:
+            logger.error(f"❌ {coin}-{interval} 학습 데이터 조회 실패: {e}")
+            return []
+            
+    if not rows:
+        logger.debug(f"⚠️ {coin}-{interval}: 학습용 에피소드 데이터 없음")
+        return []
+        
+    cycle_results = []
+    for i, row in enumerate(rows):
+        episode_id, ts_entry, strategy_id, predicted_dir, total_reward, realized_ret_signed, acc_flag, first_event = row
+        
+        # 방향 매핑 (1: BUY, 2: SELL, 0: HOLD)
+        direction_map = {1: 'BUY', 2: 'SELL', 0: 'HOLD'}
+        direction = direction_map.get(predicted_dir, 'HOLD')
+        
+        # results 구조 재구성
+        results_data = {}
+        if strategy_id:
+            # 가상의 trades 데이터 생성
+            trades = []
+            if direction in ['BUY', 'SELL']:
+                trades.append({'direction': direction})
+            
+            # PnL 및 보상 데이터 (NULL 처리)
+            pnl = realized_ret_signed if realized_ret_signed is not None else 0.0
+            reward = total_reward if total_reward is not None else 0.0
+            win = 1.0 if acc_flag else 0.0
+            
+            results_data[strategy_id] = {
+                'total_pnl': pnl,
+                'total_return': pnl,
+                'total_reward': reward,
+                'win_rate': win,
+                'strategy_direction': direction.lower(),
+                'trades': trades
+            }
+        
+        cycle_results.append({
+            'episode': i,
+            'episode_id': episode_id,
+            'results': results_data,
+            'created_at': ts_entry
+        })
+            
+    return cycle_results

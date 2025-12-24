@@ -1,6 +1,6 @@
 """
 전략 생성 데이터 검증
-coin_strategies 테이블 및 전략 파라미터 검증
+strategies 테이블 및 전략 파라미터 검증
 """
 
 import os
@@ -224,8 +224,8 @@ class StrategyValidator(BaseValidator):
                     SELECT COUNT(*) as count,
                            AVG(CAST(json_extract(parameters, '$.rsi_period') AS REAL)) as avg_rsi,
                            AVG(performance_score) as avg_score
-                    FROM coin_strategies
-                    WHERE coin = ? AND interval = ?
+                    FROM strategies
+                    WHERE symbol = ? AND interval = ?
                     AND created_at > datetime('now', '-1 hour')
                 """, (coin, interval))
 
@@ -279,8 +279,8 @@ class StrategyValidator(BaseValidator):
                 self.strategies_db,
                 """
                 SELECT COUNT(*) as count, DATE(created_at) as date
-                FROM coin_strategies
-                WHERE coin = ? AND interval = ?
+                FROM strategies
+                WHERE symbol = ? AND interval = ?
                 AND created_at > datetime('now', '-7 days')
                 GROUP BY DATE(created_at)
                 """,

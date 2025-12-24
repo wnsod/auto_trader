@@ -10,13 +10,15 @@ from typing import Tuple, Optional
 try:
     from ..config import CANDLES_DB_PATH, STRATEGIES_DB_PATH, TRADING_SYSTEM_DB_PATH, DB_PATH
 except ImportError:
-    # fallback: 직접 계산
+    # fallback: 직접 계산 (디렉토리 모드 지원)
     import os
     current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     workspace_dir = os.path.dirname(current_dir)
-    CANDLES_DB_PATH = os.getenv('CANDLES_DB_PATH', os.path.join(workspace_dir, 'data_storage', 'realtime_candles.db'))
-    STRATEGIES_DB_PATH = os.getenv('STRATEGIES_DB_PATH', os.path.join(workspace_dir, 'data_storage', 'learning_results.db'))
-    TRADING_SYSTEM_DB_PATH = os.path.join(workspace_dir, 'data_storage', 'trading_system.db')
+    DATA_STORAGE_PATH = os.getenv('DATA_STORAGE_PATH', os.path.join(workspace_dir, 'data_storage'))
+    CANDLES_DB_PATH = os.getenv('CANDLES_DB_PATH', os.path.join(DATA_STORAGE_PATH, 'realtime_candles.db'))
+    # 🔧 디렉토리 모드 지원: 폴더 경로로 설정 (개별 함수에서 파일 선택)
+    STRATEGIES_DB_PATH = os.getenv('STRATEGY_DB_PATH', os.getenv('STRATEGIES_DB_PATH', os.path.join(DATA_STORAGE_PATH, 'learning_strategies')))
+    TRADING_SYSTEM_DB_PATH = os.getenv('TRADING_DB_PATH', os.path.join(DATA_STORAGE_PATH, 'trading_system.db'))
     DB_PATH = TRADING_SYSTEM_DB_PATH
 
 
@@ -104,9 +106,17 @@ def safe_db_read(query: str, params: Tuple = (), db_path: Optional[str] = None):
     Returns:
         쿼리 결과 리스트 (오류 시 빈 리스트)
     """
+    import os
     try:
         if db_path is None:
             db_path = STRATEGIES_DB_PATH
+        
+        # 🔧 디렉토리 모드 지원: 폴더면 common_strategies.db 사용
+        if os.path.isdir(db_path):
+            db_path = os.path.join(db_path, 'common_strategies.db')
+        
+        if not os.path.exists(db_path):
+            return []
         
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -131,9 +141,19 @@ def safe_db_write_func(query: str, params: Tuple = (), db_path: Optional[str] = 
     Returns:
         성공 여부 (bool)
     """
+    import os
     try:
         if db_path is None:
             db_path = STRATEGIES_DB_PATH
+        
+        # 🔧 디렉토리 모드 지원: 폴더면 common_strategies.db 사용
+        if os.path.isdir(db_path):
+            db_path = os.path.join(db_path, 'common_strategies.db')
+        
+        # 디렉토리가 없으면 생성
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()

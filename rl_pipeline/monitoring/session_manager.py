@@ -121,6 +121,28 @@ class SessionManager:
         with open(info_file, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _load_index(self) -> Dict[str, Any]:
+        """인덱스 파일 안전하게 로드"""
+        if not self.index_file.exists():
+            return {"sessions": []}
+
+        try:
+            with open(self.index_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"⚠️ 세션 인덱스 파일 손상 감지 ({e}). 초기화합니다.")
+            # 손상된 파일 백업
+            backup_path = self.index_file.with_suffix(f".bak.{datetime.now().strftime('%Y%m%d%H%M%S')}")
+            try:
+                shutil.copy(self.index_file, backup_path)
+                print(f"   └─ 백업 완료: {backup_path.name}")
+            except:
+                pass
+            return {"sessions": []}
+        except Exception as e:
+            print(f"⚠️ 세션 인덱스 로드 중 오류: {e}")
+            return {"sessions": []}
+
     def list_sessions(self, limit: int = None, status: str = None) -> List[Dict[str, Any]]:
         """
         세션 목록 조회
@@ -132,12 +154,7 @@ class SessionManager:
         Returns:
             세션 정보 리스트 (최신순)
         """
-        if not self.index_file.exists():
-            return []
-
-        with open(self.index_file, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
-
+        index_data = self._load_index()
         sessions = index_data.get("sessions", [])
 
         # 상태 필터링
@@ -160,102 +177,16 @@ class SessionManager:
         Returns:
             최신 세션 ID
         """
-        if not self.index_file.exists():
-            return None
-
-        with open(self.index_file, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
-
+        index_data = self._load_index()
         return index_data.get("latest")
-
-    def compare_sessions(self, session_id1: str, session_id2: str) -> Dict[str, Any]:
-        """
-        두 세션 비교
-
-        Args:
-            session_id1: 첫 번째 세션 ID
-            session_id2: 두 번째 세션 ID
-
-        Returns:
-            비교 결과
-        """
-        info1 = self.get_session_info(session_id1)
-        info2 = self.get_session_info(session_id2)
-
-        if not info1 or not info2:
-            return {"error": "세션 정보를 찾을 수 없습니다"}
-
-        comparison = {
-            "session1": session_id1,
-            "session2": session_id2,
-            "config_diff": self._diff_dicts(info1.get("config", {}), info2.get("config", {})),
-            "summary_diff": self._diff_dicts(info1.get("summary", {}), info2.get("summary", {})),
-            "issues_comparison": {
-                "session1_issues": info1.get("issues_found", []),
-                "session2_issues": info2.get("issues_found", []),
-                "common_issues": list(set(info1.get("issues_found", [])) & set(info2.get("issues_found", []))),
-                "unique_to_session1": list(set(info1.get("issues_found", [])) - set(info2.get("issues_found", []))),
-                "unique_to_session2": list(set(info2.get("issues_found", [])) - set(info1.get("issues_found", [])))
-            }
-        }
-
-        return comparison
-
-    def cleanup_old_sessions(self, keep_recent: int = 10, delete_after_days: int = 7):
-        """
-        오래된 세션 정리
-
-        Args:
-            keep_recent: 최근 N개 세션은 유지
-            delete_after_days: N일 이상 된 세션 삭제
-        """
-        sessions = self.list_sessions()
-
-        # 최근 N개는 보호
-        protected_sessions = set(s["session_id"] for s in sessions[:keep_recent])
-
-        # 삭제 대상 찾기
-        cutoff_date = datetime.now() - timedelta(days=delete_after_days)
-        deleted_count = 0
-
-        for session in sessions:
-            session_id = session["session_id"]
-
-            # 보호된 세션은 스킵
-            if session_id in protected_sessions:
-                continue
-
-            # 시작 시간 확인
-            start_time_str = session.get("start_time")
-            if not start_time_str:
-                continue
-
-            start_time = datetime.fromisoformat(start_time_str)
-
-            # 오래된 세션 삭제
-            if start_time < cutoff_date:
-                session_dir = self.base_dir / session_id
-                if session_dir.exists():
-                    shutil.rmtree(session_dir)
-                    deleted_count += 1
-                    print(f"🗑️ 세션 삭제: {session_id}")
-
-        # 인덱스 재구성
-        self._rebuild_index()
-
-        print(f"✅ 정리 완료: {deleted_count}개 세션 삭제")
 
     def _add_to_index(self, session_info: Dict[str, Any]):
         """세션을 인덱스에 추가"""
-        if self.index_file.exists():
-            with open(self.index_file, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
-        else:
-            index_data = {"sessions": []}
+        index_data = self._load_index()
 
         # 중복 제거
         index_data["sessions"] = [
-            s for s in index_data["sessions"]
+            s for s in index_data.get("sessions", [])
             if s["session_id"] != session_info["session_id"]
         ]
 
@@ -277,13 +208,13 @@ class SessionManager:
 
     def _update_index(self, session_info: Dict[str, Any]):
         """세션 인덱스 업데이트"""
-        if not self.index_file.exists():
-            return
+        index_data = self._load_index()
 
-        with open(self.index_file, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
+        if "sessions" not in index_data:
+            index_data["sessions"] = []
 
         # 해당 세션 찾아서 업데이트
+        updated = False
         for i, s in enumerate(index_data["sessions"]):
             if s["session_id"] == session_info["session_id"]:
                 index_data["sessions"][i] = {
@@ -295,7 +226,20 @@ class SessionManager:
                     "status": session_info["status"],
                     "issues_found": session_info.get("issues_found", [])
                 }
+                updated = True
                 break
+        
+        if not updated:
+             # 없으면 추가
+            index_data["sessions"].append({
+                "session_id": session_info["session_id"],
+                "start_time": session_info["start_time"],
+                "end_time": session_info.get("end_time"),
+                "coins": session_info["coins"],
+                "intervals": session_info["intervals"],
+                "status": session_info["status"],
+                "issues_found": session_info.get("issues_found", [])
+            })
 
         with open(self.index_file, "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2, ensure_ascii=False)

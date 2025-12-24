@@ -64,7 +64,7 @@ def calculate_coin_volatility(db_path: str, coin: str) -> Optional[float]:
             cursor.execute('''
                 SELECT AVG(atr) as avg_atr
                 FROM candles
-                WHERE coin = ? AND atr IS NOT NULL
+                WHERE symbol = ? AND atr IS NOT NULL
             ''', (coin,))
 
             result = cursor.fetchone()
@@ -125,9 +125,10 @@ def get_volatility_profile(coin: Optional[str], db_path: str) -> Dict:
     avg_atr = calculate_coin_volatility(db_path, coin)
 
     if avg_atr is None:
-        # 데이터 없으면 기본값
-        logger.warning(f"⚠️ {coin} ATR 데이터 없음, 기본값 사용")
+        # 데이터 없으면 기본값 (정상 - 아직 데이터 수집 중일 수 있음)
+        logger.debug(f"ℹ️ {coin} ATR 데이터 없음, 기본값(MEDIUM) 사용")
         group = 'MEDIUM'
+        avg_atr = 0.0  # 표시용 기본값
     else:
         # 그룹 분류
         group = classify_volatility_group(avg_atr)
@@ -164,7 +165,7 @@ def get_all_coin_profiles(db_path: str) -> Dict[str, Dict]:
 
             # 모든 코인 조회
             cursor.execute('''
-                SELECT DISTINCT coin
+                SELECT DISTINCT symbol as coin
                 FROM candles
                 WHERE atr IS NOT NULL
             ''')

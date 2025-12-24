@@ -2108,9 +2108,9 @@ def create_long_term_routing_strategies(coin: str, interval: str, periods: Dict[
 
                        quality_grade, complexity_score, score
 
-                FROM coin_strategies 
+                FROM strategies 
 
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
 
                 AND quality_grade IN ('A', 'B')
 
@@ -2236,9 +2236,9 @@ def create_short_term_front_routing_strategies(coin: str, interval: str, periods
 
                        quality_grade, complexity_score, score
 
-                FROM coin_strategies 
+                FROM strategies 
 
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
 
                 AND quality_grade IN ('A', 'B')
 
@@ -2364,9 +2364,9 @@ def create_short_term_back_routing_strategies(coin: str, interval: str, periods:
 
                        quality_grade, complexity_score, score
 
-                FROM coin_strategies 
+                FROM strategies 
 
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
 
                 AND quality_grade IN ('A', 'B')
 
@@ -2492,9 +2492,9 @@ def create_short_term_only_routing_strategies(coin: str, interval: str, periods:
 
                        quality_grade, complexity_score, score
 
-                FROM coin_strategies 
+                FROM strategies 
 
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
 
                 AND quality_grade IN ('A', 'B')
 
@@ -2620,9 +2620,9 @@ def create_hybrid_routing_strategies(coin: str, interval: str, periods: Dict[str
 
                        quality_grade, complexity_score, score
 
-                FROM coin_strategies 
+                FROM strategies 
 
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
 
                 AND quality_grade IN ('A', 'B')
 
@@ -2648,9 +2648,9 @@ def create_hybrid_routing_strategies(coin: str, interval: str, periods: Dict[str
 
                    quality_grade, complexity_score, score
 
-            FROM coin_strategies 
+            FROM strategies 
 
-            WHERE coin = ? AND interval = ? AND strategy_type IN ('short_term_front', 'short_term_back')
+            WHERE symbol = ? AND interval = ? AND strategy_type IN ('short_term_front', 'short_term_back')
 
             AND quality_grade IN ('A', 'B')
 
@@ -3056,7 +3056,7 @@ def save_dynamic_routing_strategies_to_db(strategies: List[Dict[str, Any]], coin
 
                     cursor.execute("""
 
-                        INSERT OR REPLACE INTO coin_strategies (
+                        INSERT OR REPLACE INTO strategies (
 
                             id, coin, interval, strategy_type, strategy_conditions,
 
@@ -3346,11 +3346,11 @@ def calculate_current_routing_quality(coin: str, intervals: List[str]) -> float:
 
                        AVG(sr.sharpe_ratio) as avg_sharpe, COUNT(*) as strategy_count
 
-                FROM coin_strategies cs
+                FROM strategies cs
 
                 LEFT JOIN simulation_results sr ON cs.id = sr.strategy_id
 
-                WHERE cs.coin = ? AND cs.interval IN ({})
+                WHERE cs.symbol = ? AND cs.interval IN ({})
 
                 AND sr.total_trades > 0
 
@@ -3416,7 +3416,7 @@ def get_previous_routing_quality(coin: str) -> float:
 
                 SELECT analysis_result FROM routing_quality_history 
 
-                WHERE coin = ?
+                WHERE symbol = ?
 
                 ORDER BY created_at DESC LIMIT 1
 

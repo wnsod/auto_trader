@@ -90,6 +90,16 @@ class Strategy:
     # 🚀 통합 분석 메타데이터 (그룹 조합, OR 조건 등)
     metadata: Dict[str, Any] = None
 
+    def get(self, key: str, default: Any = None) -> Any:
+        """dict 인터페이스 호환을 위한 헬퍼 (Orchestrator 등에서 사용)"""
+        if hasattr(self, key):
+            value = getattr(self, key)
+            if value is not None:
+                return value
+        if isinstance(self.params, dict):
+            return self.params.get(key, default)
+        return default
+
 @dataclass
 class ReplayReport:
     """시뮬레이션 결과 DTO"""

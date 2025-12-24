@@ -20,6 +20,8 @@ from rl_pipeline.strategy.factory import make_strategy
 from rl_pipeline.strategy.serializer import serialize_strategy
 from rl_pipeline.db.writes import write_batch
 from rl_pipeline.db.connection_pool import get_optimized_db_connection
+from rl_pipeline.strategy.strategy_evolver import StrategyEvolver
+from rl_pipeline.db.reads import load_strategies_pool
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +39,8 @@ from rl_pipeline.strategy.router import (
 from rl_pipeline.strategy.creator import (
     create_intelligent_strategies_with_type,
     create_intelligent_strategies,
-    create_coin_strategies_dynamic,
-    create_coin_strategies,
+    create_strategies_dynamic,
+    create_strategies,
     classify_market_condition,
     create_enhanced_market_adaptive_strategy,
     create_guided_random_strategy,
@@ -47,8 +49,8 @@ from rl_pipeline.strategy.creator import (
     create_global_strategies_from_results,
 )
 from rl_pipeline.strategy.validator import (
-    revalidate_coin_strategies,
-    revalidate_coin_strategies_dynamic,
+    revalidate_strategies,
+    revalidate_strategies_dynamic,
     revalidate_with_dynamic_iteration,
     perform_enhanced_strategy_validation,
     update_strategy_grade,
@@ -186,7 +188,10 @@ class StrategyManager:
                 logger.warning("⚠️ 저장할 전략이 없습니다")
                 return 0
             
-            logger.info(f"💾 전략 저장 시작: {len(strategies)}개")
+            # 🔥 코인 정보 추출 (첫 번째 전략 기준)
+            coin = strategies[0].get('coin') or strategies[0].get('symbol') or 'UNKNOWN'
+            
+            logger.info(f"💾 전략 저장 시작: {len(strategies)}개 ({coin})")
             
             # 데이터베이스 연결 (절대 경로 사용)
             import sqlite3
@@ -203,17 +208,24 @@ class StrategyManager:
             
             # 확장 스키마 사용을 위해 write_batch 사용
             from rl_pipeline.db.writes import write_batch
-            from rl_pipeline.db.schema import create_coin_strategies_table
+            from rl_pipeline.db.schema import create_strategies_table
             
             # 테이블 생성 (없으면)
-            create_coin_strategies_table()
+            create_strategies_table()
             
             # dict를 확장 스키마로 변환
             expanded_strategies = []
+            
+            # 헬퍼 함수: 객체/dict 속성 접근
+            def _get_val(obj, key, default=None):
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+                
             for strategy in strategies:
                 try:
                     # params 추출
-                    params = strategy.get('params', {})
+                    params = _get_val(strategy, 'params', {})
                     if isinstance(params, str):
                         params = json.loads(params)
                     
@@ -223,14 +235,16 @@ class StrategyManager:
                     macd_sell = params.get('macd_sell_threshold')
                     
                     expanded = {
-                        'id': strategy.get('id', ''),
-                        'coin': strategy.get('coin', ''),
-                        'interval': strategy.get('interval', ''),
-                        'strategy_type': strategy.get('strategy_type', 'hybrid'),
+                        'id': _get_val(strategy, 'id', ''), # 🔥 id로 복구
+                        'coin': _get_val(strategy, 'coin', ''),
+                        'interval': _get_val(strategy, 'interval', ''),
+                        'strategy_type': _get_val(strategy, 'strategy_type', 'hybrid'),
                         'strategy_conditions': json.dumps(params),
-                        'name': strategy.get('name', ''),
-                        'description': strategy.get('description', ''),
-                        'created_at': strategy.get('created_at', datetime.now().isoformat()),
+                        # 'name': _get_val(strategy, 'name', ''),  # 스키마에 없음, 제거
+                        'description': _get_val(strategy, 'description', ''),
+                        # 🔥 레짐 정보 저장 (필수)
+                        'regime': _get_val(strategy, 'regime', 'neutral'),
+                        'created_at': _get_val(strategy, 'created_at', datetime.now().isoformat()),
                         'rsi_min': params.get('rsi_min', 30.0),
                         'rsi_max': params.get('rsi_max', 70.0),
                         'volume_ratio_min': params.get('volume_ratio_min', 1.0),
@@ -253,28 +267,39 @@ class StrategyManager:
                         'calmar_ratio': params.get('calmar_ratio', 0.0),
                         'profit_factor': params.get('profit_factor', 0.0),
                         'avg_profit_per_trade': params.get('avg_profit_per_trade', 0.0),
-                        'quality_grade': params.get('quality_grade') or strategy.get('quality_grade'),
+                        'avg_mfe': params.get('avg_mfe', 0.0),
+                        'avg_mae': params.get('avg_mae', 0.0),
+                        'quality_grade': params.get('quality_grade') or _get_val(strategy, 'quality_grade'),
                         'market_condition': params.get('market_condition', 'neutral'),
                         'score': params.get('score', 0.5),
                         'complexity_score': params.get('complexity_score', 0.6),
                         # 하이브리드 시스템 컬럼 (현재 미사용, 향후 확장용)
-                        'hybrid_score': params.get('hybrid_score') or strategy.get('hybrid_score'),
-                        'model_id': params.get('model_id') or strategy.get('model_id') or '',
+                        'hybrid_score': params.get('hybrid_score') or _get_val(strategy, 'hybrid_score'),
+                        'model_id': params.get('model_id') or _get_val(strategy, 'model_id') or '',
                         # 활성화 상태 (현재는 모두 1, 향후 비활성화 로직 추가 시 활용)
-                        'is_active': params.get('is_active', strategy.get('is_active', 1)),
+                        'is_active': params.get('is_active', _get_val(strategy, 'is_active', 1)),
                         # 🆕 증분 학습 메타데이터
-                        'similarity_classification': params.get('similarity_classification') or strategy.get('similarity_classification'),
-                        'similarity_score': params.get('similarity_score') or strategy.get('similarity_score'),
-                        'parent_strategy_id': params.get('parent_strategy_id') or strategy.get('parent_strategy_id'),
+                        'similarity_classification': params.get('similarity_classification') or _get_val(strategy, 'similarity_classification'),
+                        'similarity_score': params.get('similarity_score') or _get_val(strategy, 'similarity_score'),
+                        'parent_strategy_id': params.get('parent_strategy_id') or _get_val(strategy, 'parent_strategy_id'),
+                        
+                        # 🆕 v2 Lifecycle (생애주기) 관리
+                        # 기본값은 'QUARANTINE' (격리) -> 검증 후 승격
+                        'lifecycle_status': params.get('lifecycle_status', 'QUARANTINE'),
+                        'failure_assumption': params.get('failure_assumption', None),
                     }
                     expanded_strategies.append(expanded)
                     
                 except Exception as e:
-                    logger.error(f"⚠️ 전략 변환 실패: {strategy.get('id', 'unknown')} - {e}")
+                    logger.error(f"⚠️ 전략 변환 실패: {_get_val(strategy, 'id', 'unknown')} - {e}")
                     continue
             
+            # 🔥 코인별 DB 경로 설정
+            from rl_pipeline.core.env import config
+            db_path = config.get_strategy_db_path(coin)
+            
             # write_batch로 일괄 저장
-            saved_count = write_batch(expanded_strategies, 'coin_strategies', db_path=db_path)
+            saved_count = write_batch(expanded_strategies, 'strategies', db_path=db_path)
             
             logger.info(f"✅ 전략 저장 완료: {saved_count}개")
             return saved_count
@@ -314,29 +339,64 @@ class StrategyManager:
             # 3. 다양한 전략 타입별 파라미터 샘플링
             strategies = []
             
-            # 3.1 범위 거래 전략 (30%)
-            range_count = int(n * 0.3)
-            if range_count > 0:
-                range_strategies = self._generate_range_trading_strategies(coin, interval, range_count)
-                strategies.extend(range_strategies)
+            # 🔥 [개선] 진화적 생성 우선 시도
+            try:
+                # 상위 등급 전략 로드 (S, A, B)
+                top_strategies = load_strategies_pool(coin, interval, limit=50)
+                valid_parents = [s for s in top_strategies if s.get('quality_grade') in ['S', 'A', 'B']]
+                
+                if len(valid_parents) >= 2:
+                    evolver = StrategyEvolver()
+                    n_evolution = int(n * 0.7)  # 70%는 진화로 생성
+                    
+                    logger.info(f"🧬 진화 모드: 우수 전략 {len(valid_parents)}개를 기반으로 {n_evolution}개 생성 시도")
+                    evolved_results = evolver.evolve_strategies(valid_parents, n_children=n_evolution)
+                    
+                    for es in evolved_results:
+                        st_dict = es.params.copy()
+                        st_dict['id'] = es.strategy_id
+                        st_dict['parent_id'] = es.parent_id
+                        st_dict['strategy_type'] = 'evolved'
+                        st_dict['coin'] = coin
+                        st_dict['interval'] = interval
+                        
+                        # make_strategy를 통해 객체화
+                        strategy = make_strategy(st_dict, coin, interval)
+                        strategies.append(strategy)
+                        
+                    logger.info(f"✅ 진화 성공: {len(strategies)}개 전략 생성됨")
+            except Exception as evol_err:
+                logger.warning(f"⚠️ 진화 생성 실패 (기본 생성으로 진행): {evol_err}")
+
+            # 남은 수량 계산
+            remaining_n = n - len(strategies)
             
-            # 3.2 평균 회귀 전략 (25%)
-            mean_reversion_count = int(n * 0.25)
-            if mean_reversion_count > 0:
-                mr_strategies = self._generate_mean_reversion_strategies(coin, interval, mean_reversion_count)
-                strategies.extend(mr_strategies)
-            
-            # 3.3 추세 추종 전략 (25%)
-            trend_following_count = int(n * 0.25)
-            if trend_following_count > 0:
-                tf_strategies = self._generate_trend_following_strategies(coin, interval, trend_following_count)
-                strategies.extend(tf_strategies)
-            
-            # 3.4 볼륨 스파이크 전략 (20%)
-            volume_spike_count = n - len(strategies)
-            if volume_spike_count > 0:
-                vs_strategies = self._generate_volume_spike_strategies(coin, interval, volume_spike_count)
-                strategies.extend(vs_strategies)
+            if remaining_n > 0:
+                logger.info(f"🎲 기본 전략 생성: {remaining_n}개 (부족분)")
+                
+                # 3.1 범위 거래 전략 (30%)
+                range_count = int(remaining_n * 0.3)
+                if range_count > 0:
+                    range_strategies = self._generate_range_trading_strategies(coin, interval, range_count)
+                    strategies.extend(range_strategies)
+                
+                # 3.2 평균 회귀 전략 (25%)
+                mean_reversion_count = int(remaining_n * 0.25)
+                if mean_reversion_count > 0:
+                    mr_strategies = self._generate_mean_reversion_strategies(coin, interval, mean_reversion_count)
+                    strategies.extend(mr_strategies)
+                
+                # 3.3 추세 추종 전략 (25%)
+                trend_following_count = int(remaining_n * 0.25)
+                if trend_following_count > 0:
+                    tf_strategies = self._generate_trend_following_strategies(coin, interval, trend_following_count)
+                    strategies.extend(tf_strategies)
+                
+                # 3.4 볼륨 스파이크 전략 (나머지)
+                volume_spike_count = n - len(strategies)
+                if volume_spike_count > 0:
+                    vs_strategies = self._generate_volume_spike_strategies(coin, interval, volume_spike_count)
+                    strategies.extend(vs_strategies)
             
             logger.info(f"✅ 전략 생성 완료: {len(strategies)}개 생성됨")
             if len(strategies) == 0:
@@ -699,9 +759,9 @@ class StrategyManager:
                     'take_profit_pct': data.get('take_profit_pct') or data['params'].get('take_profit_pct', 0.04),
                 }
                 
-                # 데이터베이스 저장용 필드 추가 (개선된 스키마에 맞춤)
+                    # 데이터베이스 저장용 필드 추가 (개선된 스키마에 맞춤)
                 db_record = {
-                    'id': data['id'],
+                    'id': data['id'], # 🔥 id로 복구 (테이블 컬럼은 id임)
                     'coin': data['coin'],
                     'interval': data['interval'],
                     'strategy_type': data.get('strategy_type', 'hybrid'),
@@ -769,13 +829,28 @@ class StrategyManager:
                     'parent_strategy_id': (data.get('parent_strategy_id') or
                                            data['params'].get('parent_strategy_id') or
                                            getattr(strategy, 'parent_strategy_id', None)),
+                    # 🆕 v2 Lifecycle
+                    'lifecycle_status': data.get('lifecycle_status', 'QUARANTINE'),
+                    'failure_assumption': data.get('failure_assumption', None),
+                    
                     'params': json.dumps(data.get('params', {}))  # 전체 파라미터 저장
                 }
                 strategy_data.append(db_record)
             
             # 배치 저장
             logger.info(f"🔍 전략 저장 시작: {len(strategy_data)}개 전략 데이터 준비됨")
-            saved_count = write_batch(strategy_data, 'coin_strategies')
+
+            # 🔥 FIX: coin 추출 및 코인별 DB 경로 설정
+            coin = strategy_data[0]['coin'] if strategy_data else None
+            if coin:
+                from rl_pipeline.core.env import config
+                db_path = config.get_strategy_db_path(coin)
+                logger.info(f"🔍 코인별 DB 경로 사용: {db_path}")
+                saved_count = write_batch(strategy_data, 'strategies', db_path=db_path)
+            else:
+                # Fallback: coin이 없으면 기본 경로 사용
+                saved_count = write_batch(strategy_data, 'strategies')
+
             logger.info(f"🔍 write_batch 결과: {saved_count}개 저장됨")
             
             logger.info(f"✅ 전략 DB 저장 완료: {saved_count}개")
@@ -906,65 +981,94 @@ def get_strategy_statistics(strategies: List[Strategy]) -> Dict[str, Any]:
     manager = get_strategy_manager()
     return manager.get_strategy_statistics(strategies)
 
-def create_run_record(run_id: str, notes: str = None, coin: str = None, interval: str = None) -> bool:
-    """새로운 실행 기록 생성 - 중복 방지 (개선된 버전: coin, interval 포함)
-    
+def create_run_record(run_id: str, notes: str = None, coin: str = None, interval: str = None,
+                      market_type: str = "COIN", market: str = "BITHUMB") -> bool:
+    """새로운 실행 기록 생성 - 중복 방지 (개선된 버전: symbol, interval 포함)
+
     runs 테이블과 run_records 테이블 모두에 저장 (하위 호환성 유지)
+
+    핵심 설계:
+    - coin 파라미터는 하위 호환성을 위해 유지 (내부적으로 symbol로 저장)
+    - market_type, market 컬럼 추가
     """
+    import time
+    import random
+    
     try:
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
         from rl_pipeline.core.env import config
         from datetime import datetime
+
+        # coin → symbol 매핑 (하위 호환성)
+        symbol = coin
+
+        # 실행 기록은 공용 DB(또는 설정된 DB)에 저장
+        db_path = config.LEARNING_RESULTS_DB_PATH
         
-        with get_optimized_db_connection(config.STRATEGIES_DB) as conn:
-            cursor = conn.cursor()
-            
-            # 🔥 1. runs 테이블에 저장 (기존 로직)
-            cursor.execute("SELECT COUNT(*) FROM runs WHERE run_id = ?", (run_id,))
-            existing_runs = cursor.fetchone()[0]
-            
-            if existing_runs == 0:
-                cursor.execute("""
-                    INSERT INTO runs (run_id, coin, interval, start_time, notes, status)
-                    VALUES (?, ?, ?, datetime('now'), ?, 'running')
-                """, (run_id, coin, interval, notes))
-            
-            # 🔥 2. run_records 테이블에도 저장 (새로운 테이블)
+        max_retries = 5
+        
+        for attempt in range(max_retries):
             try:
-                # run_records 테이블 존재 여부 확인
-                cursor.execute("""
-                    SELECT name FROM sqlite_master 
-                    WHERE type='table' AND name='run_records'
-                """)
-                has_run_records = cursor.fetchone() is not None
-                
-                if has_run_records:
-                    cursor.execute("SELECT COUNT(*) FROM run_records WHERE run_id = ?", (run_id,))
-                    existing_records = cursor.fetchone()[0]
-                    
-                    if existing_records == 0:
-                        now = datetime.now().isoformat()
+                with get_optimized_db_connection(db_path) as conn:
+                    cursor = conn.cursor()
+
+                    # 🔥 1. runs 테이블에 저장 (symbol 사용)
+                    cursor.execute("SELECT COUNT(*) FROM runs WHERE run_id = ?", (run_id,))
+                    existing_runs = cursor.fetchone()[0]
+
+                    if existing_runs == 0:
                         cursor.execute("""
-                            INSERT INTO run_records 
-                            (run_id, status, message, coin, interval, created_at, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (run_id, 'running', notes, coin, interval, now, now))
-                        logger.debug(f"✅ run_records 테이블에 저장 완료: {run_id}")
+                            INSERT INTO runs (run_id, market_type, market, symbol, interval, start_time, notes, status)
+                            VALUES (?, ?, ?, ?, ?, datetime('now'), ?, 'running')
+                        """, (run_id, market_type, market, symbol, interval, notes))
+                    
+                    # 🔥 2. run_records 테이블에도 저장 (새로운 테이블)
+                    try:
+                        # run_records 테이블 존재 여부 확인
+                        cursor.execute("""
+                            SELECT name FROM sqlite_master
+                            WHERE type='table' AND name='run_records'
+                        """)
+                        has_run_records = cursor.fetchone() is not None
+
+                        if has_run_records:
+                            cursor.execute("SELECT COUNT(*) FROM run_records WHERE run_id = ?", (run_id,))
+                            existing_records = cursor.fetchone()[0]
+
+                            if existing_records == 0:
+                                now = datetime.now().isoformat()
+                                cursor.execute("""
+                                    INSERT INTO run_records
+                                    (run_id, status, message, market_type, market, symbol, interval, created_at, updated_at)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (run_id, 'running', notes, market_type, market, symbol, interval, now, now))
+                                logger.debug(f"✅ run_records 테이블에 저장 완료: {run_id}")
+                            else:
+                                logger.debug(f"⚠️ run_records에 이미 존재: {run_id}")
+                        else:
+                            logger.debug(f"⚠️ run_records 테이블이 없음 (무시)")
+                    except Exception as e:
+                        logger.warning(f"⚠️ run_records 저장 실패 (무시): {e}")
+
+                    conn.commit()
+
+                    if existing_runs == 0:
+                        logger.info(f"✅ 실행 기록 생성 완료: {run_id} (symbol={symbol}, interval={interval})")
                     else:
-                        logger.debug(f"⚠️ run_records에 이미 존재: {run_id}")
-                else:
-                    logger.debug(f"⚠️ run_records 테이블이 없음 (무시)")
+                        logger.info(f"✅ 실행 기록 확인 완료 (이미 존재): {run_id}")
+                    
+                    return True
+                    
             except Exception as e:
-                logger.warning(f"⚠️ run_records 저장 실패 (무시): {e}")
-            
-            conn.commit()
-            
-            if existing_runs == 0:
-                logger.info(f"✅ 실행 기록 생성 완료: {run_id} (coin={coin}, interval={interval})")
-            else:
-                logger.info(f"✅ 실행 기록 확인 완료 (이미 존재): {run_id}")
-            
-            return True
+                is_locked = "database is locked" in str(e) or "disk I/O error" in str(e) or "malformed" in str(e)
+                if is_locked and attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0.1, 1.0)
+                    logger.warning(f"⚠️ 실행 기록 생성 일시적 실패 ({attempt+1}/{max_retries}), {wait_time:.2f}초 후 재시도: {e}")
+                    time.sleep(wait_time)
+                else:
+                    if attempt == max_retries - 1:
+                        logger.error(f"❌ 실행 기록 생성 실패 (최종): {e}")
+                    raise e
             
     except Exception as e:
         logger.error(f"❌ 실행 기록 생성 실패: {e}")
@@ -977,96 +1081,117 @@ def update_run_record(run_id: str, status: str, message: str = "",
     
     runs 테이블과 run_records 테이블 모두에 업데이트 (하위 호환성 유지)
     """
+    import time
+    import random
+    
     try:
         from rl_pipeline.db.connection_pool import get_optimized_db_connection
         from rl_pipeline.core.env import config
         from datetime import datetime
         
-        with get_optimized_db_connection(config.STRATEGIES_DB) as conn:
-            cursor = conn.cursor()
-            
-            # 업데이트할 필드들 동적 구성
-            update_fields = ["status = ?", "notes = ?", "completed_at = datetime('now')"]
-            update_values = [status, message]
-            
-            # 통계 정보 추가 (값이 제공된 경우만)
-            if strategies_count is not None:
-                update_fields.append("strategies_count = ?")
-                update_values.append(strategies_count)
-            if successful_strategies is not None:
-                update_fields.append("successful_strategies = ?")
-                update_values.append(successful_strategies)
-            if error_count is not None:
-                update_fields.append("error_count = ?")
-                update_values.append(error_count)
-            
-            update_values.append(run_id)
-            
-            # 🔥 1. runs 테이블 업데이트 (기존 로직)
+        # 실행 기록은 공용 DB(또는 설정된 DB)에 저장
+        db_path = config.LEARNING_RESULTS_DB_PATH
+        
+        max_retries = 5
+        
+        for attempt in range(max_retries):
             try:
-                query = f"UPDATE runs SET {', '.join(update_fields)} WHERE run_id = ?"
-                cursor.execute(query, tuple(update_values))
-            except Exception as e:
-                # completed_at 컬럼이 없는 경우 제외하고 재시도
-                update_fields_safe = [f for f in update_fields if 'completed_at' not in f]
-                if update_fields_safe:
-                    query = f"UPDATE runs SET {', '.join(update_fields_safe)} WHERE run_id = ?"
-                    safe_values = [v for i, v in enumerate(update_values) if i < len(update_values) - 1]
-                    safe_values.append(run_id)
-                    cursor.execute(query, tuple(safe_values))
-                else:
-                    raise
-            
-            # 🔥 2. run_records 테이블도 업데이트
-            try:
-                cursor.execute("""
-                    SELECT name FROM sqlite_master 
-                    WHERE type='table' AND name='run_records'
-                """)
-                has_run_records = cursor.fetchone() is not None
-                
-                if has_run_records:
-                    run_records_fields = []
-                    run_records_values = []
+                with get_optimized_db_connection(db_path) as conn:
+                    cursor = conn.cursor()
                     
-                    if status:
-                        run_records_fields.append("status = ?")
-                        run_records_values.append(status)
+                    # 업데이트할 필드들 동적 구성
+                    update_fields = ["status = ?", "notes = ?", "completed_at = datetime('now')"]
+                    update_values = [status, message]
                     
-                    if message:
-                        run_records_fields.append("message = ?")
-                        run_records_values.append(message)
-                    
+                    # 통계 정보 추가 (값이 제공된 경우만)
                     if strategies_count is not None:
-                        run_records_fields.append("strategies_count = ?")
-                        run_records_values.append(strategies_count)
-                    
+                        update_fields.append("strategies_count = ?")
+                        update_values.append(strategies_count)
                     if successful_strategies is not None:
-                        run_records_fields.append("successful_strategies = ?")
-                        run_records_values.append(successful_strategies)
-                    
+                        update_fields.append("successful_strategies = ?")
+                        update_values.append(successful_strategies)
                     if error_count is not None:
-                        run_records_fields.append("error_count = ?")
-                        run_records_values.append(error_count)
+                        update_fields.append("error_count = ?")
+                        update_values.append(error_count)
                     
-                    # updated_at 항상 업데이트
-                    run_records_fields.append("updated_at = ?")
-                    run_records_values.append(datetime.now().isoformat())
-                    run_records_values.append(run_id)
+                    update_values.append(run_id)
                     
-                    if run_records_fields:
-                        query = f"UPDATE run_records SET {', '.join(run_records_fields)} WHERE run_id = ?"
-                        cursor.execute(query, tuple(run_records_values))
-                        logger.debug(f"✅ run_records 테이블 업데이트 완료: {run_id}")
+                    # 🔥 1. runs 테이블 업데이트 (기존 로직)
+                    try:
+                        query = f"UPDATE runs SET {', '.join(update_fields)} WHERE run_id = ?"
+                        cursor.execute(query, tuple(update_values))
+                    except Exception as e:
+                        # completed_at 컬럼이 없는 경우 제외하고 재시도
+                        update_fields_safe = [f for f in update_fields if 'completed_at' not in f]
+                        if update_fields_safe:
+                            query = f"UPDATE runs SET {', '.join(update_fields_safe)} WHERE run_id = ?"
+                            safe_values = [v for i, v in enumerate(update_values) if i < len(update_values) - 1]
+                            safe_values.append(run_id)
+                            cursor.execute(query, tuple(safe_values))
+                        else:
+                            raise
+                    
+                    # 🔥 2. run_records 테이블도 업데이트
+                    try:
+                        cursor.execute("""
+                            SELECT name FROM sqlite_master 
+                            WHERE type='table' AND name='run_records'
+                        """)
+                        has_run_records = cursor.fetchone() is not None
+                        
+                        if has_run_records:
+                            run_records_fields = []
+                            run_records_values = []
+                            
+                            if status:
+                                run_records_fields.append("status = ?")
+                                run_records_values.append(status)
+                            
+                            if message:
+                                run_records_fields.append("message = ?")
+                                run_records_values.append(message)
+                            
+                            if strategies_count is not None:
+                                run_records_fields.append("strategies_count = ?")
+                                run_records_values.append(strategies_count)
+                            
+                            if successful_strategies is not None:
+                                run_records_fields.append("successful_strategies = ?")
+                                run_records_values.append(successful_strategies)
+                            
+                            if error_count is not None:
+                                run_records_fields.append("error_count = ?")
+                                run_records_values.append(error_count)
+                            
+                            # updated_at 항상 업데이트
+                            run_records_fields.append("updated_at = ?")
+                            run_records_values.append(datetime.now().isoformat())
+                            run_records_values.append(run_id)
+                            
+                            if run_records_fields:
+                                query = f"UPDATE run_records SET {', '.join(run_records_fields)} WHERE run_id = ?"
+                                cursor.execute(query, tuple(run_records_values))
+                                logger.debug(f"✅ run_records 테이블 업데이트 완료: {run_id}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ run_records 업데이트 실패 (무시): {e}")
+                    
+                    conn.commit()
+                    stats_info = ""
+                    if strategies_count is not None or successful_strategies is not None or error_count is not None:
+                        stats_info = f" (strategies={strategies_count}, successful={successful_strategies}, errors={error_count})"
+                    logger.info(f"✅ 실행 기록 업데이트 완료: {run_id} -> {status}{stats_info}")
+                    return True
+                    
             except Exception as e:
-                logger.warning(f"⚠️ run_records 업데이트 실패 (무시): {e}")
-            
-            conn.commit()
-            stats_info = ""
-            if strategies_count is not None or successful_strategies is not None or error_count is not None:
-                stats_info = f" (strategies={strategies_count}, successful={successful_strategies}, errors={error_count})"
-            logger.info(f"✅ 실행 기록 업데이트 완료: {run_id} -> {status}{stats_info}")
-            return True
+                is_locked = "database is locked" in str(e) or "disk I/O error" in str(e) or "malformed" in str(e)
+                if is_locked and attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0.1, 1.0)
+                    logger.warning(f"⚠️ 실행 기록 업데이트 일시적 실패 ({attempt+1}/{max_retries}), {wait_time:.2f}초 후 재시도: {e}")
+                    time.sleep(wait_time)
+                else:
+                    if attempt == max_retries - 1:
+                        logger.error(f"❌ 실행 기록 업데이트 실패 (최종): {e}")
+                    raise e
             
     except Exception as e:
         logger.error(f"❌ 실행 기록 업데이트 실패: {e}")

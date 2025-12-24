@@ -16,6 +16,9 @@ import json
 
 logger = logging.getLogger(__name__)
 
+GLOBAL_REPLACEMENT_SCORE_THRESHOLD = 0.01
+VALUE_EPSILON = 1e-6
+
 
 def classify_rsi_zone(rsi_min: float, rsi_max: float) -> str:
     """
@@ -69,6 +72,12 @@ def classify_regime(strategy: Dict[str, Any]) -> str:
     # regime이 없으면 strategy_type에서 추론
     strategy_type = strategy.get('strategy_type', '')
 
+    # 1. ADX 확인 (ADX > 25이면 Trending)
+    adx_min = params.get('adx_min')
+    if adx_min is not None and adx_min >= 25:
+        return 'trending'
+
+    # 2. Strategy Type 확인
     if 'trend' in strategy_type.lower():
         return 'trending'
     elif 'volatile' in strategy_type.lower() or 'breakout' in strategy_type.lower():
@@ -164,8 +173,16 @@ def get_zone_key(strategy: Dict[str, Any]) -> Tuple[str, str, str, str]:
             params = {}
 
     # RSI 범위
-    rsi_min = params.get('rsi_min', 30)
-    rsi_max = params.get('rsi_max', 70)
+    rsi_min = params.get('rsi_min')
+    if rsi_min is None:
+        # Fallback: MFI 사용
+        rsi_min = params.get('mfi_min', 30)
+        
+    rsi_max = params.get('rsi_max')
+    if rsi_max is None:
+        # Fallback: MFI 사용
+        rsi_max = params.get('mfi_max', 70)
+        
     rsi_zone = classify_rsi_zone(rsi_min, rsi_max)
 
     # 레짐
@@ -184,15 +201,35 @@ def calculate_strategy_score(strategy: Dict[str, Any]) -> float:
     """
     전략의 종합 점수 계산
 
+    Phase 2 개선: strategy_grades를 Source of Truth로 우선 사용
+
     Args:
         strategy: 전략 dict
 
     Returns:
         종합 점수 (0.0 ~ 1.0)
     """
-    # 성과 지표 추출
-    profit = strategy.get('profit', 0) or 0
+    # Phase 2: strategy_grades의 grade_score를 우선 사용
+    grade_score = strategy.get('grade_score')
+    if grade_score is not None and grade_score > 0:
+        # grade_score가 있으면 그대로 사용 (이미 0-1 범위로 정규화되어 있음)
+        return max(0.0, min(1.0, grade_score))
+
+    # Fallback: strategy_grades 데이터가 없으면 기존 방식 사용
+    # (total_return, predictive_accuracy 우선 참조)
+    total_return = strategy.get('total_return')
+    if total_return is not None:
+        profit = total_return
+    else:
+        profit = strategy.get('profit', 0) or 0
+
     win_rate = strategy.get('win_rate', 0) or 0
+
+    # predictive_accuracy가 있으면 승률 대신 사용
+    predictive_accuracy = strategy.get('predictive_accuracy')
+    if predictive_accuracy is not None:
+        win_rate = max(win_rate, predictive_accuracy)
+
     sharpe_ratio = strategy.get('sharpe_ratio', 0) or 0
     max_drawdown = abs(strategy.get('max_drawdown', 0) or 0)
 
@@ -208,14 +245,80 @@ def calculate_strategy_score(strategy: Dict[str, Any]) -> float:
     return max(0.0, min(1.0, score))
 
 
+def _find_existing_global_strategy(
+    existing_strategies: List[Dict[str, Any]],
+    parent_id: Optional[str],
+    zone_key: str,
+) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    """
+    유사도 분류 결과를 바탕으로 기존 글로벌 전략을 탐색
+
+    Returns:
+        (리스트 인덱스, 전략 dict)
+    """
+    if parent_id:
+        for idx, strategy in enumerate(existing_strategies):
+            if strategy.get('id') == parent_id:
+                return idx, strategy
+
+    for idx, strategy in enumerate(existing_strategies):
+        if strategy.get('zone_key') == zone_key:
+            return idx, strategy
+
+    return None, None
+
+
+def _should_replace_existing_global_strategy(
+    existing_strategy: Dict[str, Any],
+    new_strategy: Dict[str, Any],
+    score_threshold: float = GLOBAL_REPLACEMENT_SCORE_THRESHOLD,
+) -> Tuple[bool, float, float]:
+    """
+    기존 전략과 신규 전략을 비교하여 교체 여부를 판단
+
+    Returns:
+        (교체 여부, 기존 점수, 신규 점수)
+    """
+    existing_score = calculate_strategy_score(existing_strategy)
+    new_score = calculate_strategy_score(new_strategy)
+    score_diff = new_score - existing_score
+
+    if score_diff > score_threshold:
+        return True, existing_score, new_score
+    if score_diff < -score_threshold:
+        return False, existing_score, new_score
+
+    # 점수 차이가 미미하면 성과 지표로 판단
+    existing_profit = existing_strategy.get('profit') or 0.0
+    new_profit = new_strategy.get('profit') or 0.0
+    if new_profit > existing_profit + VALUE_EPSILON:
+        return True, existing_score, new_score
+    if new_profit + VALUE_EPSILON < existing_profit:
+        return False, existing_score, new_score
+
+    existing_win = existing_strategy.get('win_rate') or 0.0
+    new_win = new_strategy.get('win_rate') or 0.0
+    if new_win > existing_win + VALUE_EPSILON:
+        return True, existing_score, new_score
+    if new_win + VALUE_EPSILON < existing_win:
+        return False, existing_score, new_score
+
+    existing_trades = existing_strategy.get('trades_count') or 0
+    new_trades = new_strategy.get('trades_count') or 0
+    if new_trades > existing_trades:
+        return True, existing_score, new_score
+
+    return False, existing_score, new_score
+
+
 def group_strategies_by_zone(
-    all_coin_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]
+    all_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]]
 ) -> Dict[Tuple[str, str, str, str], List[Dict[str, Any]]]:
     """
     모든 코인 전략을 구역별로 그룹화
 
     Args:
-        all_coin_strategies: {coin: {interval: [strategies]}}
+        all_strategies: {coin: {interval: [strategies]}}
 
     Returns:
         {zone_key: [strategies]}
@@ -224,7 +327,7 @@ def group_strategies_by_zone(
 
     total_strategies = 0
 
-    for coin, interval_strategies in all_coin_strategies.items():
+    for coin, interval_strategies in all_strategies.items():
         for interval, strategies in interval_strategies.items():
             for strategy in strategies:
                 try:
@@ -312,29 +415,38 @@ def create_global_strategy_from_best(
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     global_id = f"GLOBAL_ZONE_{zone_str}_{timestamp}"
 
+    # 원본 전략 params 안전하게 병합
+    raw_params = best_strategy.get('params', {})
+    if isinstance(raw_params, str):
+        try:
+            raw_params = json.loads(raw_params)
+        except Exception:
+            raw_params = {}
+    elif not isinstance(raw_params, dict):
+        raw_params = {}
+
+    merged_params = raw_params.copy()
+    param_fields = [
+        'rsi_min', 'rsi_max',
+        'volume_ratio_min', 'volume_ratio_max',
+        'macd_buy_threshold', 'macd_sell_threshold',
+        'mfi_min', 'mfi_max',
+        'atr_min', 'atr_max',
+        'adx_min',
+        'stop_loss_pct', 'take_profit_pct'
+    ]
+    for field in param_fields:
+        value = best_strategy.get(field)
+        if value is not None:
+            merged_params[field] = value
+
     # 원본 전략 복사
     global_strategy = {
         'id': global_id,
         'coin': 'GLOBAL',
         'interval': best_strategy.get('_source_interval', '240m'),
         'strategy_type': f'zone_based_{regime}',
-        'params': {
-            # 기존 params에 파라미터 값 추가 (coin_strategies는 컬럼에 저장됨)
-            **(best_strategy.get('params', {})),
-            'rsi_min': best_strategy.get('rsi_min'),
-            'rsi_max': best_strategy.get('rsi_max'),
-            'volume_ratio_min': best_strategy.get('volume_ratio_min'),
-            'volume_ratio_max': best_strategy.get('volume_ratio_max'),
-            'macd_buy_threshold': best_strategy.get('macd_buy_threshold'),
-            'macd_sell_threshold': best_strategy.get('macd_sell_threshold'),
-            'mfi_min': best_strategy.get('mfi_min'),
-            'mfi_max': best_strategy.get('mfi_max'),
-            'atr_min': best_strategy.get('atr_min'),
-            'atr_max': best_strategy.get('atr_max'),
-            'adx_min': best_strategy.get('adx_min'),
-            'stop_loss_pct': best_strategy.get('stop_loss_pct'),
-            'take_profit_pct': best_strategy.get('take_profit_pct'),
-        },
+        'params': merged_params,
         'name': f'Global Zone Strategy ({zone_str})',
         'description': (
             f'구역 기반 글로벌 전략: {zone_str} | '
@@ -365,7 +477,7 @@ def create_global_strategy_from_best(
         'volatility_level': volatility_level,
 
         # 출처 정보
-        'source_coin': best_strategy.get('_source_coin'),
+        'source_symbol': best_strategy.get('_source_coin'),
         'source_strategy_id': best_strategy.get('id'),
         'source_type': 'zone_based',
 
@@ -379,14 +491,14 @@ def create_global_strategy_from_best(
 
 
 def create_zone_based_global_strategies(
-    all_coin_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    all_strategies: Dict[str, Dict[str, List[Dict[str, Any]]]],
     enable_similarity_check: bool = True
 ) -> List[Dict[str, Any]]:
     """
     구역 기반 글로벌 전략 생성 (메인 함수)
 
     Args:
-        all_coin_strategies: {coin: {interval: [strategies]}}
+        all_strategies: {coin: {interval: [strategies]}}
         enable_similarity_check: 유사도 검사 활성화 여부
 
     Returns:
@@ -396,7 +508,7 @@ def create_zone_based_global_strategies(
 
     try:
         # 1. 전략을 구역별로 그룹화
-        zones = group_strategies_by_zone(all_coin_strategies)
+        zones = group_strategies_by_zone(all_strategies)
 
         if not zones:
             logger.warning("⚠️ 분류된 구역 없음")
@@ -424,34 +536,41 @@ def create_zone_based_global_strategies(
         if enable_similarity_check:
             try:
                 from rl_pipeline.db.connection_pool import get_optimized_db_connection
+                from rl_pipeline.db.reads import check_table_exists
 
-                with get_optimized_db_connection("strategies") as conn:
-                    cursor = conn.cursor()
+                # 먼저 테이블 존재 여부 확인 (에러 로그 방지)
+                if not check_table_exists('global_strategies', db_path="strategies"):
+                    logger.info("ℹ️ 글로벌 전략 테이블이 없어 유사도 검사를 건너뜁니다 (첫 실행)")
+                    enable_similarity_check = False
+                else:
+                    with get_optimized_db_connection("strategies") as conn:
+                        cursor = conn.cursor()
 
-                    cursor.execute("""
-                        SELECT * FROM global_strategies
-                        WHERE zone_key IS NOT NULL
-                    """)
+                        cursor.execute("""
+                            SELECT * FROM global_strategies
+                            WHERE zone_key IS NOT NULL
+                        """)
 
-                    rows = cursor.fetchall()
-                    columns = [desc[0] for desc in cursor.description]
+                        rows = cursor.fetchall()
+                        columns = [desc[0] for desc in cursor.description]
 
-                    for row in rows:
-                        strategy = dict(zip(columns, row))
+                        for row in rows:
+                            strategy = dict(zip(columns, row))
 
-                        # params JSON 파싱
-                        if 'params' in strategy and isinstance(strategy['params'], str):
-                            try:
-                                strategy['params'] = json.loads(strategy['params'])
-                            except:
-                                pass
+                            # params JSON 파싱
+                            if 'params' in strategy and isinstance(strategy['params'], str):
+                                try:
+                                    strategy['params'] = json.loads(strategy['params'])
+                                except:
+                                    pass
 
-                        existing_global_strategies.append(strategy)
+                            existing_global_strategies.append(strategy)
 
-                logger.info(f"📊 기존 글로벌 전략 로드: {len(existing_global_strategies)}개 (유사도 검사용)")
+                    logger.info(f"📊 기존 글로벌 전략 로드: {len(existing_global_strategies)}개 (유사도 검사용)")
 
             except Exception as e:
-                logger.warning(f"⚠️ 기존 글로벌 전략 로드 실패: {e}")
+                # 테이블이 없거나 로드 실패 시 유사도 검사 비활성화
+                logger.warning(f"⚠️ 기존 글로벌 전략 로드 실패 (유사도 검사 건너뜀): {e}")
                 enable_similarity_check = False
 
         # 4. 글로벌 전략 생성 (유사도 검사 포함)
@@ -459,6 +578,7 @@ def create_zone_based_global_strategies(
 
         for zone_key, best_strategy in best_strategies.items():
             try:
+                zone_str = '-'.join(zone_key)
                 global_strategy = create_global_strategy_from_best(zone_key, best_strategy)
 
                 # 유사도 검사
@@ -483,7 +603,46 @@ def create_zone_based_global_strategies(
 
                     # duplicate는 건너뜀 (중복 방지)
                     if classification == 'duplicate':
-                        logger.info(f"  ⚠️ 중복 전략 건너뜀: {'-'.join(zone_key)}")
+                        idx, existing_strategy = _find_existing_global_strategy(
+                            existing_global_strategies,
+                            parent_id,
+                            zone_str
+                        )
+
+                        if existing_strategy:
+                            replace, existing_score, new_score = _should_replace_existing_global_strategy(
+                                existing_strategy,
+                                global_strategy
+                            )
+
+                            if replace:
+                                logger.info(
+                                    f"  🔁 중복 전략 교체: {zone_str} "
+                                    f"(score {existing_score:.3f} → {new_score:.3f})"
+                                )
+                                original_id = existing_strategy.get('id')
+                                if original_id:
+                                    global_strategy['id'] = original_id
+                                global_strategy['similarity_classification'] = 'replacement'
+                                global_strategy['parent_strategy_id'] = parent_id or original_id
+                                global_strategy['updated_at'] = datetime.now().isoformat()
+                                global_strategies.append(global_strategy)
+
+                                if idx is not None:
+                                    updated_entry = existing_strategy.copy()
+                                    updated_entry.update(global_strategy)
+                                    if isinstance(global_strategy.get('params'), dict):
+                                        updated_entry['params'] = global_strategy['params']
+                                    existing_global_strategies[idx] = updated_entry
+                                continue
+
+                            logger.info(
+                                f"  ⚠️ 중복 전략 유지: {zone_str} "
+                                f"(existing={existing_score:.3f}, new={new_score:.3f})"
+                            )
+                            continue
+
+                        logger.info(f"  ⚠️ 중복 전략 건너뜀: {zone_str} (기존 전략 미탐지)")
                         continue
 
                 global_strategies.append(global_strategy)
@@ -539,6 +698,10 @@ def save_global_strategies_to_db(
     try:
         from rl_pipeline.db.writes import write_batch
         from rl_pipeline.core.env import config
+        from rl_pipeline.db.schema import create_global_strategies_table
+
+        # 테이블 존재 여부 확인 및 생성
+        create_global_strategies_table()
 
         # params를 JSON 문자열로 변환
         for strategy in global_strategies:

@@ -105,6 +105,11 @@ def save_realtime_signal_from_analysis(
         저장 성공 여부
     """
     try:
+        # 🚨 [Safety] 코인 심볼 유효성 검사 (숫자형 코인 방지)
+        if str(coin).isdigit():
+            logger.error(f"⛔ 잘못된 코인 심볼(숫자) 감지되어 저장 건너뜀: {coin}")
+            return False
+
         # 테이블 확인
         ensure_signals_table()
         

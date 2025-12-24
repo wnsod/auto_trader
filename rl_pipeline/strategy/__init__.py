@@ -33,8 +33,8 @@ except ImportError as e:
 # 전략 생성
 try:
     from .creator import (
-        create_coin_strategies, create_intelligent_strategies,
-        create_coin_strategies_dynamic,
+        create_strategies, create_intelligent_strategies,
+        create_strategies_dynamic,
     )
 except ImportError:
     # 🔥 선택적 모듈이므로 조용하게 처리
@@ -56,8 +56,8 @@ except ImportError:
 # 전략 검증
 try:
     from .validator import (
-        revalidate_coin_strategies,
-        revalidate_coin_strategies_dynamic,
+        revalidate_strategies,
+        revalidate_strategies_dynamic,
         perform_enhanced_strategy_validation,
         update_strategy_grade,
         load_high_grade_strategies,
@@ -99,14 +99,14 @@ __all__ = [
     "generate_strategies", "generate_strategies_with_indicators",
     "save_strategies_to_db", "generate_and_save_strategies",
     "get_strategy_statistics", "create_run_record", "update_run_record",
-    "create_coin_strategies", "create_intelligent_strategies", "revalidate_coin_strategies",
+    "create_strategies", "create_intelligent_strategies", "revalidate_strategies",
     "run_coin_dynamic_routing", "extract_optimal_conditions_from_analysis",
     "perform_enhanced_strategy_validation", "update_strategy_grade",
     "extract_routing_patterns_from_analysis", "load_high_grade_strategies",
     "create_dna_fractal_based_routing_strategies", "create_enhanced_dynamic_routing_strategies",
     "save_dynamic_routing_strategies_to_db", "create_missing_tables_if_needed",
     # 🆕 동적 분할 및 시장 상황별 함수들
-    "create_coin_strategies_dynamic", "revalidate_coin_strategies_dynamic",
+    "create_strategies_dynamic", "revalidate_strategies_dynamic",
     "run_dynamic_routing_by_market_condition",
     # 🤖 AI 학습용 데이터 수집 함수들
     "collect_strategy_performance_for_ai", "collect_strategy_comparison_for_ai",

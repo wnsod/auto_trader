@@ -127,7 +127,7 @@ class StrategyRollbackManager:
                 
                 # 부모 전략 파라미터 조회
                 cursor.execute("""
-                    SELECT * FROM coin_strategies
+                    SELECT * FROM strategies
                     WHERE id = ?
                 """, (parent_id,))
                 
@@ -142,7 +142,7 @@ class StrategyRollbackManager:
                 
                 # 현재 전략을 부모 파라미터로 업데이트
                 cursor.execute("""
-                    UPDATE coin_strategies
+                    UPDATE strategies
                     SET rsi_min = ?,
                         rsi_max = ?,
                         stop_loss_pct = ?,
@@ -193,7 +193,7 @@ class StrategyRollbackManager:
                 # (컬럼이 없을 수도 있으므로 안전하게 처리)
                 try:
                     cursor.execute("""
-                        UPDATE coin_strategies
+                        UPDATE strategies
                         SET is_active = 0
                         WHERE id = ?
                     """, (strategy_id,))
@@ -201,7 +201,7 @@ class StrategyRollbackManager:
                     if cursor.rowcount == 0:
                         # 컬럼이 없으면 quality_grade로 표시
                         cursor.execute("""
-                            UPDATE coin_strategies
+                            UPDATE strategies
                             SET quality_grade = 'FROZEN'
                             WHERE id = ?
                         """, (strategy_id,))
@@ -213,7 +213,7 @@ class StrategyRollbackManager:
                 except Exception as col_error:
                     # 컬럼이 없으면 quality_grade로 표시
                     cursor.execute("""
-                        UPDATE coin_strategies
+                        UPDATE strategies
                         SET quality_grade = 'FROZEN'
                         WHERE id = ?
                     """, (strategy_id,))

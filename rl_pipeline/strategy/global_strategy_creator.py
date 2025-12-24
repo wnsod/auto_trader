@@ -3,6 +3,7 @@
 - 인터벌별 글로벌 전략 생성
 - 등급/예측정확도/방향성/레짐 기반 선별
 - 통합 인터벌 글로벌 전략 (등급 가중치)
+- interval_profiles 통합
 """
 
 import logging
@@ -14,6 +15,35 @@ from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
+
+# 🔥 interval_profiles 임포트
+try:
+    from rl_pipeline.core.interval_profiles import (
+        get_interval_profile,
+        get_interval_role,
+        get_integration_weights
+    )
+    INTERVAL_PROFILES_AVAILABLE = True
+except ImportError:
+    logger.debug("interval_profiles 모듈을 찾을 수 없습니다. 기본값 사용")
+    INTERVAL_PROFILES_AVAILABLE = False
+    get_interval_profile = None
+    get_interval_role = None
+    get_integration_weights = None
+
+# 🔥 변동성 프로파일 시스템 임포트
+try:
+    from rl_pipeline.utils.coin_volatility import (
+        get_volatility_profile,
+        VOLATILITY_GROUPS
+    )
+    from rl_pipeline.core.env import config
+    VOLATILITY_SYSTEM_AVAILABLE = True
+except ImportError:
+    logger.debug("변동성 프로파일 모듈을 찾을 수 없습니다.")
+    VOLATILITY_SYSTEM_AVAILABLE = False
+    get_volatility_profile = None
+    VOLATILITY_GROUPS = {}
 
 # 등급 점수 매핑
 GRADE_SCORES = {'S': 6, 'A': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1, 'UNKNOWN': 0}
@@ -330,6 +360,20 @@ def create_global_strategy_for_interval(
             if neutral_list:
                 neutral_strategies[coin] = neutral_list
         
+        # 🔥 interval_profiles 정보 로드
+        interval_profile = {}
+        interval_role = None
+        interval_weight = 0.0
+        if INTERVAL_PROFILES_AVAILABLE and get_interval_profile and get_interval_role and get_integration_weights:
+            try:
+                interval_profile = get_interval_profile(interval) or {}
+                interval_role = get_interval_role(interval)
+                integration_weights = get_integration_weights() or {}
+                interval_weight = integration_weights.get(interval, 0.0)
+                logger.debug(f"🎯 [{interval}] interval_profiles 정보 로드: 역할={interval_role}, 가중치={interval_weight:.3f}")
+            except Exception as e:
+                logger.debug(f"⚠️ [{interval}] interval_profiles 정보 로드 실패: {e}")
+        
         # 🔥 매수 그룹과 매도 그룹을 각각 종합하여 글로벌 전략 생성
         global_strategies = []
         
@@ -351,7 +395,12 @@ def create_global_strategy_for_interval(
                 'created_at': datetime.now().isoformat(),
                 'updated_at': datetime.now().isoformat(),
                 '_num_coins': len(buy_strategies),
-                '_num_strategies': sum(len(s) for s in buy_strategies.values())
+                '_num_strategies': sum(len(s) for s in buy_strategies.values()),
+                # 🔥 interval_profiles 정보 추가
+                'interval_role': interval_role,
+                'interval_weight': interval_weight,
+                'interval_objectives': interval_profile.get('objectives', {}),
+                'interval_label_type': interval_profile.get('labeling', {}).get('label_type', 'unknown')
             }
             global_strategies.append(buy_global_strategy)
             logger.info(f"✅ [{interval}] 글로벌 매수 전략 생성: {len(buy_strategies)}개 코인, {buy_global_strategy['_num_strategies']}개 전략")
@@ -374,7 +423,12 @@ def create_global_strategy_for_interval(
                 'created_at': datetime.now().isoformat(),
                 'updated_at': datetime.now().isoformat(),
                 '_num_coins': len(sell_strategies),
-                '_num_strategies': sum(len(s) for s in sell_strategies.values())
+                '_num_strategies': sum(len(s) for s in sell_strategies.values()),
+                # 🔥 interval_profiles 정보 추가
+                'interval_role': interval_role,
+                'interval_weight': interval_weight,
+                'interval_objectives': interval_profile.get('objectives', {}),
+                'interval_label_type': interval_profile.get('labeling', {}).get('label_type', 'unknown')
             }
             global_strategies.append(sell_global_strategy)
             logger.info(f"✅ [{interval}] 글로벌 매도 전략 생성: {len(sell_strategies)}개 코인, {sell_global_strategy['_num_strategies']}개 전략")
@@ -784,6 +838,92 @@ def create_risk_profile_global_strategy(
         return None
 
 
+def create_volatility_group_global_strategy(
+    interval: str,
+    interval_strategies: Dict[str, List[Dict[str, Any]]],
+    volatility_group: str
+) -> Optional[Dict[str, Any]]:
+    """변동성 그룹별 글로벌 전략 생성"""
+    try:
+        if not VOLATILITY_SYSTEM_AVAILABLE:
+            return None
+
+        from rl_pipeline.strategy.analyzer import _analyze_global_params_from_strategies
+
+        # 해당 변동성 그룹의 코인들만 선별
+        group_strategies = {}
+        
+        # 캔들 DB 경로 (config에서 가져옴)
+        candles_db_path = config.RL_DB if config else None
+        if not candles_db_path:
+            return None
+
+        for coin, strategies in interval_strategies.items():
+            # 코인의 변동성 프로파일 조회
+            # 최적화: 매번 DB 조회하면 느리므로 캐싱 고려 (여기서는 일단 호출)
+            profile = get_volatility_profile(coin, candles_db_path)
+            
+            if profile['volatility_group'] == volatility_group:
+                group_strategies[coin] = strategies
+
+        if not group_strategies:
+            return None
+
+        # 파라미터 분석
+        global_params = _analyze_global_params_from_strategies(group_strategies)
+
+        # 평균 성능 계산
+        all_profits = []
+        all_win_rates = []
+        all_grades = []
+
+        for strategies in group_strategies.values():
+            for s in strategies:
+                all_profits.append(s.get('profit', 0.0))
+                all_win_rates.append(s.get('win_rate', 0.5))
+                grade = s.get('quality_grade') or s.get('grade', 'C')
+                if grade in ['S', 'A', 'B', 'C', 'D', 'F']:
+                    all_grades.append(grade)
+
+        avg_profit = sum(all_profits) / len(all_profits) if all_profits else 0.0
+        avg_win_rate = sum(all_win_rates) / len(all_win_rates) if all_win_rates else 0.5
+
+        # 대표 등급
+        if all_grades:
+            from collections import Counter
+            representative_grade = Counter(all_grades).most_common(1)[0][0]
+        else:
+            representative_grade = 'B'
+
+        strategy_id = f"GLOBAL_{interval}_VOL_{volatility_group}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        vol_strategy = {
+            'id': strategy_id,
+            'coin': 'GLOBAL',
+            'interval': interval,
+            'strategy_type': f'volatility_group_{volatility_group}',
+            'params': global_params,
+            'name': f'Global {volatility_group} Volatility Strategy ({interval})',
+            'description': f'{volatility_group} 변동성 그룹 글로벌 전략 ({interval})',
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat(),
+            'quality_grade': representative_grade,
+            'profit': avg_profit,
+            'win_rate': avg_win_rate,
+            'volatility_group': volatility_group,
+            '_num_strategies': sum(len(s) for s in group_strategies.values()),
+            '_num_coins': len(group_strategies)
+        }
+
+        logger.info(f"✅ [{interval}] {volatility_group} 변동성 그룹 글로벌 전략 생성 ({len(group_strategies)}개 코인, 등급: {representative_grade})")
+
+        return vol_strategy
+
+    except Exception as e:
+        logger.debug(f"❌ [{interval}] {volatility_group} 변동성 그룹 글로벌 전략 생성 실패: {e}")
+        return None
+
+
 def create_enhanced_interval_strategies(
     interval: str,
     interval_strategies: Dict[str, List[Dict[str, Any]]]
@@ -819,8 +959,9 @@ def create_enhanced_interval_strategies(
 
     logger.info(f"  ✅ [{interval}] 기본 전략: {len(strategies)}개 생성")
 
-    # 레짐별 전략 (주요 레짐 3개만 생성하여 효율화)
-    major_regimes = ['bullish', 'bearish', 'neutral']
+    # 🔥 레짐별 전략 (7개 레짐 체계)
+    from rl_pipeline.core.regime_classifier import SIMPLIFIED_REGIMES
+    major_regimes = SIMPLIFIED_REGIMES  # 7개 레짐 전체 사용
 
     for regime in major_regimes:
         regime_strategy = create_regime_specific_global_strategy(interval, interval_strategies, regime)
@@ -838,6 +979,16 @@ def create_enhanced_interval_strategies(
             strategies.append(risk_strategy)
 
     logger.info(f"  ✅ [{interval}] 리스크 프로파일별 전략: {len([s for s in strategies if 'risk_profile' in s.get('strategy_type', '')])}개 생성")
+
+    # 🔥 변동성 그룹별 전략 (4가지)
+    if VOLATILITY_SYSTEM_AVAILABLE:
+        vol_groups = ['LOW', 'MEDIUM', 'HIGH', 'VERY_HIGH']
+        for group in vol_groups:
+            vol_strategy = create_volatility_group_global_strategy(interval, interval_strategies, group)
+            if vol_strategy:
+                strategies.append(vol_strategy)
+        
+        logger.info(f"  ✅ [{interval}] 변동성 그룹별 전략: {len([s for s in strategies if 'volatility_group' in s.get('strategy_type', '')])}개 생성")
 
     logger.info(f"🎉 [{interval}] 총 {len(strategies)}개 글로벌 전략 생성 완료")
 

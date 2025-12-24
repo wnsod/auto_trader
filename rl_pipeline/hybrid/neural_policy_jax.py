@@ -184,7 +184,18 @@ if JAX_AVAILABLE:
             # sigmoid로 0~1 범위로 만든 후 1~20으로 스케일링
             horizon = nn.sigmoid(horizon) * 19 + 1
 
-            return action_logits, value, price_change, horizon
+            # 🆕 Analysis head: 분석 점수 예측 (회귀)
+            # 범위: 0 ~ 100 (분석 점수는 0~100 사이)
+            analysis_score = nn.Dense(
+                1,
+                name='analysis_head',
+                kernel_init=kernel_init,
+                bias_init=bias_init
+            )(x)
+            # sigmoid로 0~1 범위로 만든 후 100으로 스케일링
+            analysis_score = nn.sigmoid(analysis_score) * 100.0
+
+            return action_logits, value, price_change, horizon, analysis_score
 else:
     # JAX 없을 때 폴백 클래스
     class PolicyNetwork:
@@ -274,7 +285,7 @@ def apply(
     state_vec_jax = jnp.array(state_vec)
     
     # 순전파
-    action_logits, value, price_change, horizon = model.apply(params['params'], state_vec_jax)
+    action_logits, value, price_change, horizon, analysis_score = model.apply(params['params'], state_vec_jax)
 
     # 🔥 액션 샘플링 개선: Temperature 기반 탐험 강화
     # deterministic=False일 때 temperature를 적용하여 탐험 증가
@@ -306,7 +317,8 @@ def apply(
         'action_name': action_name,
         'confidence': round(float(jnp.max(action_probs)), 2),  # 소숫점 2자리
         'price_change_pct': round(float(price_change[0, 0]), 4),  # 🆕 변동률 예측 (소숫점 4자리)
-        'horizon_k': int(jnp.round(horizon[0, 0]))  # 🆕 타이밍 예측 (정수)
+        'horizon_k': int(jnp.round(horizon[0, 0])),  # 🆕 타이밍 예측 (정수)
+        'predicted_analysis_score': round(float(analysis_score[0, 0]), 2)  # 🆕 분석 점수 예측 (소숫점 2자리)
     }
 
 

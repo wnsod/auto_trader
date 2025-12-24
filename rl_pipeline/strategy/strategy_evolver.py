@@ -708,7 +708,7 @@ class StrategyEvolver:
                 mutated_params['id'] = child_id
                 mutated_params['parent_id'] = parent1_id
                 mutated_params['version'] = version
-                mutated_params['coin'] = parent1.get('coin', 'BTC')
+                mutated_params['coin'] = parent1.get('coin') or parent1.get('symbol') or 'BTC'
                 mutated_params['interval'] = parent1.get('interval', '15m')
                 
                 evolved = EvolvedStrategy(
@@ -759,7 +759,7 @@ class StrategyEvolver:
                 
                 for evolved in evolved_strategies:
                     try:
-                        # coin_strategies에 저장
+                        # strategies에 저장
                         params = evolved.params
                         
                         # 기본 정보
@@ -775,8 +775,8 @@ class StrategyEvolver:
                         
                         # INSERT 또는 UPDATE
                         cursor.execute("""
-                            INSERT OR REPLACE INTO coin_strategies (
-                                id, coin, interval, parent_id, version,
+                            INSERT OR REPLACE INTO strategies (
+                                id, symbol, interval, parent_id, version,
                                 strategy_type, strategy_conditions,
                                 rsi_min, rsi_max, stop_loss_pct, take_profit_pct,
                                 volume_ratio_min, volume_ratio_max,
@@ -868,8 +868,8 @@ def evolve_strategies_from_segments(
             # 전략 조회
             placeholders = ','.join(['?' for _ in strategy_ids])
             cursor.execute(f"""
-                SELECT * FROM coin_strategies
-                WHERE id IN ({placeholders}) AND coin = ? AND interval = ?
+                SELECT * FROM strategies
+                WHERE id IN ({placeholders}) AND symbol = ? AND interval = ?
             """, list(strategy_ids) + [coin, interval])
             
             rows = cursor.fetchall()

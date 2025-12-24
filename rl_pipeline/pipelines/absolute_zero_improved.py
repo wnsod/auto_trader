@@ -103,17 +103,17 @@ try:
     AZError = core_errors.AZError
     create_run_record = strategy_manager.create_run_record
     update_run_record = strategy_manager.update_run_record
-    create_coin_strategies = strategy_manager.create_coin_strategies
+    create_strategies = strategy_manager.create_strategies
     create_global_strategies = strategy_manager.create_global_strategies
     run_self_play_test = selfplay.run_self_play_test
     RegimeRouter = regime_router.RegimeRouter
     create_regime_routing_strategies = regime_router.create_regime_routing_strategies
     IntegratedAnalyzer = integrated_analyzer.IntegratedAnalyzer
-    analyze_coin_strategies = integrated_analyzer.analyze_coin_strategies
+    analyze_strategies = integrated_analyzer.analyze_strategies
     analyze_global_strategies = integrated_analyzer.analyze_global_strategies
     ensure_indexes = db_schema.ensure_indexes
     setup_database_tables = db_schema.setup_database_tables
-    create_coin_strategies_table = db_schema.create_coin_strategies_table
+    create_strategies_table = db_schema.create_strategies_table
     get_optimized_db_connection = db_pool.get_optimized_db_connection
 
     NEW_PIPELINE_AVAILABLE = True
@@ -175,7 +175,7 @@ def _configure_logging():
 # 🔥 pipelines 폴더로 이동했으므로 상위 디렉토리 기준으로 경로 설정
 base_dir = os.path.dirname(os.path.dirname(__file__))
 CANDLES_DB_PATH = os.path.join(base_dir, 'data', 'rl_candles.db')
-STRATEGIES_DB_PATH = os.path.join(base_dir, 'data', 'rl_strategies.db')
+STRATEGIES_DB_PATH = os.getenv('STRATEGY_DB_PATH', os.getenv('STRATEGIES_DB_PATH', os.path.join(base_dir, 'data', 'learning_strategies.db')))
 # learning_results.db는 이제 rl_strategies.db로 통합됨 (core/env.py 참조)
 LEARNING_RESULTS_DB_PATH = STRATEGIES_DB_PATH
 
@@ -459,26 +459,10 @@ def run_absolute_zero(coin: Optional[str] = None, interval: str = "15m",
                 logger.info(f"   누적 검증: {stats.get('total_validations', 0)}회")
                 logger.info(f"   자동 복구: {stats.get('auto_fixed', 0)}건")
 
-        # Paper Trading 자동 시작
-        if ENABLE_AUTO_PAPER_TRADING and pipeline_results:
-            try:
-                logger.info(f"\n📊 {coin} Paper Trading 자동 시작...")
-                from rl_pipeline.validation.auto_paper_trading import auto_start_paper_trading_after_pipeline
-
-                paper_result = auto_start_paper_trading_after_pipeline(
-                    coin=coin,
-                    intervals=intervals_to_use,
-                    duration_days=PAPER_TRADING_DURATION_DAYS
-                )
-
-                if paper_result.get('status') == 'started':
-                    logger.info(f"✅ Paper Trading 시작 완료")
-                else:
-                    logger.warning(f"⚠️ Paper Trading 시작 실패")
-
-            except Exception as e:
-                logger.warning(f"⚠️ Paper Trading 자동 시작 실패: {e}")
-
+        # Paper Trading 자동 시작 (사용자 요청으로 제거됨)
+        # if ENABLE_AUTO_PAPER_TRADING and pipeline_results:
+        #    ... (removed) ...
+        
         execution_time = (datetime.now() - start_time).total_seconds()
 
         logger.info(f"\n🎉 Absolute Zero 시스템 실행 완료")
@@ -526,9 +510,9 @@ def main():
             create_learning_results_tables()
 
             try:
-                create_coin_strategies_table()
+                create_strategies_table()
             except Exception as e:
-                logger.warning(f"⚠️ coin_strategies 테이블 생성 실패 (이미 존재): {e}")
+                logger.warning(f"⚠️ strategies 테이블 생성 실패 (이미 존재): {e}")
 
             try:
                 ensure_indexes()

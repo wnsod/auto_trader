@@ -326,7 +326,7 @@ class SelfPlayValidator(BaseValidator):
                 """
                 SELECT prediction_accuracy, average_return
                 FROM selfplay_results
-                WHERE coin = ? AND interval = ?
+                WHERE symbol = ? AND interval = ?
                 AND created_at > datetime('now', '-7 days')
                 ORDER BY created_at DESC
                 LIMIT 10
