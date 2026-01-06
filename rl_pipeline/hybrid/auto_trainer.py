@@ -1394,6 +1394,20 @@ def auto_train_from_global_strategies(
         db_path_config = config.get('paths', {}).get('db')
         env_db_path = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
         
+        # 🆕 Windows에서 Docker 경로(/workspace/...) 감지 시 로컬 경로로 변환
+        if env_db_path and env_db_path.startswith('/workspace/') and os.name == 'nt':
+            old_path = env_db_path
+            # 워크스페이스 루트 추론 (C:\auto_trader)
+            current_dir = os.getcwd()
+            if 'auto_trader' in current_dir:
+                workspace_root = current_dir.split('auto_trader')[0] + 'auto_trader'
+            else:
+                workspace_root = current_dir
+            
+            relative_path = old_path.replace('/workspace/', '').replace('/', os.sep)
+            env_db_path = os.path.join(workspace_root, relative_path)
+            logger.info(f"🔧 Windows Docker 경로 변환: {old_path} -> {env_db_path}")
+        
         should_replace_db = False
         if not db_path_config:
             should_replace_db = True

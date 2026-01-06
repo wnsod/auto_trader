@@ -16,7 +16,7 @@ import json
 
 logger = logging.getLogger(__name__)
 
-GLOBAL_REPLACEMENT_SCORE_THRESHOLD = 0.01
+GLOBAL_REPLACEMENT_SCORE_THRESHOLD = 0.005  # 🆕 유사도 임계값 완화 (더 다양한 전략 확보)
 VALUE_EPSILON = 1e-6
 
 
@@ -354,17 +354,18 @@ def group_strategies_by_zone(
 
 def select_best_strategy_per_zone(
     zones: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]]
-) -> Dict[Tuple[str, str, str, str], Dict[str, Any]]:
+) -> Dict[Tuple[str, str, str, str], List[Dict[str, Any]]]:
     """
-    각 구역에서 최고 성능 전략 선정
+    각 구역에서 상위 N개 성능 전략 선정 (글로벌 전략 다양성 확보)
 
     Args:
         zones: {zone_key: [strategies]}
 
     Returns:
-        {zone_key: best_strategy}
+        {zone_key: [best_strategies]}
     """
-    best_strategies = {}
+    best_strategies_map = {}
+    top_n = 20  # 🆕 구역당 상위 20개까지 글로벌 전략으로 선정 (기존 5개에서 대폭 상향)
 
     for zone_key, strategies in zones.items():
         if not strategies:
@@ -378,20 +379,19 @@ def select_best_strategy_per_zone(
         # 점수 기준 정렬
         scored_strategies.sort(reverse=True, key=lambda x: x[0])
 
-        # 최고 전략 선정
-        best_score, best_strategy = scored_strategies[0]
-
-        best_strategies[zone_key] = best_strategy
+        # 상위 N개 전략 선정
+        selected = [s for _, s in scored_strategies[:top_n]]
+        best_strategies_map[zone_key] = selected
 
         logger.debug(
             f"구역 {'-'.join(zone_key)}: "
-            f"{len(strategies)}개 중 최고 선정 "
-            f"(점수: {best_score:.3f}, 출처: {best_strategy.get('_source_coin')})"
+            f"{len(strategies)}개 중 상위 {len(selected)}개 선정 "
+            f"(최고 점수: {scored_strategies[0][0]:.3f})"
         )
 
-    logger.info(f"✅ 구역별 최고 전략 선정 완료: {len(best_strategies)}개 구역")
+    logger.info(f"✅ 구역별 상위 전략 선정 완료: {len(best_strategies_map)}개 구역, 총 {sum(len(v) for v in best_strategies_map.values())}개 전략")
 
-    return best_strategies
+    return best_strategies_map
 
 
 def create_global_strategy_from_best(
@@ -576,80 +576,81 @@ def create_zone_based_global_strategies(
         # 4. 글로벌 전략 생성 (유사도 검사 포함)
         global_strategies = []
 
-        for zone_key, best_strategy in best_strategies.items():
-            try:
-                zone_str = '-'.join(zone_key)
-                global_strategy = create_global_strategy_from_best(zone_key, best_strategy)
+        for zone_key, selected_strategies in best_strategies.items():
+            for best_strategy in selected_strategies:
+                try:
+                    zone_str = '-'.join(zone_key)
+                    global_strategy = create_global_strategy_from_best(zone_key, best_strategy)
 
-                # 유사도 검사
-                if enable_similarity_check and existing_global_strategies:
-                    from rl_pipeline.strategy.similarity import classify_strategy_by_similarity
+                    # 유사도 검사
+                    if enable_similarity_check and existing_global_strategies:
+                        from rl_pipeline.strategy.similarity import classify_strategy_by_similarity
 
-                    classification, similarity_score, parent_id = classify_strategy_by_similarity(
-                        global_strategy,
-                        existing_global_strategies,
-                        use_smart=False  # 글로벌 전략은 simple similarity 사용
-                    )
-
-                    # 유사도 정보 업데이트
-                    global_strategy['similarity_classification'] = classification
-                    global_strategy['similarity_score'] = similarity_score
-                    global_strategy['parent_strategy_id'] = parent_id
-
-                    logger.debug(
-                        f"  유사도 검사: {zone_key} → {classification} "
-                        f"(score: {similarity_score:.3f})"
-                    )
-
-                    # duplicate는 건너뜀 (중복 방지)
-                    if classification == 'duplicate':
-                        idx, existing_strategy = _find_existing_global_strategy(
+                        classification, similarity_score, parent_id = classify_strategy_by_similarity(
+                            global_strategy,
                             existing_global_strategies,
-                            parent_id,
-                            zone_str
+                            use_smart=False  # 글로벌 전략은 simple similarity 사용
                         )
 
-                        if existing_strategy:
-                            replace, existing_score, new_score = _should_replace_existing_global_strategy(
-                                existing_strategy,
-                                global_strategy
+                        # 유사도 정보 업데이트
+                        global_strategy['similarity_classification'] = classification
+                        global_strategy['similarity_score'] = similarity_score
+                        global_strategy['parent_strategy_id'] = parent_id
+
+                        logger.debug(
+                            f"  유사도 검사: {zone_key} → {classification} "
+                            f"(score: {similarity_score:.3f})"
+                        )
+
+                        # duplicate는 건너뜀 (중복 방지)
+                        if classification == 'duplicate':
+                            idx, existing_strategy = _find_existing_global_strategy(
+                                existing_global_strategies,
+                                parent_id,
+                                zone_str
                             )
 
-                            if replace:
-                                logger.info(
-                                    f"  🔁 중복 전략 교체: {zone_str} "
-                                    f"(score {existing_score:.3f} → {new_score:.3f})"
+                            if existing_strategy:
+                                replace, existing_score, new_score = _should_replace_existing_global_strategy(
+                                    existing_strategy,
+                                    global_strategy
                                 )
-                                original_id = existing_strategy.get('id')
-                                if original_id:
-                                    global_strategy['id'] = original_id
-                                global_strategy['similarity_classification'] = 'replacement'
-                                global_strategy['parent_strategy_id'] = parent_id or original_id
-                                global_strategy['updated_at'] = datetime.now().isoformat()
-                                global_strategies.append(global_strategy)
 
-                                if idx is not None:
-                                    updated_entry = existing_strategy.copy()
-                                    updated_entry.update(global_strategy)
-                                    if isinstance(global_strategy.get('params'), dict):
-                                        updated_entry['params'] = global_strategy['params']
-                                    existing_global_strategies[idx] = updated_entry
+                                if replace:
+                                    logger.info(
+                                        f"  🔁 중복 전략 교체: {zone_str} "
+                                        f"(score {existing_score:.3f} → {new_score:.3f})"
+                                    )
+                                    original_id = existing_strategy.get('id')
+                                    if original_id:
+                                        global_strategy['id'] = original_id
+                                    global_strategy['similarity_classification'] = 'replacement'
+                                    global_strategy['parent_strategy_id'] = parent_id or original_id
+                                    global_strategy['updated_at'] = datetime.now().isoformat()
+                                    global_strategies.append(global_strategy)
+
+                                    if idx is not None:
+                                        updated_entry = existing_strategy.copy()
+                                        updated_entry.update(global_strategy)
+                                        if isinstance(global_strategy.get('params'), dict):
+                                            updated_entry['params'] = global_strategy['params']
+                                        existing_global_strategies[idx] = updated_entry
+                                    continue
+
+                                logger.info(
+                                    f"  ⚠️ 중복 전략 유지: {zone_str} "
+                                    f"(existing={existing_score:.3f}, new={new_score:.3f})"
+                                )
                                 continue
 
-                            logger.info(
-                                f"  ⚠️ 중복 전략 유지: {zone_str} "
-                                f"(existing={existing_score:.3f}, new={new_score:.3f})"
-                            )
+                            logger.info(f"  ⚠️ 중복 전략 건너뜀: {zone_str} (기존 전략 미탐지)")
                             continue
 
-                        logger.info(f"  ⚠️ 중복 전략 건너뜀: {zone_str} (기존 전략 미탐지)")
-                        continue
+                    global_strategies.append(global_strategy)
 
-                global_strategies.append(global_strategy)
-
-            except Exception as e:
-                logger.error(f"❌ 글로벌 전략 생성 실패 ({'-'.join(zone_key)}): {e}")
-                continue
+                except Exception as e:
+                    logger.error(f"❌ 글로벌 전략 생성 실패 ({'-'.join(zone_key)}): {e}")
+                    continue
 
         logger.info(f"✅ 구역 기반 글로벌 전략 생성 완료: {len(global_strategies)}개")
 

@@ -35,52 +35,72 @@ TRADE_DIR = os.path.join(ROOT_DIR, 'trade')
 # 4. 시그널 & 매매: trade 폴더 내 스크립트 (추후 연결)
 
 # 3. 실행 환경 변수 설정
-# 데이터 저장소 디렉토리 생성 (절대 경로 보장)
-DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, 'data_storage'))
-os.environ['DATA_STORAGE_PATH'] = DATA_DIR  # 하위 프로세스를 위해 가장 먼저 설정
+# 🆕 경로 변환 유틸리티 (Docker /workspace → Windows 절대 경로 호환)
+def finalize_path(path):
+    if not path: return None
+    
+    # 🚀 Docker 환경 감지: /workspace가 실제로 존재하면 Docker 환경
+    if os.path.exists('/workspace'):
+        # Docker 환경 - 경로 변환 없이 그대로 사용
+        return os.path.abspath(path)
+    
+    # 🚀 Windows 호스트에서 직접 실행 시에만 /workspace 경로 변환
+    if os.name == 'nt':
+        if path.startswith('/workspace') or path.startswith('\\workspace'):
+            rel_path = path.replace('/workspace', '', 1).replace('\\workspace', '', 1).lstrip('/\\')
+            return os.path.join(ROOT_DIR, rel_path)
+        if path.startswith('/') and not path.startswith('//'):
+            return os.path.join(ROOT_DIR, path.lstrip('/'))
+    
+    return os.path.abspath(path)
+
+# 📂 데이터 저장소 디렉토리 결정 (환경 변수 우선)
+DATA_DIR = os.environ.get('DATA_STORAGE_PATH')
+if not DATA_DIR:
+    DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, 'data_storage'))
+    os.environ['DATA_STORAGE_PATH'] = DATA_DIR
+else:
+    DATA_DIR = finalize_path(DATA_DIR)  # 🚀 os.path.abspath 대신 finalize_path 사용
 
 if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+    os.makedirs(DATA_DIR, exist_ok=True)
     print(f"📂 데이터 저장소 디렉토리 생성: {DATA_DIR}")
 
-# DB 경로 설정 (4분할 구조 적용 - DATA_DIR 기반으로 통일)
-# 1. 매매용 캔들 (경량/최신)
-os.environ['RL_DB_PATH'] = os.path.join(DATA_DIR, 'trade_candles.db')
-os.environ['CANDLES_DB_PATH'] = os.environ['RL_DB_PATH']  # Signal Selector 호환성
+# 🕯️ 1. 매매용 캔들 DB 경로 설정
+if not os.environ.get('CANDLES_DB_PATH'):
+    os.environ['CANDLES_DB_PATH'] = os.path.join(DATA_DIR, 'trade_candles.db')
+os.environ['RL_DB_PATH'] = os.environ['CANDLES_DB_PATH'] # 하위 호환성
 
-# 2. 학습된 전략/모델 (Brain) - 학습 봇이 만든 것을 공유받아 읽기/쓰기
-# 🔧 수정: run_learning.py와 동일한 경로를 사용해야 전략 DB를 올바르게 로드
-# 학습 봇이 저장한 경로: /workspace/market/coin_market/data_storage/learning_strategies/
-STRATEGY_DIR = os.path.join(DATA_DIR, 'learning_strategies')
+# 🧠 2. 전략 저장소 경로 설정
+STRATEGY_DIR = os.environ.get('STRATEGY_DB_PATH')
+if not STRATEGY_DIR:
+    STRATEGY_DIR = os.path.join(DATA_DIR, 'learning_strategies')
+    os.environ['STRATEGY_DB_PATH'] = STRATEGY_DIR
+    os.environ['STRATEGIES_DB_PATH'] = STRATEGY_DIR
+else:
+    STRATEGY_DIR = finalize_path(STRATEGY_DIR)  # 🚀 os.path.abspath 대신 finalize_path 사용
+    os.environ['STRATEGY_DB_PATH'] = STRATEGY_DIR
+    os.environ['STRATEGIES_DB_PATH'] = STRATEGY_DIR
 
-# 전략 폴더 및 공용 DB 확인/생성
 if not os.path.exists(STRATEGY_DIR):
-    try:
-        os.makedirs(STRATEGY_DIR, exist_ok=True)
-        print(f"📂 전략 저장소 폴더 생성: {STRATEGY_DIR}")
-    except Exception as e:
-        print(f"⚠️ 전략 저장소 폴더 생성 실패: {e}")
+    os.makedirs(STRATEGY_DIR, exist_ok=True)
 
-# 1) 전략 저장소 루트 (개별 코인 DB들이 있는 폴더)
-os.environ['STRATEGY_DB_PATH'] = STRATEGY_DIR
-os.environ['STRATEGIES_DB_PATH'] = STRATEGY_DIR
+# 🌐 2-1. 공용 전략 DB 설정 (사용자 지정: common_strategies.db)
+if not os.environ.get('GLOBAL_STRATEGY_DB_PATH'):
+    os.environ['GLOBAL_STRATEGY_DB_PATH'] = os.path.join(STRATEGY_DIR, 'common_strategies.db')
+os.environ['LEARNING_RESULTS_DB_PATH'] = os.environ['GLOBAL_STRATEGY_DB_PATH']
 
-# 2) 글로벌 전략 DB (공용 전략) - 명시적 설정
-COMMON_DB_PATH = os.path.join(STRATEGY_DIR, 'common_strategies.db')
-os.environ['GLOBAL_STRATEGY_DB_PATH'] = COMMON_DB_PATH
+# 📝 3. 실전/가상 매매 시스템 DB 설정
+if not os.environ.get('TRADING_SYSTEM_DB_PATH'):
+    os.environ['TRADING_SYSTEM_DB_PATH'] = os.path.join(DATA_DIR, 'trading_system.db')
+os.environ['TRADING_DB_PATH'] = os.environ['TRADING_SYSTEM_DB_PATH']
 
-# 3) 학습 결과 DB (Learning Results) - 하위 호환성 및 명시적 설정
-# 일부 구형 모듈이 LEARNING_RESULTS_DB_PATH를 찾을 수 있으므로 공용 DB로 연결
-os.environ['LEARNING_RESULTS_DB_PATH'] = COMMON_DB_PATH
-
-# 3. 실전/섀도우 매매 기록 (Records) - 실전 기록 분리
-os.environ['TRADING_DB_PATH'] = os.path.join(DATA_DIR, 'trading_system.db')
-os.environ['TRADING_SYSTEM_DB_PATH'] = os.environ['TRADING_DB_PATH'] # Executor 호환성
-
-# 3-1. 공통 데이터 저장소 경로 설정 (중복 설정이지만 명시적으로)
-os.environ['DATA_STORAGE_PATH'] = DATA_DIR
-
-os.environ['PYTHONPATH'] = ROOT_DIR
+# 🐍 PYTHONPATH 설정
+if not os.environ.get('PYTHONPATH'):
+    os.environ['PYTHONPATH'] = ROOT_DIR
+else:
+    if ROOT_DIR not in os.environ['PYTHONPATH']:
+        os.environ['PYTHONPATH'] = f"{ROOT_DIR}{os.pathsep}{os.environ['PYTHONPATH']}"
 
 # DB 경로 설정 로그 출력
 print("-" * 60)
@@ -91,12 +111,12 @@ print(f"  🧠 STRATEGY_DB:  {os.environ['STRATEGY_DB_PATH']}")
 print(f"  📝 TRADING_DB:   {os.environ['TRADING_DB_PATH']}")
 print("-" * 60)
 
-# 전역 중단 플래그
+# 전역 중단 플래그 관리
 _stopped = False
 
 def signal_handler(signum, frame):
     global _stopped
-    print("\n\n⏹️ 트레이딩 봇 중단 신호 감지! (안전 종료 중...)")
+    print("\n\n⏹️ 트레이딩 봇 중단 신호 감지!")
     _stopped = True
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -180,8 +200,9 @@ def main():
             print(f"⚠️ 동적 필터링 실패 (이전 설정 유지): {e}")
 
         
+        # 🚀 [Step 순차 실행] 파이프라인 정합성 유지
+        
         # Step 1: 데이터 수집 (공용 엔진 사용)
-        # config_trading.env에 설정된 짧은 기간(DAYS_BACK)만큼만 수집
         if not run_step("데이터 수집", os.path.join(SCRIPTS_DIR, 'candles_collector.py')):
             time.sleep(5)
         
@@ -193,7 +214,7 @@ def main():
         if not run_step("통합 분석", os.path.join(SCRIPTS_DIR, 'candles_integrated.py')):
             pass
             
-        # Step 4: 실시간 시그널 생성 (Trading 전용)
+        # Step 4: 실시간 시그널 생성 (최적화된 엔진 순차 실행)
         if not run_step("시그널 생성", os.path.join(TRADE_DIR, 'strategy_signal_generator.py')):
             pass
 

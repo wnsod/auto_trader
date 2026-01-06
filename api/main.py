@@ -1,14 +1,47 @@
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles # 🆕 StaticFiles import
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse # 🆕 RedirectResponse 추가
+from fastapi.responses import RedirectResponse
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.background import BackgroundScheduler
+from llm_factory.orchestrator.router import Orchestrator
 from api.routers import coin, dashboard, market
 import os
+
+# --- LLM Scheduler Setup ---
+orchestrator = Orchestrator()
+scheduler = BackgroundScheduler()
+
+def run_llm_cycle():
+    """주기적 LLM 분석 작업 (1분마다)"""
+    print("[Scheduler] Running LLM Analysis Cycle...")
+    try:
+        # 데이터가 없으면 에이전트가 알아서 수집하도록 None 전달
+        orchestrator.run_cycle(None, None)
+    except Exception as e:
+        print(f"[Scheduler] Error: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("[SYSTEM] Starting LLM Scheduler...")
+    scheduler.add_job(run_llm_cycle, 'interval', seconds=60)
+    scheduler.start()
+    
+    # 서버 시작 시 즉시 한 번 실행
+    scheduler.add_job(run_llm_cycle, 'date')
+    
+    yield
+    
+    # Shutdown
+    print("[SYSTEM] Stopping LLM Scheduler...")
+    scheduler.shutdown()
 
 app = FastAPI(
     title="Auto Trader Shadow Dashboard API",
     description="섀도우 트레이딩(가상 매매) 데이터를 제공하는 API 서버입니다.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS 설정

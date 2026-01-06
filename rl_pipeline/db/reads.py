@@ -37,7 +37,7 @@ TABLE_MAPPING = {
 def _select_pool_by_query(db_path: str, query: str):
     """쿼리/명시 경로 기준으로 적절한 풀 선택"""
     if db_path:
-        return get_candle_db_pool() if 'candles' in db_path else get_strategy_db_pool()
+        return get_candle_db_pool() if 'candles' in db_path else get_strategy_db_pool(db_path)
     # 쿼리 기반 휴리스틱: 전략 테이블 키워드가 있으면 전략 DB
     q = (query or '').lower()
     # 테이블명

@@ -3,8 +3,12 @@
 """
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from typing import Tuple, Optional
+
+# 🚀 [Stability] 전역 DB 쓰기 락
+_db_write_lock = threading.Lock()
 
 # DB 경로는 config.py에서 import
 try:
@@ -35,8 +39,15 @@ def get_optimized_db_connection(db_path: str, mode: str = 'read'):
         SQLite 연결 객체
     """
     conn = None
+    # 🚀 [Stability] 쓰기 모드일 경우 락 획득
+    lock_acquired = False
+    if mode == 'write':
+        _db_write_lock.acquire()
+        lock_acquired = True
+        
     try:
-        conn = sqlite3.connect(db_path)
+        # 🚀 [Stability] 타임아웃 30초 설정
+        conn = sqlite3.connect(db_path, timeout=30)
         if mode == 'write':
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=NORMAL')
@@ -48,6 +59,9 @@ def get_optimized_db_connection(db_path: str, mode: str = 'read'):
     finally:
         if conn:
             conn.close()
+        # 🚀 [Stability] 락 해제
+        if lock_acquired:
+            _db_write_lock.release()
 
 
 @contextmanager
@@ -63,20 +77,23 @@ def safe_db_write(db_path: str, operation_name: str):
         SQLite 연결 객체
     """
     conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=NORMAL')
-        yield conn
-        conn.commit()
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"⚠️ 데이터베이스 쓰기 오류 ({operation_name}): {e}")
-        raise e
-    finally:
-        if conn:
-            conn.close()
+    # 🚀 [Stability] 전역 쓰기 락
+    with _db_write_lock:
+        try:
+            # 🚀 [Stability] 타임아웃 30초 설정
+            conn = sqlite3.connect(db_path, timeout=30)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            yield conn
+            conn.commit()
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"⚠️ 데이터베이스 쓰기 오류 ({operation_name}): {e}")
+            raise e
+        finally:
+            if conn:
+                conn.close()
 
 
 def get_strategy_db_pool():
@@ -118,7 +135,8 @@ def safe_db_read(query: str, params: Tuple = (), db_path: Optional[str] = None):
         if not os.path.exists(db_path):
             return []
         
-        conn = sqlite3.connect(db_path)
+        # 🚀 [Stability] 타임아웃 30초 설정
+        conn = sqlite3.connect(db_path, timeout=30)
         cursor = conn.cursor()
         cursor.execute(query, params)
         results = cursor.fetchall()
@@ -155,11 +173,13 @@ def safe_db_write_func(query: str, params: Tuple = (), db_path: Optional[str] = 
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
         
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        conn.commit()
-        conn.close()
+        # 🚀 [Stability] 전역 쓰기 락 및 타임아웃 30초
+        with _db_write_lock:
+            conn = sqlite3.connect(db_path, timeout=30)
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            conn.close()
         return True
     except Exception as e:
         print(f"⚠️ 데이터베이스 쓰기 오류: {e}")

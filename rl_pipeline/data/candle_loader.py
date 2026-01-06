@@ -219,10 +219,12 @@ def load_candle_data_for_coin(coin: str, intervals: List[str]) -> Dict[tuple, An
                         # 🔥 Unix 타임스탬프를 datetime으로 변환 (unit='s'로 초 단위 명시)
                         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
 
-                        # 7단계 레짐을 3단계로 매핑 (ranging, trending, volatile)
-                        df['regime'] = df['regime_label'].apply(
-                            lambda x: classify_regime_from_old(x) if pd.notna(x) else 'ranging'
-                        )
+                        # 🆕 7단계 레짐 정보 보존 (뭉뚱그리지 않음)
+                        if 'regime_label' in df.columns:
+                            df['regime'] = df['regime_label']
+                        elif 'regime' not in df.columns:
+                            # 레짐 정보가 아예 없는 경우에만 기본값
+                            df['regime'] = 'neutral'
 
                         all_candle_data[(coin, interval)] = df
 

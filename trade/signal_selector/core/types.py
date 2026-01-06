@@ -79,4 +79,9 @@ class SignalInfo:
     regime_coverage: Optional[Dict[str, float]] = field(default=None)
     target_price: float = 0.0  # 🆕 예상 목표가 (AI/기술적 분석 기반)
     source_type: str = 'quant' # 🆕 시그널 출처 (quant, ai, hybrid)
+    # 🆕 전략 시스템 필드
+    strategy_scores: Optional[Dict] = field(default=None)  # 전략별 점수
+    recommended_strategy: str = 'trend'  # 추천 전략
+    strategy_match: float = 0.5  # 전략 적합도
+    tick_size: float = 0.0  # 호가 단위
 

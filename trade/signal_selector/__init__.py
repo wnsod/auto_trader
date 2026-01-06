@@ -14,14 +14,24 @@ Signal Selector 모듈 - 실시간 시그널 생성 시스템
 - config.py: 설정
 """
 
+# 타입 정의는 즉시 임포트
 from .core.types import SignalInfo, SignalAction
 
-# SignalSelector는 통합 클래스에서 import
+# SignalSelector는 필요한 경우에만 임포트할 수 있도록 보조 함수 제공
+def get_signal_selector():
+    """순환 참조 방지를 위해 지연 임포트를 수행하는 팩토리 함수"""
+    try:
+        from .core.selector import SignalSelector
+        return SignalSelector()
+    except Exception as e:
+        print(f"⚠️ SignalSelector 로드 실패: {e}")
+        return None
+
+# 하위 호환성을 위해 시도하지만 실패해도 패키지 로드는 차단하지 않음
 try:
     from .core.selector import SignalSelector
-    __all__ = ['SignalSelector', 'SignalInfo', 'SignalAction']
-except ImportError as e:
-    # 개별 Mixin만 사용하는 경우
-    print(f"⚠️ SignalSelector 통합 클래스 로드 실패: {e}")
-    __all__ = ['SignalInfo', 'SignalAction']
+    __all__ = ['SignalSelector', 'SignalInfo', 'SignalAction', 'get_signal_selector']
+except Exception:
+    SignalSelector = None
+    __all__ = ['SignalInfo', 'SignalAction', 'get_signal_selector']
 

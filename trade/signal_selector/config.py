@@ -19,51 +19,34 @@ MAX_WORKERS = int(os.getenv('MAX_WORKERS', '8'))
 CACHE_SIZE = int(os.getenv('CACHE_SIZE', '50000'))
 ENABLE_CROSS_COIN_LEARNING = os.getenv('ENABLE_CROSS_COIN_LEARNING', 'true').lower() == 'true'
 
-# 🚫 GPU 가속 설정 (사용하지 않음, 호환성 유지를 위해 변수는 남겨둠)
-USE_GPU_ACCELERATION = False
-JAX_PLATFORM_NAME = 'cpu'
+# 🚀 GPU 가속 설정 (RTX 5090 지원)
+USE_GPU_ACCELERATION = True
+JAX_PLATFORM_NAME = 'cuda'  # RTX 5090 CUDA 가속
 
-# 🆕 DB 경로 설정 (Windows 환경 지원 및 DATA_STORAGE_PATH 우선)
-# 환경 변수에서 경로를 가져오되, Windows 경로가 아닌 경우(/workspace/...) 자동으로 로컬 경로로 변환
-_env_storage = os.getenv('DATA_STORAGE_PATH')
-if _env_storage and (_env_storage.startswith('/workspace') or _env_storage.startswith('\\workspace')):
-     # Docker 경로를 로컬 경로로 변환 (Windows 환경일 경우)
-    if os.name == 'nt':
-         _default_market_storage = os.path.join(workspace_dir, 'market', 'coin_market', 'data_storage')
-         DATA_STORAGE_PATH = _default_market_storage
-    else:
-         DATA_STORAGE_PATH = _env_storage
-else:
-    DATA_STORAGE_PATH = _env_storage
+# 🆕 DB 경로 설정 (Docker 환경 전용)
+def finalize_path(path):
+    """경로를 절대 경로로 변환 (Docker 환경)"""
+    if not path: return None
+    return os.path.abspath(path)
 
+# 1. 데이터 저장소 루트
+DATA_STORAGE_PATH = finalize_path(os.getenv('DATA_STORAGE_PATH'))
 if not DATA_STORAGE_PATH:
-    # 기본 경로 탐색: market/coin_market/data_storage 우선, 없으면 root/data_storage
-    _default_market_storage = os.path.join(workspace_dir, 'market', 'coin_market', 'data_storage')
-    if os.path.isdir(_default_market_storage):
-        DATA_STORAGE_PATH = _default_market_storage
-    else:
-        DATA_STORAGE_PATH = os.path.join(workspace_dir, 'data_storage')
+    DATA_STORAGE_PATH = finalize_path(os.path.join(workspace_dir, 'market', 'coin_market', 'data_storage'))
 
-# 🔥 [Fix] 캔들 DB도 환경변수 우선 사용 (run_learning.py / run_trading.py 호환)
-_env_candles_db = os.getenv('RL_DB_PATH') or os.getenv('CANDLES_DB_PATH')
-if _env_candles_db:
-    CANDLES_DB_PATH = _env_candles_db
-else:
-    # 기본값: trade_candles.db (트레이딩 환경)
+# 2. 캔들 DB 경로
+CANDLES_DB_PATH = finalize_path(os.getenv('CANDLES_DB_PATH') or os.getenv('RL_DB_PATH'))
+if not CANDLES_DB_PATH:
     CANDLES_DB_PATH = os.path.join(DATA_STORAGE_PATH, 'trade_candles.db')
 
-# 🔥 [Fix] 환경변수 우선 사용 (run_learning.py와 호환성 보장)
-# 🔧 디렉토리 모드 지원: 환경변수가 .db로 끝나지 않거나 디렉토리인 경우 디렉토리로 간주
-_env_strategy_db = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
-if _env_strategy_db:
-    STRATEGIES_DB_PATH = _env_strategy_db
-else:
+# 3. 전략 저장소 경로 (디렉토리 또는 파일)
+STRATEGIES_DB_PATH = finalize_path(os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH'))
+if not STRATEGIES_DB_PATH:
     STRATEGIES_DB_PATH = os.path.join(DATA_STORAGE_PATH, 'learning_strategies')
 
-_env_trading_db = os.getenv('TRADING_DB_PATH') or os.getenv('TRADING_SYSTEM_DB_PATH')
-if _env_trading_db:
-    TRADING_SYSTEM_DB_PATH = _env_trading_db
-else:
+# 4. 트레이딩 시스템 DB 경로
+TRADING_SYSTEM_DB_PATH = finalize_path(os.getenv('TRADING_SYSTEM_DB_PATH') or os.getenv('TRADING_DB_PATH'))
+if not TRADING_SYSTEM_DB_PATH:
     TRADING_SYSTEM_DB_PATH = os.path.join(DATA_STORAGE_PATH, 'trading_system.db')
 DB_PATH = TRADING_SYSTEM_DB_PATH
 
@@ -107,12 +90,9 @@ analyze_strategy_quality = None
 
 # print("ℹ️ AI Learning Engine 비활성화 (모듈 미포함)")
 
-# 🆕 변동성 시스템
-try:
-    from rl_pipeline.utils.coin_volatility import CoinVolatilityCalculator
-    VOLATILITY_SYSTEM_AVAILABLE = True
-except ImportError:
-    VOLATILITY_SYSTEM_AVAILABLE = False
+# 🆕 변동성 시스템 (rl_pipeline 의존성 제거 - 자체 구현 사용)
+VOLATILITY_SYSTEM_AVAILABLE = False  # 트레이딩에서는 기본 변동성 계산 사용
+CoinVolatilityCalculator = None
 
 
 # 🔧 코인별 전략 DB 경로 함수 (strategy_signal_generator 순환 import 방지)

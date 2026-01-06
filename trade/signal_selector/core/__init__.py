@@ -4,16 +4,10 @@ Core 모듈 - 핵심 시그널 선택기 및 타입 정의
 
 from .types import SignalInfo, SignalAction
 
-# SignalSelector와 StrategyScoreCalculator는 아직 원본 파일에 있으므로 선택적 import
-try:
-    from .signal_selector import SignalSelector
-except ImportError:
-    SignalSelector = None
-
-try:
-    from .strategy_calculator import StrategyScoreCalculator
-except ImportError:
-    StrategyScoreCalculator = None
+# SignalSelector와 StrategyScoreCalculator는 상위 레벨에서 임포트하거나 지연 임포트 사용
+# (패키지 초기화 시의 순환 참조 방지)
+SignalSelector = None
+StrategyScoreCalculator = None
 
 __all__ = ['SignalInfo', 'SignalAction']
 if SignalSelector is not None:

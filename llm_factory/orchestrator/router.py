@@ -11,15 +11,21 @@ class Orchestrator:
         self.news_agent = NewsAgent()
         # 나중에 여기에 각 에이전트를 등록하는 레지스트리 패턴 적용 가능
 
-    def run_cycle(self, market_data: dict, news_data: list):
+    def run_cycle(self, market_data: dict = None, news_data: list = None):
         """
         한 번의 분석 사이클 실행:
         1. 뉴스 분석 -> 2. (필요시) 시장 에이전트에 경고 -> 3. 시장 분석 -> 4. 종합 판단
+        데이터가 None이면 각 에이전트가 스스로 수집하도록 함.
         """
-        # print("\U0001f504 [Orchestrator] Starting Analysis Cycle...")
         print("[Orchestrator] Starting Analysis Cycle...")
         
-        # 1. 뉴스 분석
+        # 1. 뉴스 분석 (데이터 없으면 내부 수집 로직 사용 - NewsAgent 구현에 따라 다름)
+        # NewsAgent.process가 None을 받으면 최신 뉴스를 가져오도록 구현되어 있다고 가정하거나, 여기서 수집
+        if news_data is None:
+             # 실제 환경에서는 NewsCollector에서 가져와야 함.
+             # 임시로 빈 리스트 넘기면 NewsAgent가 알아서 처리하거나 Mock 사용
+             news_data = [] 
+
         news_result = self.news_agent.process(news_data)
         self.store.log_message(
             sender="agent_news", 
@@ -33,23 +39,22 @@ class Orchestrator:
         risk_alert = None
         
         if impact < -0.5:
-            # print("🚨 [Orchestrator] High Risk News Detected! Alerting Market Agents.")
             print("[Orchestrator] High Risk News Detected! Alerting Market Agents.")
             risk_alert = {
                 "level": "high", 
                 "source": "news", 
                 "msg": f"Negative news impact: {news_result.get('summary')}"
             }
-            # 실제로는 여기서 coin_agent에게 "보수적으로 봐라"는 프롬프트를 주입할 수 있음.
         
         # 3. 코인 시장 분석 (뉴스 리스크 반영)
-        # 에이전트에게 리스크 정보를 컨텍스트로 전달하는 로직이 필요함 (여기선 mock data에 반영 안됨)
+        # market_data가 None이면 CoinAgent가 DB에서 직접 조회함
         coin_result = self.coin_agent.process(market_data)
         
         # (시뮬레이션) 만약 리스크가 감지되었다면 코인 에이전트의 결과를 덮어쓰거나 재요청한다고 가정
         if risk_alert:
             coin_result['risk_level'] = "high"
-            coin_result['summary'] += " (News Risk Reflected)"
+            if "News Risk Reflected" not in coin_result['summary']:
+                coin_result['summary'] += " (News Risk Reflected)"
             
         self.store.log_message(
             sender="agent_coin",
@@ -58,7 +63,6 @@ class Orchestrator:
             content=coin_result
         )
 
-        # print("✅ Cycle Complete.")
         print("Cycle Complete.")
         return {
             "global_status": "risk_on" if impact > -0.3 else "risk_off",

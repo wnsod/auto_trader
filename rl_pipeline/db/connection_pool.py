@@ -492,11 +492,22 @@ def get_candle_db_pool() -> DatabaseConnectionPool:
     return _candle_pool
 
 def get_strategy_db_pool(db_path: str = None) -> DatabaseConnectionPool:
-    """전략 데이터베이스 연결 풀 반환"""
+    """전략 데이터베이스 연결 풀 반환 (Windows/Docker 크로스 플랫폼 호환)"""
     global _strategy_pool, _strategy_pools
+    
+    # 🆕 경로 변환 임포트 (순환 참조 방지를 위해 함수 내부에서 임포트)
+    from rl_pipeline.core.env import finalize_path
     
     # db_path가 명시적으로 주어지면(예: 코인별 DB) 새로운 풀 사용 (또는 캐싱된 풀)
     if db_path:
+        # 🚀 /workspace 경로를 Windows 경로로 변환
+        db_path = finalize_path(db_path)
+        
+        # 디렉토리인 경우 기본 파일명 사용 (common_strategies.db)
+        import os
+        if os.path.isdir(db_path) or not db_path.endswith('.db'):
+            db_path = os.path.join(db_path, 'common_strategies.db')
+            
         if db_path in _strategy_pools:
             return _strategy_pools[db_path]
             
@@ -517,17 +528,26 @@ def get_strategy_db_pool(db_path: str = None) -> DatabaseConnectionPool:
                 conn.close()
         except Exception as e:
             logger.error(f"❌ 코인별 전략 DB 준비 실패: {db_path} - {e}")
+            # 🔥 실패한 경로 캐시에서 제거 (다음 시도 시 재생성 가능)
+            if db_path in _strategy_pools:
+                del _strategy_pools[db_path]
             raise DBReadError(f"전략 DB를 준비할 수 없습니다: {e}")
             
         # 풀 생성 및 캐싱
-        pool = DatabaseConnectionPool(db_path)
-        _strategy_pools[db_path] = pool
-        return pool
+        try:
+            pool = DatabaseConnectionPool(db_path)
+            _strategy_pools[db_path] = pool
+            return pool
+        except Exception as pool_err:
+            # 🔥 풀 생성 실패 시 캐시에서 제거 (다음 시도 시 재생성 가능)
+            logger.error(f"❌ 연결 풀 생성 실패: {db_path} - {pool_err}")
+            if db_path in _strategy_pools:
+                del _strategy_pools[db_path]
+            raise DBReadError(f"연결 풀 생성 실패: {pool_err}")
 
     if _strategy_pool is None:
-        # 🔥 config.STRATEGIES_DB는 이제 동적 속성이므로 항상 최신 환경변수를 반영함
-        # 따라서 복잡한 폴백 로직 없이 config를 신뢰하면 됨
-        db_path = config.STRATEGIES_DB
+        # 🔥 config.STRATEGIES_DB에서 경로를 가져온 후 finalize_path 적용
+        db_path = finalize_path(config.STRATEGIES_DB)
         
         # 디렉토리인 경우 기본 파일명 사용 (common_strategies.db)
         import os
@@ -656,6 +676,18 @@ def close_all_connections(verbose: bool = False):
             _candle_pool.close_all_connections(verbose=verbose)
         if _batch_pool:
             _batch_pool.close_all_connections(verbose=verbose)
+        
+        # 🔥 코인별 전략 DB 풀 캐시도 정리
+        global _strategy_pools
+        if _strategy_pools:
+            for db_path, pool in list(_strategy_pools.items()):
+                try:
+                    pool.close_all_connections(verbose=verbose)
+                except:
+                    pass
+            _strategy_pools.clear()
+            if verbose:
+                logger.info("✅ 코인별 전략 DB 풀 캐시 정리 완료")
 
         if verbose:
             logger.info("✅ 모든 데이터베이스 연결 종료 완료")

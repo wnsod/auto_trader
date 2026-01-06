@@ -7,6 +7,14 @@ import os
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
+# 🆕 경로 변환 유틸리티 (Windows/Docker 크로스 플랫폼 호환)
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def finalize_path(path: str) -> str:
+    """경로를 절대 경로로 변환 (Docker 환경)"""
+    if not path: return path
+    return os.path.abspath(path)
+
 # 환경변수 로드
 env_path = os.path.join(os.path.dirname(__file__), '..', 'rl_pipeline_config.env')
 load_dotenv(env_path)
@@ -120,45 +128,49 @@ class Config:
     # 🔥 동적 속성: 환경변수 변경을 실시간 반영 (엔진화 필수)
     @property
     def DATA_STORAGE_PATH(self):
-        """데이터 저장소 경로 (동적)"""
+        """데이터 저장소 경로 (동적, Windows/Docker 크로스 플랫폼 호환)"""
         # 1. 환경변수 우선
         _env_storage = os.getenv('DATA_STORAGE_PATH')
         if _env_storage:
-            return _env_storage
+            return finalize_path(_env_storage)
             
         # 2. 전략 DB 경로 기반 추론
         _strat_db = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
         if _strat_db:
-            return os.path.dirname(_strat_db)
+            return finalize_path(os.path.dirname(_strat_db))
             
         # 3. 폴백: market/coin_market/data_storage 우선 확인 (프로젝트 구조 인식)
-        # 현재 위치에서 상대 경로로 market/coin_market 찾기 시도
-        current_dir = os.getcwd()
-        
-        # case A: 루트에서 실행 시
-        potential_path = os.path.join(current_dir, 'market', 'coin_market', 'data_storage')
-        if os.path.exists(os.path.dirname(potential_path)): # coin_market 폴더가 있으면
+        # 🆕 _BASE_DIR 기준으로 탐색 (cwd 의존성 제거)
+        potential_path = os.path.join(_BASE_DIR, 'market', 'coin_market', 'data_storage')
+        if os.path.exists(os.path.dirname(potential_path)):
             return potential_path
             
-        # case B: market/coin_market 내부에서 실행 시 (이미 처리되겠지만)
-        if 'coin_market' in current_dir:
-            # 상위로 올라가서 data_storage 찾기 등 복잡한 로직보다는
-            # 보통 run_learning.py가 환경변수를 설정하므로 여기까지 올 일이 적음
-            pass
+        # case B: 현재 위치에서 실행 시
+        current_dir = os.getcwd()
+        potential_path2 = os.path.join(current_dir, 'market', 'coin_market', 'data_storage')
+        if os.path.exists(os.path.dirname(potential_path2)):
+            return potential_path2
 
-        # 4. 최후의 수단 (현재 디렉토리)
-        return os.path.join(current_dir, 'data_storage')
+        # 4. 최후의 수단 (_BASE_DIR 기준)
+        return os.path.join(_BASE_DIR, 'market', 'coin_market', 'data_storage')
 
     @property
     def RL_DB(self):
-        """RL 캔들 DB 경로 (동적)"""
-        return os.getenv('RL_DB_PATH', os.getenv('CANDLES_DB_PATH', os.path.join(self.DATA_STORAGE_PATH, 'rl_candles.db')))
+        """RL 캔들 DB 경로 (동적, Windows/Docker 크로스 플랫폼 호환)"""
+        _env_path = os.getenv('RL_DB_PATH') or os.getenv('CANDLES_DB_PATH')
+        if _env_path:
+            return finalize_path(_env_path)
+        return os.path.join(self.DATA_STORAGE_PATH, 'rl_candles.db')
 
     @property
     def STRATEGIES_DB(self):
-        """전략 DB 경로 (동적 - 파일 또는 디렉토리)"""
+        """전략 DB 경로 (동적 - 파일 또는 디렉토리, Windows/Docker 크로스 플랫폼 호환)"""
         # 🔧 기본값을 디렉토리 모드로 변경 (learning_strategies 폴더)
-        path = os.getenv('STRATEGY_DB_PATH', os.getenv('STRATEGIES_DB_PATH', os.path.join(self.DATA_STORAGE_PATH, 'learning_strategies')))
+        _env_path = os.getenv('STRATEGY_DB_PATH') or os.getenv('STRATEGIES_DB_PATH')
+        if _env_path:
+            path = finalize_path(_env_path)
+        else:
+            path = os.path.join(self.DATA_STORAGE_PATH, 'learning_strategies')
         
         # 🔥 강제 보정: rl_strategies.db가 경로에 포함되어 있으면 learning_strategies로 교체 (레거시 호환성)
         if 'rl_strategies.db' in path:

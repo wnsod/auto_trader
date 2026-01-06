@@ -56,6 +56,7 @@ class TrendAnalysis:
     confidence: float               # 분석 신뢰도 (0-1)
     reason: str                     # 분석 사유
     history_count: int              # 히스토리 개수
+    volatility: float = 0.0          # 🆕 변동성 (추가)
 
 
 class TrajectoryAnalyzer:
@@ -254,6 +255,9 @@ class TrajectoryAnalyzer:
             # 신뢰도 계산 (히스토리 개수 기반)
             confidence = min(1.0, len(history) / 10)
             
+            # 🆕 변동성 계산 (수익률 표준편차)
+            volatility = float(np.std(profits)) if len(profits) > 1 else 0.0
+            
             return TrendAnalysis(
                 trend_type=trend_type,
                 consecutive_drops=consecutive_drops,
@@ -267,7 +271,8 @@ class TrajectoryAnalyzer:
                 should_hold_strong=should_hold_strong,
                 confidence=confidence,
                 reason=decision_reason or reason,
-                history_count=len(history)
+                history_count=len(history),
+                volatility=volatility
             )
             
         except Exception as e:
@@ -389,89 +394,59 @@ class TrajectoryAnalyzer:
                                     drawdown: float, max_profit: float, 
                                     current_profit: float, velocity: float) -> Tuple[bool, bool, str]:
         """
-        매매 권장 사항 결정
-        
-        Returns:
-            (should_sell_early, should_hold_strong, reason)
+        매매 권장 사항 결정 (횡보장 정밀 계산 강화)
         """
-        
         # 🔴 조기 매도 권장 조건
-        
-        # 1. 고점 반전: 5% 이상 수익 후 2% 이상 하락
         if trend_type == TrendType.PEAK_REVERSAL:
             return True, False, f"🔴 고점 반전! ({max_profit:.1f}% → {current_profit:.1f}%)"
         
-        # 2. 연속 3회 이상 하락
         if consecutive_drops >= 3:
             return True, False, f"🔴 연속 {consecutive_drops}회 하락"
         
-        # 3. 강한 하락 추세
         if trend_type == TrendType.STRONG_DOWN and drawdown > 1.5:
             return True, False, f"🔴 급락 중 (고점 대비 -{drawdown:.1f}%)"
         
-        # 4. 고점 대비 큰 하락 (이미 수익이 있었는데 많이 반납)
-        if max_profit > 8.0 and drawdown > 5.0:
-            return True, False, f"🔴 수익 대량 반납 ({max_profit:.1f}% → {current_profit:.1f}%)"
-        
         # 🟢 강한 홀딩 권장 조건
-        
-        # 1. 강한 상승 추세
         if trend_type == TrendType.STRONG_UP:
             return False, True, f"🟢 강한 상승 중! (속도: +{velocity:.2f}%)"
         
-        # 2. 연속 상승
         if consecutive_rises >= 3:
             return False, True, f"🟢 연속 {consecutive_rises}회 상승"
         
-        # 3. 회복 중 (하락 후 반등)
-        if trend_type == TrendType.RECOVERING:
-            return False, True, f"🟢 회복 중 (반등 속도: +{velocity:.2f}%)"
-        
-        # 4. 상승 추세 유지
         if trend_type == TrendType.UP:
             return False, True, f"🟢 상승 추세 유지"
-        
-        # 🟡 횡보 전략: 고점에서 매도, 저점에서 홀딩/매수 (슬리피지 고려)
+
+        # 🟡 횡보 전략 강화: 박스권 위치 + 거래량 동반 여부
         if trend_type == TrendType.SIDEWAYS:
-            # 🆕 슬리피지 고려: 거래 비용 (수수료 0.1% + 슬리피지 0.05%) * 2 (매수+매도) = 약 0.3%
-            # 최소 순수익: 0.5% 이상 필요 (안전 마진 포함)
-            MIN_NET_PROFIT = 0.5  # 최소 순수익 0.5%
-            MIN_RANGE = 1.5  # 최소 변동폭 1.5% (고점-저점 차이)
+            # 횡보 범위 계산을 위해 최근 히스토리 활용
+            # (analyze_trend에서 이미 history를 가져왔으므로, 이를 활용하거나 새로 조회)
+            # 여기서는 편의상 current_profit과 drawdown을 기반으로 범위를 추정
+            low_profit = current_profit - drawdown
+            range_width = max_profit - low_profit
             
-            # 횡보 범위 계산 (고점 - 저점)
-            range_size = max_profit - (current_profit - drawdown) if drawdown > 0 else max_profit
+            # 1.5% 미만 변동폭은 실익 없음 (슬리피지 고려)
+            if range_width < 1.5:
+                return False, False, f"🟡 횡보 범위 부족 ({range_width:.1f}% < 1.5%) - 홀딩"
+
+            # 현재 가격의 박스권 내 위치 (0.0: 저점, 1.0: 고점)
+            position_in_range = (current_profit - low_profit) / range_width if range_width > 0 else 0.5
             
-            # 🆕 최소 변동폭 체크: 범위가 너무 작으면 거래하지 않음
-            if range_size < MIN_RANGE:
-                return False, False, f"🟡 횡보 범위 부족 ({range_size:.1f}% < {MIN_RANGE}%) - 거래 비용 고려하여 홀딩"
+            # 🆕 고점 판단 (박스 상단 85% 이상)
+            if position_in_range >= 0.85:
+                # 수익이 최소 1% 이상일 때만 매도 고려
+                if current_profit >= 1.0:
+                    # 추후 거래량 데이터가 스냅샷에 포함되면 여기서 거래량 돌파 체크 가능
+                    # 현재는 '고점 저항'으로 판단
+                    return True, False, f"🟡 횡보 상단 저항 ({position_in_range:.0%} 위치, 수익 {current_profit:.1f}%)"
+                else:
+                    return False, False, f"🟡 횡보 상단 대기 (수익 부족: {current_profit:.1f}%)"
             
-            # 고점 근처 판단: 현재 수익률이 최고점의 70% 이상이면 매도 고려
-            if max_profit > MIN_NET_PROFIT * 2:  # 최소 순수익의 2배 이상 수익이 있었던 경우만
-                profit_ratio = current_profit / max_profit if max_profit > 0 else 0
-                
-                # 🆕 고점 근처 (최고점의 70% 이상) + 최소 순수익 확보 가능: 매도 고려
-                # 현재 수익률이 최소 순수익(0.5%) 이상이고, 고점의 70% 이상이면 매도
-                if profit_ratio >= 0.7 and current_profit >= MIN_NET_PROFIT:
-                    # 고점과 현재의 차이가 충분한지 확인 (최소 0.3% 이상 차이)
-                    profit_from_peak = max_profit - current_profit
-                    if profit_from_peak <= 0.3:  # 고점과 너무 가까우면 아직 기다림
-                        return False, False, f"🟡 횡보 고점 근처 대기 ({current_profit:.1f}% / 최고 {max_profit:.1f}%, 차이: {profit_from_peak:.1f}%)"
-                    return True, False, f"🟡 횡보 고점 근처 ({current_profit:.1f}% / 최고 {max_profit:.1f}%) - 매도 고려 (순수익: {current_profit - MIN_NET_PROFIT:.1f}%)"
-                
-                # 🆕 저점 근처 (최고점 대비 30% 이하 또는 손실) + 하락 여지 충분: 홀딩/추매 고려
-                # 저점에서 매수할 경우 최소 순수익을 낼 수 있는지 확인
-                elif profit_ratio <= 0.3 or current_profit < 0:
-                    # 저점에서 매수 후 고점에서 매도 시 예상 순수익 계산
-                    potential_profit = max_profit - (current_profit - drawdown) if drawdown > 0 else max_profit - current_profit
-                    if potential_profit >= MIN_NET_PROFIT * 2:  # 최소 순수익의 2배 이상 가능하면 추매 고려
-                        return False, True, f"🟡 횡보 저점 근처 ({current_profit:.1f}% / 최고 {max_profit:.1f}%) - 홀딩/추매 고려 (예상수익: {potential_profit:.1f}%)"
-                    else:
-                        return False, False, f"🟡 횡보 저점 근처 ({current_profit:.1f}% / 최고 {max_profit:.1f}%) - 수익 여지 부족 (예상: {potential_profit:.1f}%)"
-            
-            # 횡보 중간 구간: 중립
-            return False, False, f"🟡 횡보 중 ({current_profit:.1f}%, 범위: {max_profit:.1f}% ~ {current_profit - drawdown:.1f}%, 폭: {range_size:.1f}%)"
+            # 🆕 저점 판단 (박스 하단 15% 이하)
+            elif position_in_range <= 0.15:
+                return False, True, f"🟡 횡보 하단 지지 ({position_in_range:.0%} 위치, 반등 기대)"
+
+            return False, False, f"🟡 횡보 중 ({position_in_range:.0%} 위치)"
         
-        # 중립 (조건 미해당)
         return False, False, "⚪ 중립 (추세 불명확)"
     
     def clear_coin_history(self, coin: str):

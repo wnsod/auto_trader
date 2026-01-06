@@ -88,7 +88,10 @@ class DBWriterMixin:
     """
 
     def create_signal_table(self):
-        """시그널 테이블 생성 (trading_system.db에 저장)"""
+        """시그널 테이블 생성 (엔진 모드에서는 생략 가능하도록 보호)"""
+        if os.environ.get('ENGINE_READ_ONLY') == 'true':
+            return
+            
         try:
             print(f"🚀 시그널 테이블 생성 중: {DB_PATH}")
             
@@ -128,6 +131,13 @@ class DBWriterMixin:
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_signals_combined ON signals(coin, interval) WHERE interval = "combined"')
                 
+                # 🆕 [증분 검증] validated_at 컬럼 마이그레이션 (없으면 추가)
+                cursor = conn.execute("PRAGMA table_info(signals)")
+                cols = [row[1] for row in cursor.fetchall()]
+                if 'validated_at' not in cols:
+                    conn.execute("ALTER TABLE signals ADD COLUMN validated_at INTEGER DEFAULT NULL")
+                    conn.execute('CREATE INDEX IF NOT EXISTS idx_signals_unvalidated ON signals(validated_at) WHERE validated_at IS NULL')
+                
                 conn.commit()
                 print(f"✅ 시그널 테이블 생성 완료: {DB_PATH}")
                 
@@ -135,7 +145,10 @@ class DBWriterMixin:
             print(f"⚠️ 시그널 테이블 생성 오류: {e}")
     
     def create_enhanced_learning_tables(self):
-        """향상된 학습을 위한 추가 테이블들 생성 (learning_strategies.db에 생성)"""
+        """향상된 학습을 위한 추가 테이블들 생성 (엔진 모드 보호)"""
+        if os.environ.get('ENGINE_READ_ONLY') == 'true':
+            return
+            
         try:
             # learning_strategies.db에 테이블 생성
             # 🔧 디렉토리 모드 지원: 폴더면 common_strategies.db 사용
@@ -148,7 +161,8 @@ class DBWriterMixin:
             if db_dir and not os.path.exists(db_dir):
                 os.makedirs(db_dir, exist_ok=True)
             
-            with sqlite3.connect(learning_db_path) as conn:
+            from trade.core.database import get_db_connection
+            with get_db_connection(learning_db_path, read_only=False) as conn:
                 # 신뢰도 점수 테이블
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS reliability_scores (
@@ -222,19 +236,41 @@ class DBWriterMixin:
                 
                 # 🆕 누락된 테이블들 추가
                 
-                # 시그널 피드백 점수 테이블
+                # 🆕 통일된 스키마로 시그널 피드백 점수 테이블 생성
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS signal_feedback_scores (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        coin TEXT NOT NULL,
+                        interval TEXT NOT NULL DEFAULT 'combined',
                         signal_pattern TEXT NOT NULL,
                         success_rate REAL NOT NULL,
                         avg_profit REAL NOT NULL,
                         total_trades INTEGER NOT NULL,
                         confidence REAL NOT NULL,
+                        score REAL,  -- strategy_calculator용 (confidence와 동일 값)
+                        feedback_type TEXT,  -- strategy_calculator용
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(coin, interval, signal_pattern, feedback_type)
                     )
                 """)
+                
+                # 🆕 기존 컬럼이 없으면 추가 (마이그레이션)
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(signal_feedback_scores)")
+                columns = [row[1] for row in cursor.fetchall()]
+                
+                if 'coin' not in columns:
+                    try:
+                        cursor.execute("ALTER TABLE signal_feedback_scores ADD COLUMN coin TEXT DEFAULT 'unknown'")
+                        cursor.execute("ALTER TABLE signal_feedback_scores ADD COLUMN interval TEXT DEFAULT 'combined'")
+                        cursor.execute("ALTER TABLE signal_feedback_scores ADD COLUMN score REAL")
+                        cursor.execute("ALTER TABLE signal_feedback_scores ADD COLUMN feedback_type TEXT")
+                        # 기존 데이터에 기본값 설정
+                        cursor.execute("UPDATE signal_feedback_scores SET coin = 'unknown', interval = 'combined', score = confidence, feedback_type = 'unknown' WHERE coin IS NULL")
+                        conn.commit()
+                    except Exception as e:
+                        pass  # 마이그레이션 오류는 조용히 무시
                 
                 # 전략 결과 테이블
                 conn.execute("""
@@ -351,10 +387,11 @@ class DBWriterMixin:
         except Exception as e:
             print(f"⚠️ 학습용 시그널 저장 오류: {e}")
     
-    def save_signal(self, signal: SignalInfo):
+    def save_signal(self, signal: SignalInfo, silent: bool = False):
         """시그널 저장 (trading_system.db에 저장) - 연결 풀 사용"""
         try:
-            print(f"💾 시그널 저장 중: {signal.coin}/{signal.interval} -> {DB_PATH}")
+            if not silent:
+                print(f"💾 시그널 저장 중: {signal.coin}/{signal.interval} -> {DB_PATH}")
             
             # 🆕 최적화된 DB 연결 (충돌 방지 강화)
             if DB_POOL_AVAILABLE:
@@ -364,17 +401,44 @@ class DBWriterMixin:
                 # Fallback: 직접 연결
                 with sqlite3.connect(DB_PATH) as conn:
                     self._save_signal_to_db(conn, signal)
-                    
-            print(f"✅ 시그널 저장 완료: {signal.coin}/{signal.interval}")
+            
+            if not silent:
+                print(f"✅ 시그널 저장 완료: {signal.coin}/{signal.interval}")
         except Exception as e:
             logger.error(f"❌ 시그널 저장 실패: {e}")
-    
-    def _save_signal_to_db(self, conn, signal: SignalInfo):
-        """실제 시그널 저장 로직"""
+
+    def save_signals_batch(self, signals: List[SignalInfo]):
+        """🚀 [Speed] 대량의 시그널을 하나의 트랜잭션으로 일괄 저장"""
+        if not signals: return
+        
+        try:
+            start_t = time.time()
+            print(f"📡 {len(signals)}개 시그널 일괄 저장 시작...")
+            
+            # 🆕 최적화된 DB 연결
+            if DB_POOL_AVAILABLE:
+                with get_optimized_db_connection(DB_PATH, mode='write') as conn:
+                    # 트랜잭션 수동 관리 (성능 극대화)
+                    conn.execute("BEGIN TRANSACTION")
+                    for sig in signals:
+                        self._save_signal_to_db(conn, sig, commit=False)
+                    conn.commit()
+            else:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("BEGIN TRANSACTION")
+                    for sig in signals:
+                        self._save_signal_to_db(conn, sig, commit=False)
+                    conn.commit()
+            
+            print(f"✅ 일괄 저장 완료: {len(signals)}개 | 소요: {time.time() - start_t:.3f}s")
+        except Exception as e:
+            logger.error(f"❌ 시그널 일괄 저장 실패: {e}")
+
+    def _save_signal_to_db(self, conn, signal: SignalInfo, commit: bool = True):
+        """실제 시그널 저장 로직 (commit 옵션 추가)"""
         try:
             # 🚨 [Safety] 코인 심볼 유효성 검사 (숫자형 코인 방지)
             if str(signal.coin).isdigit():
-                print(f"⛔ 잘못된 코인 심볼(숫자) 감지되어 저장 건너뜀: {signal.coin}")
                 return
 
             # 먼저 고급지표 컬럼들이 존재하는지 확인하고 없으면 추가
@@ -450,7 +514,9 @@ class DBWriterMixin:
                     {column_list}
                 ) VALUES ({placeholders})
             """, values)
-            conn.commit()
+            
+            if commit:
+                conn.commit()
         except Exception as e:
             print(f"⚠️ 시그널 저장 오류 ({signal.coin}/{signal.interval}): {e}")
 

@@ -29,12 +29,66 @@ if root_dir not in sys.path:
     sys.path.append(root_dir)
 
 # 🔥 [추가] os 모듈 import (중복 제거됨)
-import time
-import sqlite3
+import math
+import numpy as np
 import pandas as pd
+import time
 import json
+import os
+import sys
 import logging
+import traceback
+import sqlite3
+from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
+
+# 🆕 공통 코어 모듈 임포트 (가상매매와 동일하게 정합성 유지)
+from trade.core.learner.connector import SignalTradeConnector
+from trade.core.learner.analyzer import PatternAnalyzer
+from trade.core.learner.realtime import RealTimeLearner
+from trade.core.thompson import get_thompson_calculator, ThompsonSamplingLearner, OutlierGuardrail, BayesianSmoothing
+from trade.core.executor.strategy import decide_final_action, get_dynamic_weights, get_learning_maturity
+from trade.core.trading import (
+    get_market_context as get_common_market_context,
+    calculate_buy_thresholds, BuyThresholds,
+    normalize_regime, get_regime_severity, get_regime_trading_strategy,
+    should_execute_buy, calculate_combined_score, VALID_REGIMES
+)
+from trade.core.decision import get_ai_decision_engine
+from trade.core.models import SignalInfo, SignalAction
+from trade.core.sequence_analyzer import SequenceAnalyzer
+from trade.core.thresholds import (
+    get_thresholds, get_buy_threshold, get_sell_threshold,
+    get_priority_level, get_stop_loss_adjustment, is_buy_signal
+)
+
+# 🆕 전략 시스템 임포트
+try:
+    from trade.core.strategies import (
+        evaluate_all_strategies, select_best_strategies, get_top_strategies,
+        get_exit_rules, get_strategy_description, update_strategy_feedback,
+        get_strategy_success_rate, create_strategy_feedback_table,
+        STRATEGY_EXIT_RULES, STRATEGY_ENTRY_THRESHOLDS, StrategyType,
+        serialize_strategy_scores, deserialize_strategy_scores,
+        get_regime_adjustment, get_sideways_policy  # 🆕 레짐 조정 함수
+    )
+    STRATEGY_SYSTEM_AVAILABLE = True
+    print("✅ 전략 시스템 로드 완료 (10가지 매매 전략)")
+except ImportError as e:
+    STRATEGY_SYSTEM_AVAILABLE = False
+    print(f"⚠️ 전략 시스템 로드 실패: {e}")
+
+# 🧬 전략 진화 시스템 임포트 (가상매매와 동일)
+try:
+    from trade.core.strategy_evolution import (
+        get_evolution_manager, update_evolution_stats, get_strategy_level,
+        get_best_evolved_strategy, EvolutionLevel
+    )
+    EVOLUTION_SYSTEM_AVAILABLE = True
+    print("✅ 전략 진화 시스템 로드 완료 (4단계 진화)")
+except ImportError as e:
+    EVOLUTION_SYSTEM_AVAILABLE = False
+    print(f"⚠️ 전략 진화 시스템 로드 실패: {e}")
 
 # 🔧 [경로 수정] trade_manager는 trade 패키지 내에 있음
 try:
@@ -54,13 +108,15 @@ from typing import Dict, Any, List
 
 # 🆕 Thompson Sampling 학습기 임포트 (가상/실전 매매 일치화)
 try:
-    from trade.virtual_trade_learner import ThompsonSamplingLearner
+    from trade.core.thompson import ThompsonSamplingLearner
     # 🆕 전역 인스턴스 생성 (DB 연결 재사용)
     _thompson_learner_instance = None
     def get_thompson_learner():
         global _thompson_learner_instance
         if _thompson_learner_instance is None:
-            _thompson_learner_instance = ThompsonSamplingLearner()
+            # 실전 매매 DB 경로 사용 (core.database에서 가져옴)
+            from trade.core.database import STRATEGY_DB_PATH
+            _thompson_learner_instance = ThompsonSamplingLearner(db_path=STRATEGY_DB_PATH)
         return _thompson_learner_instance
 except ImportError:
     print("⚠️ ThompsonSamplingLearner 로드 실패")
@@ -86,67 +142,47 @@ except ImportError:
     TRAJECTORY_ANALYZER_AVAILABLE = False
     print("⚠️ Trajectory Analyzer 로드 실패 - 추세 분석 비활성화")
 
-# DB 경로 설정 (전역 변수로 미리 설정)
-# 1. 시그널/캔들 DB (환경변수 우선, 없으면 trade_candles.db 사용)
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DEFAULT_DB_DIR = os.path.join(PROJECT_ROOT, 'market', 'coin_market', 'data_storage')
-
+# DB 경로 설정 (trade.core.database에서 중앙화된 설정 로드)
 try:
-    os.makedirs(_DEFAULT_DB_DIR, exist_ok=True)
-except OSError:
-    pass
-
-# 🆕 전략 DB 경로 설정 (virtual_trade_learner와 동일한 로직 사용)
-_env_strategy_base = os.getenv('STRATEGY_DB_PATH')
-_default_strategy_base = os.path.join(_DEFAULT_DB_DIR, 'learning_strategies')
-
-if _env_strategy_base and (_env_strategy_base.startswith('/workspace') or _env_strategy_base.startswith('\\workspace')):
-    if os.name == 'nt':
-         _strategy_base = _default_strategy_base
-    else:
-         _strategy_base = _env_strategy_base
-else:
-    _strategy_base = _env_strategy_base or _default_strategy_base
-
-if os.path.isdir(_strategy_base) or not _strategy_base.endswith('.db'):
-    STRATEGY_DB_PATH = os.path.join(_strategy_base, 'common_strategies.db')
-else:
-    STRATEGY_DB_PATH = _strategy_base
-
-# 🆕 trade_candles.db 우선 사용
-_trade_candles_path = os.path.join(_DEFAULT_DB_DIR, 'trade_candles.db')
-# ⚠️ realtime_candles.db는 더 이상 사용하지 않음 (trade_candles.db로 통일)
-_default_candle_db = _trade_candles_path
-
-DB_PATH = os.getenv('RL_DB_PATH')
-if not DB_PATH:
-    DB_PATH = _default_candle_db
-
-# 🆕 통합 트레이딩 시스템 DB 경로 (섀도우 + 실전 매매)
-DEFAULT_TRADING_DB_PATH = os.path.join(_DEFAULT_DB_DIR, 'trading_system.db')
-TRADING_SYSTEM_DB_PATH = os.getenv('TRADING_DB_PATH')
-if not TRADING_SYSTEM_DB_PATH:
-    TRADING_SYSTEM_DB_PATH = DEFAULT_TRADING_DB_PATH
+    from trade.core.database import TRADING_SYSTEM_DB_PATH, STRATEGY_DB_PATH, CANDLES_DB_PATH
+    DB_PATH = CANDLES_DB_PATH
+except ImportError:
+    # 하위 호환성 및 대체 로직
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _DEFAULT_DB_DIR = os.path.join(PROJECT_ROOT, 'market', 'coin_market', 'data_storage')
+    TRADING_SYSTEM_DB_PATH = os.path.join(_DEFAULT_DB_DIR, 'trading_system.db')
+    STRATEGY_DB_PATH = os.path.join(_DEFAULT_DB_DIR, 'learning_strategies', 'common_strategies.db')
+    DB_PATH = os.path.join(_DEFAULT_DB_DIR, 'trade_candles.db')
 
 
-def load_virtual_trade_decisions(max_age_minutes: int = 30) -> Dict[str, Dict]:
-    """🆕🆕 가상매매 결정 테이블에서 최신 결정 읽기
-    
-    가상매매에서 모든 분석(레짐, Thompson Sampling, 기대수익률 등)을 완료한 결과를 읽어옴
-    실전매매에서는 이 결정을 그대로 사용하여 매매 실행
-    
-    Returns:
-        Dict[str, Dict]: coin -> decision_data 매핑
-    """
+def load_virtual_trade_decisions(max_age_minutes: int = 30, reference_ts: int = None) -> Dict[str, Dict]:
+    """🆕🆕 가상매매 결정 테이블에서 최신 결정 읽기 (DB 최신 시각 기준)"""
     try:
-        cutoff_time = int(time.time()) - (max_age_minutes * 60)
+        from trade.core.database import get_db_connection
+        # 🚀 [Fix] 기준 시각 설정 (없으면 현재 시스템 시각)
+        now = reference_ts if reference_ts else int(time.time())
+        cutoff_time = now - (max_age_minutes * 60)
         
-        with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
-            query = """
-                SELECT coin, timestamp, decision, signal_score, confidence, current_price,
-                       target_price, expected_profit_pct, thompson_score, thompson_approved,
-                       regime_score, regime_name, viability_passed, reason,
-                       is_holding, entry_price, profit_loss_pct
+        with get_db_connection(TRADING_SYSTEM_DB_PATH, read_only=True) as conn:
+            # 🆕 컬럼 존재 여부 확인 후 쿼리 생성
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(virtual_trade_decisions)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            select_fields = [
+                "coin", "timestamp", "decision", "signal_score", "confidence", "current_price",
+                "target_price", "expected_profit_pct", "thompson_score", "thompson_approved",
+                "regime_score", "regime_name", "viability_passed", "reason",
+                "is_holding", "entry_price", "profit_loss_pct"
+            ]
+            
+            if 'wave_phase' in columns:
+                select_fields.append("wave_phase")
+            if 'integrated_direction' in columns:
+                select_fields.append("integrated_direction")
+                
+            query = f"""
+                SELECT {', '.join(select_fields)}
                 FROM virtual_trade_decisions
                 WHERE timestamp > ? AND processed = 0
                 ORDER BY timestamp DESC
@@ -179,7 +215,9 @@ def load_virtual_trade_decisions(max_age_minutes: int = 30) -> Dict[str, Dict]:
                         'reason': row['reason'],
                         'is_holding': bool(row['is_holding']),
                         'entry_price': row['entry_price'],
-                        'profit_loss_pct': row['profit_loss_pct']
+                        'profit_loss_pct': row['profit_loss_pct'],
+                        'wave_phase': row.get('wave_phase', 'unknown'),
+                        'integrated_direction': row.get('integrated_direction', 'neutral')
                     }
             
             return decisions
@@ -190,9 +228,10 @@ def load_virtual_trade_decisions(max_age_minutes: int = 30) -> Dict[str, Dict]:
 
 
 def mark_decision_processed(coin: str, timestamp: int):
-    """🆕 가상매매 결정을 처리 완료로 표시"""
+    """🆕 가상매매 결정을 처리 완료로 표시 (쓰기 모드 안정성 강화)"""
     try:
-        with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+        from trade.core.database import get_db_connection
+        with get_db_connection(TRADING_SYSTEM_DB_PATH, read_only=False) as conn:
             conn.execute("""
                 UPDATE virtual_trade_decisions
                 SET processed = 1
@@ -202,345 +241,25 @@ def mark_decision_processed(coin: str, timestamp: int):
     except Exception as e:
         print(f"⚠️ 결정 처리 완료 표시 오류: {e}")
 
-# 🆕 성능 업그레이드 시스템 클래스들 (실전 매매 특화)
-class RealTimeActionTracker:
-    """실전 매매 액션별 성과 추적기"""
-    def __init__(self):
-        self.action_performance = {
-            'buy': {'trades': 0, 'wins': 0, 'total_profit': 0.0, 'total_amount': 0.0},
-            'sell': {'trades': 0, 'wins': 0, 'total_profit': 0.0, 'total_amount': 0.0},
-            'hold': {'trades': 0, 'wins': 0, 'total_profit': 0.0, 'total_amount': 0.0}
-        }
-        self.coin_performance = {}
-    
-    def record_action_result(self, action: str, profit: float, success: bool, amount: float, symbol: str):
-        """액션 결과 기록 (실전 매매 특화)"""
-        if action in self.action_performance:
-            self.action_performance[action]['trades'] += 1
-            self.action_performance[action]['total_profit'] += profit
-            self.action_performance[action]['total_amount'] += amount
-            if success:
-                self.action_performance[action]['wins'] += 1
-        
-        # 코인별 성과 추적
-        if symbol not in self.coin_performance:
-            self.coin_performance[symbol] = {'trades': 0, 'wins': 0, 'total_profit': 0.0}
-        self.coin_performance[symbol]['trades'] += 1
-        self.coin_performance[symbol]['total_profit'] += profit
-        if success:
-            self.coin_performance[symbol]['wins'] += 1
-    
-    def get_action_performance(self, action: str) -> dict:
-        """액션별 성과 반환"""
-        if action not in self.action_performance:
-            return {'success_rate': 0.0, 'avg_profit': 0.0, 'total_trades': 0, 'avg_amount': 0.0}
-        
-        perf = self.action_performance[action]
-        if perf['trades'] == 0:
-            return {'success_rate': 0.0, 'avg_profit': 0.0, 'total_trades': 0, 'avg_amount': 0.0}
-        
-        return {
-            'success_rate': perf['wins'] / perf['trades'],
-            'avg_profit': perf['total_profit'] / perf['trades'],
-            'total_trades': perf['trades'],
-            'avg_amount': perf['total_amount'] / perf['trades']
-        }
-    
-    def get_coin_performance(self, symbol: str) -> dict:
-        """코인별 성과 반환"""
-        if symbol not in self.coin_performance:
-            return {'success_rate': 0.0, 'avg_profit': 0.0, 'total_trades': 0}
-        
-        perf = self.coin_performance[symbol]
-        if perf['trades'] == 0:
-            return {'success_rate': 0.0, 'avg_profit': 0.0, 'total_trades': 0}
-        
-        return {
-            'success_rate': perf['wins'] / perf['trades'],
-            'avg_profit': perf['total_profit'] / perf['trades'],
-            'total_trades': perf['trades']
-        }
+# 🆕 실전 매매용 정밀 분석 및 학습 로직 통합 (trade.core 활용)
+# 가상매매에서 검증된 고정밀 학습 로직이 실전에도 동일하게 적용됩니다.
 
-class RealTimeContextRecorder:
-    """실전 매매 컨텍스트 기록기"""
-    def __init__(self):
-        self.trade_contexts = {}
-        self.market_contexts = {}
-    
-    def record_trade_context(self, trade_id: str, context: dict):
-        """거래 컨텍스트 기록"""
-        self.trade_contexts[trade_id] = {
-            'timestamp': time.time(),
-            'context': context
-        }
-    
-    def record_market_context(self, timestamp: int, context: dict):
-        """시장 컨텍스트 기록"""
-        self.market_contexts[timestamp] = context
-    
-    def get_trade_context(self, trade_id: str) -> dict:
-        """거래 컨텍스트 조회"""
-        return self.trade_contexts.get(trade_id, {})
-    
-    def get_market_context(self, timestamp: int) -> dict:
-        """시장 컨텍스트 조회"""
-        return self.market_contexts.get(timestamp, {})
+# 🆕 실전 매매 성능 업그레이드 시스템 초기화 (코어 모듈 연동)
+# 가상매매와 동일한 정밀 분석 도구 사용
+pattern_analyzer = PatternAnalyzer()
+thompson_sampler = get_thompson_learner()
+real_time_learner = RealTimeLearner(thompson_sampler)
 
-class RealTimeOutlierGuardrail:
-    """실전 매매 이상치 컷 시스템"""
-    def __init__(self, percentile_cut: float = 0.05):
-        self.percentile_cut = percentile_cut
-    
-    def winsorize_profits(self, profits: List[float]) -> List[float]:
-        """수익률 Winsorizing (실전 매매 특화)"""
-        if len(profits) < 5:  # 실전 매매는 더 보수적
-            return profits
-        
-        sorted_profits = sorted(profits)
-        n = len(sorted_profits)
-        
-        # 상하위 5% 절단
-        lower_cut = int(n * self.percentile_cut)
-        upper_cut = int(n * (1 - self.percentile_cut))
-        
-        # 절단된 값으로 대체
-        winsorized = []
-        for profit in profits:
-            if profit < sorted_profits[lower_cut]:
-                winsorized.append(sorted_profits[lower_cut])
-            elif profit > sorted_profits[upper_cut]:
-                winsorized.append(sorted_profits[upper_cut])
-            else:
-                winsorized.append(profit)
-        
-        return winsorized
-    
-    def calculate_robust_avg_profit(self, profits: List[float]) -> float:
-        """견고한 평균 수익률 계산"""
-        winsorized_profits = self.winsorize_profits(profits)
-        return sum(winsorized_profits) / len(winsorized_profits)
+# 🛡️ 알파 가디언 활성화/비활성화 설정
+ENABLE_ALPHA_GUARDIAN = os.getenv('ENABLE_ALPHA_GUARDIAN', 'true').lower() == 'true'
 
-class RealTimeAIDecisionEngine:
-    """실전 매매 AI 의사결정 엔진"""
-    def __init__(self):
-        self.decision_history = []
-        self.coin_decision_patterns = {}
-        self.market_adaptations = {}
-        
-    def make_trading_decision(self, signal_data: dict, current_price: float, 
-                            market_context: dict, coin_performance: dict) -> str:
-        """실전 매매 의사결정 (거래량 기준 선별된 코인 대상)"""
-        try:
-            # 기본 시그널 분석
-            signal_score = signal_data.get('signal_score', 0.0)
-            confidence = signal_data.get('confidence', 0.0)
-            action = signal_data.get('action', 'hold')
-            
-            # 코인별 성과 기반 조정
-            coin_bonus = self._calculate_coin_performance_bonus(coin_performance)
-            
-            # 시장 컨텍스트 기반 조정
-            market_bonus = self._calculate_market_context_bonus(market_context)
-            
-            # 실전 매매 특화 리스크 조정
-            risk_adjustment = self._calculate_real_time_risk_adjustment(signal_data, current_price)
-            
-            # 최종 의사결정
-            final_score = signal_score + coin_bonus + market_bonus - risk_adjustment
-            
-            # 의사결정 기록
-            decision_record = {
-                'timestamp': time.time(),
-                'symbol': signal_data.get('symbol', 'unknown'),
-                'signal_score': signal_score,
-                'final_score': final_score,
-                'action': action,
-                'coin_bonus': coin_bonus,
-                'market_bonus': market_bonus,
-                'risk_adjustment': risk_adjustment
-            }
-            self.decision_history.append(decision_record)
-            
-            # 액션 결정
-            if final_score > 0.3 and confidence > 0.6:
-                return 'buy'
-            elif final_score < -0.3 and confidence > 0.6:
-                return 'sell'
-            else:
-                return 'hold'
-                
-        except Exception as e:
-            print(f"⚠️ 실전 매매 AI 의사결정 오류: {e}")
-            return 'hold'
-
-    def _calculate_coin_performance_bonus(self, coin_performance: dict) -> float:
-        """코인별 성과 보너스 계산"""
-        try:
-            success_rate = coin_performance.get('success_rate', 0.5)
-            avg_profit = coin_performance.get('avg_profit', 0.0)
-            total_trades = coin_performance.get('total_trades', 0)
-            
-            # 거래 횟수가 적으면 보수적
-            if total_trades < 5:
-                return 0.0
-            
-            # 성과 기반 보너스
-            performance_bonus = (success_rate - 0.5) * 0.2 + avg_profit * 0.1
-            return max(-0.1, min(0.1, performance_bonus))
-            
-        except Exception as e:
-            print(f"⚠️ 코인 성과 보너스 계산 오류: {e}")
-            return 0.0
-    
-    def _calculate_market_context_bonus(self, market_context: dict) -> float:
-        """시장 컨텍스트 보너스 계산"""
-        try:
-            market_trend = market_context.get('trend', 'neutral')
-            volatility = market_context.get('volatility', 'medium')
-            
-            bonus = 0.0
-            
-            # 트렌드 기반 보너스
-            if market_trend == 'bullish':
-                bonus += 0.05
-            elif market_trend == 'bearish':
-                bonus -= 0.05
-            
-            # 변동성 기반 보너스
-            if volatility == 'low':
-                bonus += 0.02
-            elif volatility == 'high':
-                bonus -= 0.02
-            
-            return max(-0.1, min(0.1, bonus))
-            
-        except Exception as e:
-            print(f"⚠️ 시장 컨텍스트 보너스 계산 오류: {e}")
-            return 0.0
-    
-    def _calculate_real_time_risk_adjustment(self, signal_data: dict, current_price: float) -> float:
-        """실전 매매 리스크 조정"""
-        try:
-            risk_level = signal_data.get('risk_level', 'medium')
-            confidence = signal_data.get('confidence', 0.5)
-            
-            risk_adjustment = 0.0
-            
-            # 리스크 레벨 기반 조정
-            if risk_level == 'high':
-                risk_adjustment += 0.1
-            elif risk_level == 'low':
-                risk_adjustment += 0.02
-            
-            # 신뢰도 기반 조정
-            if confidence < 0.5:
-                risk_adjustment += 0.05
-            
-            return risk_adjustment
-            
-        except Exception as e:
-            print(f"⚠️ 실전 매매 리스크 조정 오류: {e}")
-            return 0.05
-
-class RealTimeLearningFeedback:
-    """실전 매매 학습 피드백 시스템"""
-    def __init__(self):
-        self.trade_feedback = {}
-        self.coin_patterns = {}
-        self.market_patterns = {}
-        # 🚀 초기화 시 DB에서 과거 성과 로드
-        self.load_history_from_db()
-        
-    def load_history_from_db(self):
-        """DB에서 과거 거래 기록을 로드하여 학습 상태 복원"""
-        try:
-            # 통합 DB 경로 사용 (없으면 전역 변수 참조 시도)
-            db_path = TRADING_SYSTEM_DB_PATH if 'TRADING_SYSTEM_DB_PATH' in globals() else DB_PATH
-            
-            with sqlite3.connect(db_path) as conn:
-                # real_trade_history 테이블이 있는지 확인
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='real_trade_history'")
-                if not cursor.fetchone():
-                    # 테이블이 없으면 trade_decision_log 확인 (구버전 호환)
-                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trade_decision_log'")
-                    if not cursor.fetchone():
-                        return
-                    table_name = 'trade_decision_log'
-                else:
-                    table_name = 'real_trade_history'
-                
-                # 최근 1000개 거래 내역 로드 (실행된 것만)
-                query = f"""
-                    SELECT coin, profit_pct, action 
-                    FROM {table_name}
-                    WHERE executed = 1 AND profit_pct IS NOT NULL
-                    ORDER BY timestamp DESC LIMIT 1000
-                """
-                rows = cursor.execute(query).fetchall()
-                
-                for coin, profit, action in rows:
-                    if coin not in self.coin_patterns:
-                        self.coin_patterns[coin] = {'trades': 0, 'wins': 0, 'total_profit': 0.0}
-                    
-                    self.coin_patterns[coin]['trades'] += 1
-                    self.coin_patterns[coin]['total_profit'] += profit
-                    if profit > 0:
-                        self.coin_patterns[coin]['wins'] += 1
-                
-                print(f"✅ [RealTimeLearningFeedback] 과거 거래 {len(rows)}건 로드 완료")
-        
-        except Exception as e:
-            print(f"⚠️ 과거 데이터 로드 중 오류 (무시하고 진행): {e}")
-
-    def record_trade_result(self, symbol: str, trade_result: dict):
-        """거래 결과 기록"""
-        try:
-            trade_id = f"{symbol}_{trade_result.get('timestamp', int(time.time()))}"
-            
-            self.trade_feedback[trade_id] = {
-                'symbol': symbol,
-                'timestamp': trade_result.get('timestamp', int(time.time())),
-                'action': trade_result.get('action', 'unknown'),
-                'profit': trade_result.get('profit', 0.0),
-                'success': trade_result.get('profit', 0.0) > 0,
-                'amount': trade_result.get('amount', 0.0),
-                'context': trade_result.get('context', {})
-            }
-            
-            # 코인별 패턴 업데이트
-            if symbol not in self.coin_patterns:
-                self.coin_patterns[symbol] = {'trades': 0, 'wins': 0, 'total_profit': 0.0}
-            
-            self.coin_patterns[symbol]['trades'] += 1
-            self.coin_patterns[symbol]['total_profit'] += trade_result.get('profit', 0.0)
-            if trade_result.get('profit', 0.0) > 0:
-                self.coin_patterns[symbol]['wins'] += 1
-                
-        except Exception as e:
-            print(f"⚠️ 실전 매매 학습 피드백 기록 오류: {e}")
-    
-    def get_coin_learning_data(self, symbol: str) -> dict:
-        """코인별 학습 데이터 반환"""
-        if symbol not in self.coin_patterns:
-            return {'success_rate': 0.5, 'avg_profit': 0.0, 'total_trades': 0}
-        
-        pattern = self.coin_patterns[symbol]
-        if pattern['trades'] == 0:
-            return {'success_rate': 0.5, 'avg_profit': 0.0, 'total_trades': 0}
-        
-        return {
-            'success_rate': pattern['wins'] / pattern['trades'],
-            'avg_profit': pattern['total_profit'] / pattern['trades'],
-            'total_trades': pattern['trades']
-        }
-
-# 🆕 실전 매매 성능 업그레이드 시스템 초기화
-real_time_action_tracker = RealTimeActionTracker()
-real_time_context_recorder = RealTimeContextRecorder()
-real_time_outlier_guardrail = RealTimeOutlierGuardrail()
-real_time_ai_decision_engine = RealTimeAIDecisionEngine()
-real_time_learning_feedback = RealTimeLearningFeedback()
+# 글로벌 AI 엔진 인스턴스 (공통 모듈 연동)
+if ENABLE_ALPHA_GUARDIAN:
+    real_time_ai_decision_engine = get_ai_decision_engine()
+    print("🛡️ 알파 가디언 활성화됨 (실전 매매)")
+else:
+    real_time_ai_decision_engine = None
+    print("ℹ️ 알파 가디언 비활성화됨 (실전 매매, ENABLE_ALPHA_GUARDIAN=false)")
 
 # 로깅 설정 (파일 생성 없이 콘솔만)
 logging.basicConfig(
@@ -550,92 +269,102 @@ logging.basicConfig(
 
 # 시그널 기반 거래 결정 내역 테이블 생성 (최초 1회 실행 시 생성)
 def create_signal_trade_table():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS signal_trade_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER,
-                symbol TEXT,
-                action TEXT,
-                signal_score REAL,
-                confidence REAL,
-                reason TEXT,
-                price REAL,
-                position_percentage REAL,
-                profit_pct REAL,
-                rsi REAL,
-                macd REAL,
-                wave_phase TEXT,
-                rl_score REAL,
-                tech_score REAL,
-                wave_score REAL,
-                risk_score REAL,
-                decision_status TEXT,
-                executed INTEGER DEFAULT 0
-            );
-        """)
+    try:
+        from trade.core.database import get_db_connection
+        with get_db_connection(DB_PATH, read_only=False) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signal_trade_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER,
+                    symbol TEXT,
+                    action TEXT,
+                    signal_score REAL,
+                    confidence REAL,
+                    reason TEXT,
+                    price REAL,
+                    position_percentage REAL,
+                    profit_pct REAL,
+                    rsi REAL,
+                    macd REAL,
+                    wave_phase TEXT,
+                    rl_score REAL,
+                    tech_score REAL,
+                    wave_score REAL,
+                    risk_score REAL,
+                    decision_status TEXT,
+                    executed INTEGER DEFAULT 0
+                );
+            """)
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️ 시그널 매매 내역 테이블 생성 오류: {e}")
 
 def create_trade_decision_log_table():
-    # 🚀 trading_system.db에 실전 매매 테이블 생성 (통합 DB 사용)
-    with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS real_trade_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER,
-                symbol TEXT,
-                interval TEXT,
-                action TEXT,              -- buy / sell / hold / switch
-                reason TEXT,              -- stop_loss / profit_sell / hold / switch
-                reason_detail TEXT,       -- 판단 사유 상세 (지표 수치, 시그널 분석 등)
-                entry_price REAL,
-                current_price REAL,
-                profit_pct REAL,
-                fusion_score REAL,
-                rl_score REAL,
-                market_mode TEXT,
-                market_flow TEXT,
-                gpt_approved INTEGER,     -- 1 = 승인됨, 0 = 반려됨
-                executed INTEGER,         -- 1 = 실제 매매 실행됨, 0 = 판단만 기록
-                execution_price REAL,     -- 실체결가 (없으면 NULL)
-                execution_amount REAL,    -- 체결 금액 or 수량 (없으면 NULL)
-                execution_type TEXT,      -- buy / sell / switch / none
-                signal_score REAL,        -- 시그널 점수
-                confidence REAL,          -- 신뢰도
-                holding_duration INTEGER,  -- 보유 기간 (초)
-                max_profit_pct REAL,      -- 최대 수익률
-                max_loss_pct REAL,        -- 최대 손실률
-                stop_loss_price REAL,     -- 스탑로스 가격
-                take_profit_price REAL,   -- 테이크프로핏 가격
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS real_trade_feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trade_id INTEGER,
-                coin TEXT,
-                signal_pattern TEXT,      -- 시그널 패턴
-                success_rate REAL,        -- 성공률
-                avg_profit REAL,          -- 평균 수익률
-                total_trades INTEGER,     -- 총 거래 수
-                confidence REAL,          -- 신뢰도
-                learning_episode INTEGER, -- 학습 에피소드
-                feedback_type TEXT,       -- feedback_type (success/failure)
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (trade_id) REFERENCES real_trade_history(id)
-            );
-        """)
-        
-        # 🆕 보유 시간 전용 테이블 (가벼움, 매도 시 삭제)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS current_position_times (
-                coin TEXT PRIMARY KEY,
-                buy_timestamp INTEGER NOT NULL,
-                entry_price REAL DEFAULT 0.0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
+    # 🚀 trading_system.db에 실전 매매 테이블 생성 (통합 DB 사용, 쓰기 모드 안정성 강화)
+    try:
+        from trade.core.database import get_db_connection
+        with get_db_connection(TRADING_SYSTEM_DB_PATH, read_only=False) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS real_trade_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER,
+                    symbol TEXT,
+                    interval TEXT,
+                    action TEXT,              -- buy / sell / hold / switch
+                    reason TEXT,              -- stop_loss / profit_sell / hold / switch
+                    reason_detail TEXT,       -- 판단 사유 상세 (지표 수치, 시그널 분석 등)
+                    entry_price REAL,
+                    current_price REAL,
+                    profit_pct REAL,
+                    fusion_score REAL,
+                    rl_score REAL,
+                    market_mode TEXT,
+                    market_flow TEXT,
+                    gpt_approved INTEGER,     -- 1 = 승인됨, 0 = 반려됨
+                    executed INTEGER,         -- 1 = 실제 매매 실행됨, 0 = 판단만 기록
+                    execution_price REAL,     -- 실체결가 (없으면 NULL)
+                    execution_amount REAL,    -- 체결 금액 or 수량 (없으면 NULL)
+                    execution_type TEXT,      -- buy / sell / switch / none
+                    signal_score REAL,        -- 시그널 점수
+                    confidence REAL,          -- 신뢰도
+                    holding_duration INTEGER,  -- 보유 기간 (초)
+                    max_profit_pct REAL,      -- 최대 수익률
+                    max_loss_pct REAL,        -- 최대 손실률
+                    stop_loss_price REAL,     -- 스탑로스 가격
+                    take_profit_price REAL,   -- 테이크프로핏 가격
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS real_trade_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id INTEGER,
+                    coin TEXT,
+                    signal_pattern TEXT,      -- 시그널 패턴
+                    success_rate REAL,        -- 성공률
+                    avg_profit REAL,          -- 평균 수익률
+                    total_trades INTEGER,     -- 총 거래 수
+                    confidence REAL,          -- 신뢰도
+                    learning_episode INTEGER, -- 학습 에피소드
+                    feedback_type TEXT,       -- feedback_type (success/failure)
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (trade_id) REFERENCES real_trade_history(id)
+                );
+            """)
+            
+            # 🆕 보유 시간 전용 테이블 (가벼움, 매도 시 삭제)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS current_position_times (
+                    coin TEXT PRIMARY KEY,
+                    buy_timestamp INTEGER NOT NULL,
+                    entry_price REAL DEFAULT 0.0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️ 실전 매매 테이블 생성 오류: {e}")
 
 def create_holdings_table():
     with sqlite3.connect(DB_PATH) as conn:
@@ -698,19 +427,41 @@ def load_wallet_real():
     return wallet_df
 
 # 🆕 가격 포맷팅 헬퍼 함수 (소수점 자릿수 동적 결정)
-def format_price(price: float) -> str:
-    """가격에 따라 적절한 소수점 자릿수로 포맷팅
+def format_price(price: float, return_float: bool = False) -> Any:
+    """🆕 빗썸 KRW 마켓 호가 단위(Tick Size) 규정을 준수한 포맷팅 및 반올림
     
-    - 1원 미만: 소수점 4자리 (예: 0.5912)
-    - 1~100원: 소수점 2자리 (예: 19.40)
-    - 100원 이상: 소수점 0자리 + 천단위 콤마 (예: 4,544)
+    - 1원 미만: 소수점 4자리 (0.0001 단위)
+    - 1원 이상 ~ 10원 미만: 소수점 3자리 (0.001 단위)
+    - 10원 이상 ~ 100원 미만: 소수점 2자리 (0.01 단위)
+    - 100원 이상 ~ 1,000원 미만: 소수점 1자리 (0.1 단위)
+    - 1,000원 이상: 소수점 없음 (1원 단위)
     """
+    if price is None or price <= 0: return 0.0 if return_float else "0"
+    
     if price < 1:
-        return f"{price:.4f}"
+        # 1원 미만: 0.0001 단위
+        rounded = round(price, 4)
+        return rounded if return_float else f"{rounded:.4f}"
+    elif price < 10:
+        # 1원 ~ 10원: 0.001 단위
+        rounded = round(price, 3)
+        return rounded if return_float else f"{rounded:.3f}"
     elif price < 100:
-        return f"{price:.2f}"
+        # 10원 ~ 100원: 0.01 단위
+        rounded = round(price, 2)
+        return rounded if return_float else f"{rounded:.2f}"
+    elif price < 1000:
+        # 100원 ~ 1,000원: 0.1 단위
+        rounded = round(price, 1)
+        return rounded if return_float else f"{rounded:.1f}"
     else:
-        return f"{price:,.0f}"
+        # 1,000원 이상: 1원 단위 (고가 코인은 5원/10원 단위이나 소수점 제거가 핵심)
+        rounded = float(int(round(price, 0)))
+        return rounded if return_float else f"{int(rounded):,}"
+
+def round_to_tick(price: float) -> float:
+    """가격을 빗썸 호가 단위로 반올림하여 float로 반환"""
+    return format_price(price, return_float=True)
 
 # 매수 금액 불러오기
 def get_entry_price(symbol):
@@ -729,41 +480,72 @@ def get_quantity(symbol):
 
 # 추가 매수 여부 결정 함수
 def should_add_buy(coin, signal_score, confidence, current_price, entry_price):
-    """이미 보유한 코인에 대한 추가 매수(피라미딩) 여부를 결정
+    """🆕 설계 반영: 수익 중 추가 매수(피라미딩)의 자율 판단"""
+    if entry_price is None or entry_price <= 0: return True # 신규 매수 허용
     
-    ⚠️ 물타기(손실 중 추매) 금지 - 수익 중일 때만 추매 허용
-    """
-    if entry_price is None or entry_price <= 0:
-        return True  # 보유하지 않은 코인이므로 신규 매수
+    profit_pct = ((current_price - entry_price) / entry_price) * 100
     
-    # 현재 수익률 계산
-    profit_loss_pct = ((current_price - entry_price) / entry_price) * 100
+    # ❌ 손실 중 물타기 금지 (원칙 유지)
+    if profit_pct < 0: return False
     
-    # ❌ 손실 중이면 추매 금지 (물타기 금지)
-    if profit_loss_pct < 0:
-        return False
+    # 🎯 시장 상황 및 알파 가디언 성향 연동
+    market_context = get_market_context()
+    buy_bias = 0.0
+    try:
+        from trade.core.decision import get_ai_decision_engine
+        guardian = get_ai_decision_engine()
+        buy_bias = guardian.get_meta_bias().get('buy_threshold_offset', 0.0)
+    except: pass
+
+    # 기본 추매 문턱 (0.15)을 알파 가디언 성향으로 보정
+    min_add_score = 0.15 + buy_bias
     
-    # 🎯 피라미딩 조건 (수익 중일 때만)
-    # 1. 수익률 1% 이상 + 시그널 점수 높을 때
-    if profit_loss_pct >= 1.0 and signal_score >= 0.06 and confidence >= 0.7:
-        return True
-    
-    # 2. 수익률 3% 이상 + 시그널 점수 양호할 때
-    if profit_loss_pct >= 3.0 and signal_score >= 0.05 and confidence >= 0.65:
+    # 불장(Bullish)일수록 더 낮은 수익권에서도 적극적으로 피라미딩
+    min_profit_threshold = 1.0 if market_context['trend'] == 'bullish' else 2.5
+
+    if profit_pct >= min_profit_threshold and signal_score >= min_add_score and confidence >= 0.65:
         return True
     
     return False
 
 
 # 🆕🆕 보유 시간 관리 함수들 (current_position_times 테이블)
-def record_position_buy_time(coin: str, entry_price: float = 0.0):
-    """매수 시 보유 시간 기록"""
+def record_position_buy_time(coin: str, entry_price: float = 0.0, 
+                            entry_strategy: str = 'trend', strategy_match: float = 0.5,
+                            evolution_level: int = 1, evolved_params: str = ''):
+    """매수 시 보유 시간 및 전략 정보 기록 (진화 레벨 포함)"""
     try:
         with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+            from trade.core.database import get_latest_candle_timestamp
+            db_now = get_latest_candle_timestamp()
+            
+            # 🆕 전략 + 진화 관련 컬럼 마이그레이션
+            cursor = conn.execute("PRAGMA table_info(current_position_times)")
+            cols = [c[1] for c in cursor.fetchall()]
+            strategy_cols = {
+                'entry_strategy': "TEXT DEFAULT 'trend'",
+                'current_strategy': "TEXT DEFAULT 'trend'",
+                'strategy_match': "REAL DEFAULT 0.5",
+                'strategy_switch_count': "INTEGER DEFAULT 0",
+                'strategy_switch_history': "TEXT DEFAULT ''",
+                # 🧬 진화 시스템 필드
+                'evolution_level': "INTEGER DEFAULT 1",
+                'evolved_params': "TEXT DEFAULT ''"
+            }
+            for col, col_type in strategy_cols.items():
+                if col not in cols:
+                    try:
+                        conn.execute(f"ALTER TABLE current_position_times ADD COLUMN {col} {col_type}")
+                    except:
+                        pass
+            
             conn.execute("""
-                INSERT OR REPLACE INTO current_position_times (coin, buy_timestamp, entry_price)
-                VALUES (?, ?, ?)
-            """, (coin, int(time.time()), entry_price))
+                INSERT OR REPLACE INTO current_position_times 
+                (coin, buy_timestamp, entry_price, entry_strategy, current_strategy, 
+                 strategy_match, strategy_switch_count, evolution_level, evolved_params)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """, (coin, db_now, entry_price, entry_strategy, entry_strategy, 
+                  strategy_match, evolution_level, evolved_params))
             conn.commit()
     except Exception as e:
         logging.warning(f"보유 시간 기록 오류 ({coin}): {e}")
@@ -779,23 +561,177 @@ def remove_position_time(coin: str):
         logging.warning(f"보유 시간 삭제 오류 ({coin}): {e}")
 
 
-def get_holding_duration(coin: str) -> int:
-    """코인의 보유 시간(초) 조회
-    
-    조회 순서:
-    1. current_position_times (실전매매 전용, 가벼움)
-    2. virtual_positions (가상매매 기록)
-    3. 둘 다 없으면 기본값 24시간
+def get_position_strategy_info(coin: str) -> dict:
+    """포지션의 전략 정보 조회 (진화 레벨 포함)"""
+    try:
+        with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+            cursor = conn.execute("""
+                SELECT entry_strategy, current_strategy, strategy_match, 
+                       strategy_switch_count, strategy_switch_history,
+                       evolution_level, evolved_params
+                FROM current_position_times WHERE coin = ?
+            """, (coin,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'entry_strategy': row[0] or 'trend',
+                    'current_strategy': row[1] or row[0] or 'trend',
+                    'strategy_match': row[2] or 0.5,
+                    'strategy_switch_count': row[3] or 0,
+                    'strategy_switch_history': row[4] or '',
+                    # 🧬 진화 시스템 정보
+                    'evolution_level': row[5] if len(row) > 5 and row[5] else 1,
+                    'evolved_params': row[6] if len(row) > 6 and row[6] else ''
+                }
+    except:
+        pass
+    return {'entry_strategy': 'trend', 'current_strategy': 'trend', 
+            'strategy_match': 0.5, 'strategy_switch_count': 0, 'strategy_switch_history': '',
+            'evolution_level': 1, 'evolved_params': ''}
+
+
+def check_strategy_switch_real(coin: str, profit_pct: float, holding_hours: float) -> tuple:
+    """
+    🆕 실제 매매용 전략 전환 확인
     
     Returns:
-        보유 시간(초)
+        (should_switch, new_strategy, reason)
     """
+    import json
+    
+    strategy_info = get_position_strategy_info(coin)
+    current_strat = strategy_info['current_strategy']
+    switch_count = strategy_info['strategy_switch_count']
+    
+    # 전환 횟수 제한 (최대 2회 - 실제 매매는 더 보수적)
+    if switch_count >= 2:
+        return False, None, None
+    
+    new_strategy = None
+    reason = None
+    
+    # 스캘핑 → 스윙/추세
+    if current_strat == 'scalp':
+        if holding_hours > 4.0 and profit_pct >= 0:
+            new_strategy = 'swing'
+            reason = f"스캘핑 시간 초과 ({holding_hours:.1f}h), 스윙 전환"
+        elif holding_hours > 4.0 and profit_pct >= 3.0:
+            new_strategy = 'trend'
+            reason = f"수익 중 시간 초과 (+{profit_pct:.1f}%), 추세 전환"
+    
+    # 저점 매수 → 추세
+    elif current_strat == 'bottom':
+        if profit_pct >= 10.0:
+            new_strategy = 'trend'
+            reason = f"저점 반등 확인 (+{profit_pct:.1f}%), 추세 전환"
+    
+    # 스윙 → 추세
+    elif current_strat == 'swing':
+        if profit_pct >= 20.0:
+            new_strategy = 'trend'
+            reason = f"파동 연장 (+{profit_pct:.1f}%), 추세 전환"
+    
+    if new_strategy:
+        # DB 업데이트
+        try:
+            history = json.loads(strategy_info['strategy_switch_history']) if strategy_info['strategy_switch_history'] else []
+            history.append({
+                'from': current_strat, 'to': new_strategy, 
+                'reason': reason, 'profit_at_switch': profit_pct,
+                'ts': int(time.time())
+            })
+            
+            with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+                conn.execute("""
+                    UPDATE current_position_times SET
+                        current_strategy = ?, 
+                        strategy_switch_count = strategy_switch_count + 1,
+                        strategy_switch_history = ?
+                    WHERE coin = ?
+                """, (new_strategy, json.dumps(history), coin))
+                conn.commit()
+            
+            print(f"   🔄 {coin}: 전략 전환! [{current_strat.upper()}] → [{new_strategy.upper()}]")
+            print(f"      📋 이유: {reason}")
+            
+        except Exception as e:
+            logging.warning(f"전략 전환 DB 업데이트 오류: {e}")
+        
+        return True, new_strategy, reason
+    
+    return False, None, None
+
+
+def record_strategy_feedback_real(coin: str, profit_pct: float, success: bool, holding_hours: float):
+    """🆕 실제 매매 완료 시 전략 분리 학습"""
+    try:
+        from trade.core.strategies import update_strategy_feedback
+        from trade.core.database import STRATEGY_DB_PATH
+        
+        strategy_info = get_position_strategy_info(coin)
+        entry_strategy = strategy_info['entry_strategy']
+        exit_strategy = strategy_info['current_strategy']
+        switch_count = strategy_info['strategy_switch_count']
+        
+        pattern = f"{coin}_real_trade"
+        
+        # 1️⃣ 진입 전략 학습
+        update_strategy_feedback(
+            db_path=STRATEGY_DB_PATH,
+            strategy_type=entry_strategy,
+            market_condition='real_trade',
+            signal_pattern=pattern,
+            success=success,
+            profit_pct=profit_pct,
+            holding_hours=holding_hours,
+            feedback_type='entry'
+        )
+        
+        # 2️⃣ 청산 전략 학습 (전환된 경우)
+        if switch_count > 0 and exit_strategy != entry_strategy:
+            update_strategy_feedback(
+                db_path=STRATEGY_DB_PATH,
+                strategy_type=exit_strategy,
+                market_condition='real_trade',
+                signal_pattern=pattern,
+                success=success,
+                profit_pct=profit_pct,
+                holding_hours=holding_hours,
+                feedback_type='exit'
+            )
+            
+            # 3️⃣ 전환 성공률 학습
+            switch_key = f"{entry_strategy}_to_{exit_strategy}"
+            update_strategy_feedback(
+                db_path=STRATEGY_DB_PATH,
+                strategy_type=switch_key,
+                market_condition='real_trade',
+                signal_pattern=pattern,
+                success=success,
+                profit_pct=profit_pct,
+                holding_hours=holding_hours,
+                feedback_type='switch'
+            )
+            
+            print(f"   📚 [{entry_strategy}→{exit_strategy}] 전략 전환 학습: {'✅' if success else '❌'} ({profit_pct:+.2f}%)")
+        else:
+            print(f"   📚 [{entry_strategy}] 전략 학습: {'✅' if success else '❌'} ({profit_pct:+.2f}%)")
+            
+    except ImportError:
+        pass
+    except Exception as e:
+        logging.warning(f"전략 피드백 기록 오류: {e}")
+
+
+def get_holding_duration(coin: str) -> int:
+    """코인의 보유 시간(초) 조회"""
     try:
         with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
             cursor = conn.cursor()
-            current_time = int(time.time())
+            from trade.core.database import get_latest_candle_timestamp
+            current_time = get_latest_candle_timestamp()
             
-            # 1. 실전매매 보유 시간 테이블에서 조회 (가장 정확)
+            # 1. 실전매매 보유 시간 테이블에서 조회
             cursor.execute("""
                 SELECT buy_timestamp FROM current_position_times 
                 WHERE coin = ?
@@ -803,9 +739,7 @@ def get_holding_duration(coin: str) -> int:
             
             row = cursor.fetchone()
             if row and row[0]:
-                buy_timestamp = row[0]
-                holding_seconds = current_time - buy_timestamp
-                return max(0, holding_seconds)
+                return max(0, current_time - row[0])
             
             # 2. 가상매매 포지션에서 조회 (fallback)
             cursor.execute("""
@@ -815,85 +749,154 @@ def get_holding_duration(coin: str) -> int:
             
             row = cursor.fetchone()
             if row and row[0]:
-                entry_timestamp = row[0]
-                holding_seconds = current_time - entry_timestamp
-                return max(0, holding_seconds)
+                return max(0, current_time - row[0])
             
-            # 3. 기록 없으면 기본값 24시간 (갈아타기 조건 체크 가능하도록)
-            return 24 * 3600  # 24시간
+            return 24 * 3600  # 기본값 24시간
         
     except Exception as e:
         logging.warning(f"보유 시간 조회 오류 ({coin}): {e}")
-        return 24 * 3600  # 오류 시에도 기본값 반환
+        return 24 * 3600
 
 
-# 🆕🆕 갈아타기 조건 체크 함수들 (횡보/손실장기화/목표미달)
+# 🆕🆕 갈아타기 조건 체크 함수 (지능형 보완 + 전략별 횡보 정책 + 레짐 반영)
 def check_switch_condition(coin: str, profit_pct: float, holding_hours: float, 
-                           target_price: float = 0, current_price: float = 0) -> tuple:
-    """갈아타기 조건 체크 (3가지 조건 중 하나라도 충족하면 True)
+                           target_price: float = 0, current_price: float = 0,
+                           market_score: float = 0.5, trend_analysis = None,
+                           strategy_type: str = None, market_regime: str = None) -> tuple:
+    """🆕 설계 반영: 시장 상황에 따른 자율적 종목 교체 판단 (전략별 횡보 정책 + 레짐 적용)"""
     
-    Returns:
-        (should_switch: bool, reason: str, switch_type: str)
-    """
-    # 1. 횡보 감지: 12시간+ 보유 & 수익률 ±2% 이내
-    if holding_hours >= 12.0 and -2.0 <= profit_pct <= 2.0:
-        return True, f"횡보 감지 ({holding_hours:.1f}시간, {profit_pct:+.2f}%)", "sideways"
+    # 🆕 전략별 횡보 정책 로드
+    try:
+        from trade.core.strategies import get_sideways_policy, should_exempt_from_sideways_switch
+        strategy_policy_available = True
+    except ImportError:
+        strategy_policy_available = False
     
-    # 2. 손실 장기화: 24시간+ 보유 & 손실 -3% 이하 지속
-    if holding_hours >= 24.0 and profit_pct <= -3.0:
-        return True, f"손실 장기화 ({holding_hours:.1f}시간, {profit_pct:+.2f}%)", "stagnant_loss"
+    # 🆕 전략별 횡보 갈아타기 면제 체크 (레짐 반영)
+    if strategy_policy_available and strategy_type:
+        # 🆕 전략+레짐 호환성 체크
+        if market_regime:
+            from trade.core.strategies import get_strategy_regime_compatibility
+            compatibility, compat_desc = get_strategy_regime_compatibility(strategy_type, market_regime)
+            # 호환성 매우 낮으면 (< 0.5) 면제 전략이라도 교체 고려
+            if compatibility < 0.5:
+                return True, f"{compat_desc} - 전략 부적합", "strategy_regime_mismatch"
+        
+        if should_exempt_from_sideways_switch(strategy_type):
+            # 면제 전략이라도 최대 보유 시간은 체크
+            from trade.core.strategies import STRATEGY_EXIT_RULES
+            exit_rules = STRATEGY_EXIT_RULES.get(strategy_type)
+            if exit_rules and holding_hours >= exit_rules.max_holding_hours:
+                return True, f"전략({strategy_type}) 최대 보유 시간 초과 ({holding_hours:.0f}h/{exit_rules.max_holding_hours}h)", "strategy_max_holding"
+            # 횡보 체크 스킵 (but 손실 장기화는 체크)
+            if profit_pct <= -8.0:  # 심각한 손실은 전략 무관 청산
+                return True, f"전략({strategy_type}) 손실 한도 초과 ({profit_pct:.1f}%)", "strategy_stop_loss"
+            return False, "", ""
     
-    # 3. 목표 미달: 예상 시간 2배 경과 & 목표 50% 미달
-    if target_price > 0 and current_price > 0 and holding_hours >= 24.0:
-        # 목표가까지 남은 비율 계산
-        target_distance_pct = ((target_price - current_price) / current_price) * 100
-        # 목표의 50% 이상 남아있고, 24시간 이상 경과했으면 목표 미달로 판정
-        if target_distance_pct > 2.0:  # 목표까지 2% 이상 남음
-            return True, f"목표 미달 ({holding_hours:.1f}시간, 목표까지 {target_distance_pct:.1f}%)", "target_miss"
+    # 🎯 시장 상황에 따른 '인내심(Patience)' 동적 계산
+    # 시장 점수가 높을수록(1.0에 가까울수록) 인내심을 낮춰 빠르게 주도주로 교체
+    # 시장 점수 0.8+ (강한 불장) -> 4시간만 횡보해도 교체
+    # 시장 점수 0.5  (중립)     -> 12시간 횡보 시 교체
+    # 시장 점수 0.2- (하락장)   -> 24시간까지 견딤
+    
+    patience_hours = 24.0 * (1.1 - market_score) # 0.5일 때 약 14시간, 0.8일 때 약 7시간
+    
+    # 🆕 전략별 patience 배율 적용 (레짐 반영)
+    if strategy_policy_available and strategy_type:
+        from trade.core.strategies import get_patience_multiplier
+        patience_multiplier = get_patience_multiplier(strategy_type, regime=market_regime)
+        patience_hours *= patience_multiplier
+    
+    # 🎯 전문가 지능 반영: 중장기 전문가(240m_mid)의 신뢰도가 높으면 인내심 2배 강화
+    # 이 종목이 결국 갈 것이라는 '전문가적 확신'이 있다면 횡보를 더 견딥니다.
+    expert_reliability = 0.5
+    try:
+        # 🆕 설계 반영: SignalSelector 엔진을 로드하는 대신 DB에서 직접 신뢰도 조회
+        with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT AVG(is_correct) FROM prediction_events 
+                WHERE coin = ? AND type = '240m_mid' AND status = 'completed'
+                ORDER BY expire_timestamp DESC LIMIT 30
+            """, (coin,))
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                expert_reliability = float(row[0])
+    except Exception as e:
+        logging.debug(f"신뢰도 직접 조회 실패: {e}")
+        expert_reliability = 0.5
+        
+    if expert_reliability >= 0.65:
+        patience_hours *= 2.0
+        # print(f"🛡️ {coin}: 전문가 확신 감지 (신뢰도 {expert_reliability:.2f}) -> 인내심 {patience_hours:.1f}h 확장")
+
+    # 🆕 전략별 최대 patience 확장 (기존 48시간 -> 전략에 따라 최대 336시간)
+    max_patience = 48.0
+    if strategy_policy_available and strategy_type:
+        from trade.core.strategies import STRATEGY_EXIT_RULES
+        exit_rules = STRATEGY_EXIT_RULES.get(strategy_type)
+        if exit_rules:
+            max_patience = min(exit_rules.max_holding_hours, 336.0)  # 전략 최대 보유 시간까지
+    
+    patience_hours = max(4.0, min(max_patience, patience_hours))
+
+    # 1. 횡보 감지 (자율 인내심 적용)
+    if holding_hours >= patience_hours and -1.5 <= profit_pct <= 1.5:
+        return True, f"시장 상황 대비 정체 ({holding_hours:.1f}h/{patience_hours:.1f}h, {profit_pct:+.2f}%)", "relative_weakness"
+    
+    # 2. 상대적 약세 감지 (시장 주도주 소외)
+    # 시장은 달리고 있는데 내 코인만 멈춰있을 때 (기준 시간도 시장 상황에 연동)
+    outcast_threshold = patience_hours / 2.0
+    if market_score > 0.7 and profit_pct < 0.5 and holding_hours >= outcast_threshold:
+        return True, f"주도주 소외 감지 ({holding_hours:.1f}h/{outcast_threshold:.1f}h)", "market_outcast"
+
+    # 3. 추세 피로도 분석 (기존 유지)
+    if trend_analysis and trend_analysis.history_count >= 5:
+        if trend_analysis.should_sell_early and profit_pct > 0.5:
+            return True, f"상승 에너지 고갈 (추세 피로)", "trajectory_fatigue"
+    
+    # 4. 손실 장기화 및 목표 미달 (시장이 좋을수록 더 엄격하게)
+    if holding_hours >= patience_hours * 2.0:
+        if profit_pct <= -3.0:
+            return True, f"손실 장기화 방어", "stagnant_loss"
+        if target_price > 0 and current_price > 0:
+            target_distance_pct = ((target_price - current_price) / current_price) * 100
+            if target_distance_pct > 2.0:
+                return True, f"목표 달성 지연", "target_miss"
     
     return False, "", ""
 
 
 def find_best_switch_target(virtual_decisions: dict, wallet_coins: list, 
-                            current_coin: str, min_signal_score: float = 0.3) -> dict:
-    """갈아타기 대상 코인 찾기 (시그널 점수 기반)
-    
-    조건:
-    1. 가상매매에서 'buy' 결정된 코인
-    2. 시그널 점수 > min_signal_score
-    3. 아직 보유하지 않은 코인
-    4. Thompson 점수 양호 (0.4 이상)
-    
-    Returns:
-        {'coin': str, 'signal_score': float, ...} 또는 None
-    """
+                            current_coin: str, min_signal_score: float = 0.2,
+                            top_volume_coins: list = None) -> dict:
+    """🆕 설계 반영: 종목 교체 시 임계값 완화 (0.3 -> 0.2)"""
+    """갈아타기 대상 코인 찾기 (학습 결과 중심)"""
     best_candidate = None
     best_score = 0
     
+    if top_volume_coins is not None:
+        top_volume_set = set(top_volume_coins)
+    
     for coin, decision in virtual_decisions.items():
-        # 조건 1: 가상매매에서 'buy' 결정된 코인만
+        if top_volume_coins is not None and coin not in top_volume_set:
+            continue
+            
         if decision['decision'] != 'buy':
             continue
         
-        # 조건 2: 시그널 점수 기준
         signal_score = decision['signal_score']
         if signal_score < min_signal_score:
             continue
         
-        # 조건 3: 이미 보유 중인 코인은 제외
-        if coin in wallet_coins:
+        if coin in wallet_coins or coin == current_coin:
             continue
         
-        # 현재 코인과 같으면 제외
-        if coin == current_coin:
-            continue
-        
-        # 조건 4: Thompson 점수 체크 (0.4 이상)
         thompson_score = decision.get('thompson_score', 0)
-        if thompson_score < 0.4:
+        t = get_thresholds()
+        if thompson_score < t.thompson_min:
             continue
         
-        # 가장 좋은 시그널 점수 코인 선택
         if signal_score > best_score:
             best_candidate = {
                 'coin': coin,
@@ -901,8 +904,7 @@ def find_best_switch_target(virtual_decisions: dict, wallet_coins: list,
                 'expected_profit_pct': decision.get('expected_profit_pct', 0),
                 'thompson_score': thompson_score,
                 'current_price': decision.get('current_price', 0),
-                'target_price': decision.get('target_price', 0),
-                'reason': f"시그널 점수 {signal_score:.3f}, Thompson {thompson_score:.2f}",
+                'reason': f"시그널 {signal_score:.3f}, Thompson {thompson_score:.2f}",
                 'decision_timestamp': decision.get('timestamp', 0)
             }
             best_score = signal_score
@@ -1028,10 +1030,11 @@ def load_target_coins():
 
 # 🆕 실전 매매용 시그널 점수 조회 (realtime_signals 테이블에서)
 def load_realtime_signal(symbol: str, interval: str = 'combined'):
-    """signals 테이블에서 코인의 최신 통합 시그널 정보 로드 (combined 시그널만 사용)"""
+    """signals 테이블에서 코인의 최신 통합 시그널 정보 로드 (combined 시그널만 사용, 읽기 전용 강화)"""
     try:
+        from trade.core.database import get_db_connection
         # 🚀 trading_system.db 사용
-        with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+        with get_db_connection(TRADING_SYSTEM_DB_PATH, read_only=True) as conn:
             # combined 시그널만 조회 (인터벌 합치기 로직 제거)
             # symbol 우선 조회, 없으면 coin 조회 (호환성)
             try:
@@ -1053,8 +1056,8 @@ def load_realtime_signal(symbol: str, interval: str = 'combined'):
             
             if df.empty:
                 return {
-                    'signal_info': {
-                        'action': 'wait',
+                'signal_info': {
+                    'action': 'wait',
                     'signal_score': 0.0,
                     'confidence': 0.0,
                     'reason': '시그널 없음'
@@ -1073,7 +1076,10 @@ def load_realtime_signal(symbol: str, interval: str = 'combined'):
                     'wave_progress': 0.5,
                     'structure_score': 0.5,
                     'pattern_confidence': 0.0,
-                    'integrated_direction': 'neutral'
+                    'integrated_direction': 'neutral',
+                    # 🆕 동적 영향도 정보 추가 (기본값)
+                    'signal_continuity': 0.5,
+                    'dynamic_influence': 0.5
                 },
                 'scores': {
                     'rl_score': 0.0,
@@ -1111,6 +1117,12 @@ def load_realtime_signal(symbol: str, interval: str = 'combined'):
             }
         
         row = df.iloc[0]
+        
+        # 🆕 틱 사이즈 정보 로드
+        from trade.trade_manager import get_bithumb_tick_size
+        current_price = row['current_price']
+        tick_size = get_bithumb_tick_size(current_price)
+
         return {
             'signal_info': {
                 'action': row['action'],
@@ -1119,7 +1131,8 @@ def load_realtime_signal(symbol: str, interval: str = 'combined'):
                 'reason': row['reason']
             },
             'market_data': {
-                'price': row['current_price'],
+                'price': current_price,
+                'tick_size': tick_size, # 🆕 틱 사이즈 정보 추가
                 'volume': 0.0,  # 실전 매매에서 별도 조회
                 'rsi': row['rsi'],
                 'macd': row['macd'],
@@ -1132,7 +1145,10 @@ def load_realtime_signal(symbol: str, interval: str = 'combined'):
                 'wave_progress': row['wave_progress'],
                 'structure_score': row['structure_score'],
                 'pattern_confidence': row['pattern_confidence'],
-                'integrated_direction': row['integrated_direction']
+                'integrated_direction': row['integrated_direction'],
+                # 🆕 동적 영향도 정보 추가
+                'signal_continuity': row.get('signal_continuity', 0.5),
+                'dynamic_influence': row.get('dynamic_influence', 0.5)
             },
             'scores': {
                 'rl_score': row.get('rl_score', 0.0),
@@ -1371,6 +1387,38 @@ def load_recent_candles_for_replace(coin, interval, count=4):
 
     return valid_candles
 
+def _get_recent_candles(coin, interval, count=5):
+    """🆕 DB에서 최근 N개의 캔들 데이터 로드 (Sequence 분석용)"""
+    try:
+        from trade.core.database import CANDLES_DB_PATH, get_db_connection
+        with get_db_connection(CANDLES_DB_PATH, read_only=True) as conn:
+            query = """
+                SELECT timestamp, open, high, low, close, volume, rsi
+                FROM candles 
+                WHERE symbol = ? AND interval = ?
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            """
+            df = pd.read_sql(query, conn, params=(coin, interval, count))
+            return df if not df.empty else None
+    except Exception as e:
+        # coin -> symbol 마이그레이션 대응
+        try:
+            from trade.core.database import CANDLES_DB_PATH, get_db_connection
+            with get_db_connection(CANDLES_DB_PATH, read_only=True) as conn:
+                query = """
+                    SELECT timestamp, open, high, low, close, volume, rsi
+                    FROM candles 
+                    WHERE coin = ? AND interval = ?
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                """
+                df = pd.read_sql(query, conn, params=(coin, interval, count))
+                return df if not df.empty else None
+        except:
+            print(f"⚠️ {coin}/{interval} 최근 캔들 로드 실패: {e}")
+    return None
+
 # 240m 파동 정보 로딩
 def load_wave_and_market_info(coin, interval='combined'):
     """signals 테이블에서 파동 및 시장 정보 로드 (combined 시그널만 사용)"""
@@ -1448,6 +1496,18 @@ def calculate_stop_loss_strength(current_price, entry_price, latest_candle, para
 
 # 손절 조건 체크
 def check_stop_loss_conditions(coin, current_price, entry_price, params, latest_candle, interval='240m', stop_loss_threshold=50):
+    """🆕 설계 반영: 자율 손절 외에 실전 매매 최후의 보루(Hard Rule) 적용"""
+    if entry_price and entry_price > 0:
+        profit_loss_pct = ((current_price - entry_price) / entry_price) * 100
+        
+        # 🚨 [Hard Rule] 무조건 익절 +50%
+        if profit_loss_pct >= 50.0:
+            return True, f"🚀 강제 익절 달성 (+{profit_loss_pct:.1f}%)"
+            
+        # 🚨 [Hard Rule] 무조건 손절 -10%
+        if profit_loss_pct <= -10.0:
+            return True, f"😭 강제 손절 집행 ({profit_loss_pct:.1f}%)"
+
     final_strength = calculate_stop_loss_strength(current_price, entry_price, latest_candle, params, interval)
 
     if final_strength >= stop_loss_threshold:
@@ -1457,40 +1517,96 @@ def check_stop_loss_conditions(coin, current_price, entry_price, params, latest_
 
 # 🆕 Absolute Zero System 개선사항을 반영한 시그널 기반 매매 결정 함수
 def make_signal_based_decision(signal_data):
-    """시그널 점수 중심 매매 결정 (학습 기반 동적 리스크 관리 + 적응적 고급 지표 활용)"""
-    buy_decisions = []
-    sell_decisions = []
-    
-    # 매수 후보 결정 (시그널 점수 중심 + 적응적 고급 지표 보너스)
-    for trade in signal_data.get('selected_trades', []):
-        # 🎯 핵심: 시그널 점수가 주요 기준
-        signal_score = trade.get('signal_score', 0.0)
-        confidence = trade.get('confidence', 0.0)
+    """🆕 [로직 동기화] 가상 매매(VirtualTrader)와 100% 동일한 판단 로직 적용"""
+    try:
+        from trade.core.decision import get_ai_decision_engine
+        from trade.core.thompson import get_thompson_calculator
         
-        # 기본 매수 조건: 학습된 전략의 시그널 점수만 신뢰
-        if (confidence >= 0.6 and 
-            signal_score >= 0.4 and 
-            trade['action'] == 'buy'):
+        # 🎯 1. 실전용 독자 필터 대신 통합 엔진 로직 사용
+        guardian = get_ai_decision_engine()
+        thompson = get_thompson_calculator()
+        market_context = get_market_context()
+        
+        buy_decisions = []
+        sell_decisions = []
+        
+        # 매수 후보 결정
+        for trade in signal_data.get('selected_trades', []):
+            coin = trade['coin']
+            pattern = trade.get('signal_pattern', 'unknown')
+            interval = trade.get('interval', 'combined')
             
-            # 🎯 학습된 전략의 시그널 점수 그대로 사용 (중복 계산 제거)
-            trade['enhanced_score'] = signal_score  # 시그널 점수 그대로 사용
-            buy_decisions.append(trade)
-    
-    # 매도 후보 결정 (시그널 점수 중심 + 학습 기반 동적 손절)
-    for holding in signal_data.get('current_holdings', []):
-        signal_score = holding.get('signal_score', 0.0)
-        confidence = holding.get('confidence', 0.0)
+            # 🆕 [5-Candle Sequence Analysis] 추가 검증
+            recent_candles = _get_recent_candles(coin, interval)
+            if recent_candles is not None and len(recent_candles) >= 5:
+                analysis = SequenceAnalyzer.analyze_sequence(recent_candles, interval)
+                if not analysis['passed']:
+                    print(f"  ✋ {coin} 매수 보류 (흐름분석 부적합): {analysis['reason']}")
+                    continue
+                if analysis['score_mod'] != 1.0:
+                    print(f"  🌊 {coin} 흐름분석 반영: {analysis['reason']} (보정계수: {analysis['score_mod']:.2f})")
+                    trade['signal_score'] = trade.get('signal_score', 0.0) * analysis['score_mod']
+            
+            # Thompson 점수
+            res = thompson.sample_success_rate(pattern)
+            sampled_rate = res[0] if isinstance(res, tuple) else float(res)
+            
+            # 알파 가디언 결정 (참고용으로만 사용)
+            ai_res = guardian.make_trading_decision(
+                signal_data={
+                    **trade,
+                    'wave_phase': trade.get('wave_phase', 'unknown'),
+                    'integrated_direction': trade.get('integrated_direction', 'neutral')
+                },
+                current_price=trade['price'],
+                market_context=market_context,
+                coin_performance={'profit_rate': analyze_coin_performance(coin)}
+            )
+            
+            ai_decision = ai_res.get('decision', 'hold').lower() if isinstance(ai_res, dict) else str(ai_res).lower()
+            ai_score = ai_res.get('final_score', 0.0) if isinstance(ai_res, dict) else 0.0
+            ai_reason = ai_res.get('reason', '분석 완료') if isinstance(ai_res, dict) else '분석 완료'
+            
+            # 💡 [Alpha Guardian] AI 판단 결과는 참고용 로그로만 남기고, 실제 매매 결정에는 참여하지 않음
+            # [Sync] 가상과 동일하게 Thompson 0.3 이상이면 승인
+            if sampled_rate >= 0.3:
+                trade['enhanced_score'] = trade.get('signal_score', 0.0)
+                trade['ai_decision_ref'] = ai_decision
+                trade['ai_score_ref'] = ai_score
+                trade['ai_reason_ref'] = ai_reason
+                buy_decisions.append(trade)
+                
+        # 매도 후보 결정
+        for holding in signal_data.get('current_holdings', []):
+            coin = holding['coin']
+            
+            ai_res = guardian.make_trading_decision(
+                signal_data={
+                    **holding,
+                    'wave_phase': holding.get('wave_phase', 'unknown'),
+                    'integrated_direction': holding.get('integrated_direction', 'neutral')
+                },
+                current_price=holding['price'],
+                market_context=market_context,
+                coin_performance={'profit_rate': analyze_coin_performance(coin)}
+            )
+            
+            ai_decision = ai_res.get('decision', 'hold').lower() if isinstance(ai_res, dict) else str(ai_res).lower()
+            
+            # 💡 [Alpha Guardian] 매도 결정에서도 AI는 참고용으로만 사용
+            # 실제 매도는 시그널 생성기에서 생성된 SELL 액션에 따름
+            if holding.get('action') == 'sell':
+                holding['enhanced_score'] = holding.get('signal_score', 0.0)
+                sell_decisions.append(holding)
+                
+        return {
+            'buy': buy_decisions,
+            'sell': sell_decisions
+        }
         
-        # 🎯 핵심: 학습된 전략의 시그널 점수만 신뢰
-        if signal_score < -0.3 and confidence > 0.5:  # 강한 매도 시그널
-            # 🎯 학습된 전략의 시그널 점수 그대로 사용 (중복 계산 제거)
-            holding['enhanced_score'] = signal_score  # 시그널 점수 그대로 사용
-            sell_decisions.append(holding)
-    
-    return {
-        'buy': buy_decisions,
-        'sell': sell_decisions
-    }
+    except Exception as e:
+        print(f"⚠️ 실전 통합 판단 로직 오류: {e}")
+        return {'buy': [], 'sell': []}
 
 # 🆕 적응적 고급 지표 보너스 계산
 def calculate_adaptive_technical_bonus(trade):
@@ -1539,166 +1655,117 @@ def calculate_adaptive_technical_bonus(trade):
     
     return min(bonus, 0.2)  # 최대 20% 보너스 제한
 
-# 🆕 적응적 고급 지표 페널티 계산
+# 🆕 적응적 고급 지표 페널티 계산 (알파 가디언 바이어스 연동)
 def calculate_adaptive_technical_penalty(holding):
-    """적응적 고급 지표 매도 페널티 (시장 상황에 따라 가중치 조정)"""
+    """🆕 설계 반영: 알파 가디언의 리스크 바이어스와 연동된 자율 페널티"""
     advanced_indicators = holding.get('advanced_indicators', {})
     market_context = get_market_context()
     
+    # 🎯 알파 가디언의 현재 리스크 성향 가져오기
+    risk_multiplier = 1.0
+    try:
+        from trade.core.decision import get_ai_decision_engine
+        guardian = get_ai_decision_engine()
+        bias = guardian.get_meta_bias()
+        risk_multiplier = bias.get('risk_weight_multiplier', 1.0)
+    except:
+        pass
+
     penalty = 0.0
     
-    # 🎯 시장 상황에 따른 적응적 페널티
+    # 🎯 시장 상황에 따른 베이스 페널티
     if market_context['trend'] == 'bearish':
-        # 하락장에서는 다이버전스와 약한 트렌드에 더 높은 페널티
+        # 하락장에서 다이버전스/약세 트렌드 감지 시
         if (advanced_indicators.get('rsi_divergence') == 'bearish' or 
             advanced_indicators.get('macd_divergence') == 'bearish'):
-            penalty += 0.20  # 하락장에서 다이버전스 페널티 증가
+            penalty += 0.15 * risk_multiplier # 자율 가중치 적용
         
         if advanced_indicators.get('trend_strength', 0.0) < 0.3:
-            penalty += 0.15  # 하락장에서 약한 트렌드 페널티 증가
+            penalty += 0.10 * risk_multiplier
     
     elif market_context['trend'] == 'bullish':
-        # 상승장에서는 상대적으로 낮은 페널티
+        # 상승장에서는 페널티를 대폭 낮게 유지
         if (advanced_indicators.get('rsi_divergence') == 'bearish' or 
             advanced_indicators.get('macd_divergence') == 'bearish'):
-            penalty += 0.10  # 상승장에서 다이버전스 페널티 감소
-        
-        if advanced_indicators.get('trend_strength', 0.0) < 0.3:
-            penalty += 0.08  # 상승장에서 약한 트렌드 페널티 감소
+            penalty += 0.08 * risk_multiplier
     
     else:  # 중립장
-        # 중립장에서는 균형잡힌 페널티
         if (advanced_indicators.get('rsi_divergence') == 'bearish' or 
             advanced_indicators.get('macd_divergence') == 'bearish'):
-            penalty += 0.15
-        
-        if advanced_indicators.get('trend_strength', 0.0) < 0.3:
-            penalty += 0.10
+            penalty += 0.10 * risk_multiplier
     
-    return min(penalty, 0.25)  # 최대 25% 페널티 제한
+    return min(penalty, 0.30)  # 최대 30%까지 유동적으로 적용
 
 # 🆕 학습 기반 동적 임계값 조정
 def get_dynamic_threshold(coin):
-    """학습 기반 동적 매수 임계값 조정"""
+    """🆕 설계 반영: 시그널 생성기의 자율 임계값과 동기화 (전략적 신뢰)"""
     try:
-        # 🎯 코인별 과거 성과 분석
-        performance_score = analyze_coin_performance(coin)
+        # 🎯 실전 매매 엔진 또한 시그널 생성기가 이미 동적 임계값을 통과했음을 전제로 합니다.
+        # 기존의 보수적인 0.4 기준을 완화하여 시그널의 BUY 결정을 최대한 존중합니다.
         
-        # 🎯 시장 상황 분석
-        market_score = analyze_market_conditions()
-        
-        # 🎯 기본 임계값 (0.4)
-        base_threshold = 0.4
-        
-        # 🎯 성과 기반 조정
-        if performance_score > 0.7:  # 좋은 성과
-            base_threshold -= 0.05  # 임계값 낮춤 (더 쉽게 매수)
-        elif performance_score < 0.3:  # 나쁜 성과
-            base_threshold += 0.05  # 임계값 높임 (더 엄격하게 매수)
-        
-        # 🎯 시장 상황 기반 조정
-        if market_score > 0.7:  # 좋은 시장 상황
-            base_threshold -= 0.03
-        elif market_score < 0.3:  # 나쁜 시장 상황
-            base_threshold += 0.03
-        
-        return max(0.3, min(0.6, base_threshold))  # 0.3~0.6 범위로 제한
+        # 최소한의 안전장치(0.2)만 유지합니다. (시그널의 임계값 0.15~0.45 대응)
+        return 0.2
         
     except Exception as e:
         print(f"⚠️ 동적 임계값 계산 오류 ({coin}): {e}")
-        return 0.4  # 기본값 반환
+        return 0.3  # 실패 시 약간 보수적으로 반환
 
-# 🆕 학습 기반 동적 손절 강도 계산
+# 🆕 자율형 동적 손절 강도 계산
 def calculate_adaptive_stop_loss_strength(holding):
-    """학습 기반 동적 손절 강도 계산"""
+    """🆕 설계 반영: 시장 변동성 및 알파 가디언 성향과 연동된 자율 손절 강도"""
     try:
         coin = holding['coin']
         
-        # 🎯 코인별 과거 손절 성과 분석
+        # 🎯 알파 가디언의 리스크 성향 반영
+        risk_multiplier = 1.0
+        try:
+            from trade.core.decision import get_ai_decision_engine
+            guardian = get_ai_decision_engine()
+            risk_multiplier = guardian.get_meta_bias().get('risk_weight_multiplier', 1.0)
+        except:
+            pass
+            
+        # 🎯 코인별 과거 손절 성과 (기존 유지)
         stop_loss_performance = analyze_stop_loss_performance(coin)
         
-        # 🎯 현재 시그널 강도
+        # 🎯 현재 시그널 강도 및 시장 변동성
         signal_strength = abs(holding.get('signal_score', 0.0))
-        
-        # 🎯 시장 변동성
         market_volatility = get_market_volatility()
         
-        # 🎯 기본 손절 강도 (50%)
-        base_strength = 50.0
+        # 🎯 베이스 강도 계산 (기본 50% -> 리스크 성향에 따라 동적 시작)
+        # 리스크 multiplier가 높을수록(보수적일수록) 손절 강도를 높여 더 빨리 손절함
+        base_strength = 50.0 * risk_multiplier 
         
-        # 🎯 성과 기반 조정
-        if stop_loss_performance > 0.7:  # 손절이 효과적이었던 경우
-            base_strength += 20.0  # 손절 강도 증가
-        elif stop_loss_performance < 0.3:  # 손절이 비효과적이었던 경우
-            base_strength -= 15.0  # 손절 강도 감소
+        # 🎯 성과 기반 보정
+        if stop_loss_performance > 0.7: base_strength += 15.0
+        elif stop_loss_performance < 0.3: base_strength -= 10.0
         
-        # 🎯 시그널 강도 기반 조정
-        if signal_strength > 0.5:  # 강한 매도 시그널
-            base_strength += 15.0
-        elif signal_strength < 0.2:  # 약한 매도 시그널
-            base_strength -= 10.0
+        # 🎯 시그널 및 변동성 보정
+        if signal_strength > 0.6: base_strength += 10.0
+        if market_volatility > 0.05: base_strength += 10.0
         
-        # 🎯 변동성 기반 조정
-        if market_volatility > 0.05:  # 고변동성
-            base_strength += 10.0  # 고변동성에서는 손절 강화
-        elif market_volatility < 0.02:  # 저변동성
-            base_strength -= 5.0  # 저변동성에서는 손절 완화
-        
-        return max(30.0, min(80.0, base_strength))  # 30~80% 범위로 제한
+        return max(20.0, min(90.0, base_strength)) # 20~90% 범위 자율 조절
         
     except Exception as e:
-        print(f"⚠️ 동적 손절 강도 계산 오류: {e}")
-        return 50.0  # 기본값 반환
+        print(f"⚠️ 자율 손절 강도 계산 오류: {e}")
+        return 50.0
 
-# 🆕 시장 상황 분석 캐시 (성능 최적화)
-_market_context_cache = {'data': None, 'timestamp': 0}
-_MARKET_CONTEXT_CACHE_TTL = 300  # 5분 캐시
-
-# 🆕 시장 상황 분석 (Core 위임 + 캐싱)
+# 🆕 시장 상황 분석 (Core 위임)
 def get_market_context():
-    """시장 상황 분석 (트렌드, 변동성 등) - Core 모듈 사용 + 캐싱"""
-    global _market_context_cache
+    """
+    🆕 공통 모듈(trade.core.trading) 사용
+    7단계 레짐 정보 포함: regime_stage, regime_group 추가
+    """
+    # 공통 모듈 호출 (캐싱 및 7단계 레짐 정규화 포함)
+    context = get_common_market_context()
     
-    try:
-        # 🚀 캐시 확인 (5분 TTL)
-        current_time = time.time()
-        if (_market_context_cache['data'] is not None and 
-            current_time - _market_context_cache['timestamp'] < _MARKET_CONTEXT_CACHE_TTL):
-            return _market_context_cache['data']
-        
-        # 🆕 Core MarketAnalyzer 사용 (거래량 상위 40% 코인 기준)
-        from trade.core.market import MarketAnalyzer
-        analyzer = MarketAnalyzer(db_path=os.getenv('TRADING_SYSTEM_DB_PATH'))
-        result = analyzer.analyze_market_regime()
-        
-        regime = result.get('regime', 'Neutral')
-        volatility = result.get('volatility', 0.02)
-        score = result.get('score', 0.5)
-        
-        # Trend 매핑 (레짐 기반)
-        regime_lower = regime.lower()
-        if 'bullish' in regime_lower or 'bull' in regime_lower:
-                trend = 'bullish'
-        elif 'bearish' in regime_lower or 'bear' in regime_lower:
-            trend = 'bearish'
-        else:
-            trend = 'neutral'
-            
-        context = {
-            'trend': trend,
-            'volatility': volatility,
-            'regime': regime,
-            'score': score
-        }
-        
-        # 🚀 캐시 저장
-        _market_context_cache = {'data': context, 'timestamp': current_time}
-        
-        return context
-        
-    except Exception as e:
-        print(f"⚠️ 시장 상황 분석 오류 (Core 연동): {e}")
-        return {'trend': 'neutral', 'volatility': 0.02}
+    # 7단계 레짐 정보 정규화 보장
+    regime = normalize_regime(context.get('regime', 'neutral'))
+    context['regime'] = regime
+    context['trend'] = regime
+    context['regime_stage'] = get_regime_severity(regime)
+    
+    return context
 
 # 🆕 코인별 성과 분석 (유지 - 필요한 경우 Core로 이동 고려)
 def analyze_coin_performance(coin):
@@ -1808,6 +1875,16 @@ def execute_signal_based_trades(signal_decisions, wallet_coins, selected_candida
             print(f"  📊 최적화된 가격: {mtf_trade_result['optimized_params']['optimized_price']}")
             print(f"  🛑 손절: {mtf_trade_result['optimized_params']['stop_loss_pct']}%")
             print(f"  🎯 익절: {mtf_trade_result['optimized_params']['take_profit_pct']}%")
+            
+            # 🆕 [전략 시스템] 전략 분리 학습
+            if STRATEGY_SYSTEM_AVAILABLE:
+                holding_hours = get_holding_duration(coin) / 3600.0
+                record_strategy_feedback_real(
+                    coin=coin, profit_pct=profit_pct, 
+                    success=(profit_pct > 0), holding_hours=holding_hours
+                )
+            
+            remove_position_time(coin)
         elif mtf_trade_result['status'] == 'skipped':
             print(f"⏭️ {coin}: 실행 우선순위가 낮아 매도 건너뜀")
         else:
@@ -1972,7 +2049,8 @@ def log_trade_decision(data: dict):
     )
 
     try:
-        with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+        from trade.core.database import get_db_connection
+        with get_db_connection(TRADING_SYSTEM_DB_PATH, read_only=False) as conn:
             conn.execute(insert_query, values)
     except Exception as e:
         logging.error(f"[DB 저장 오류] real_trade_history 기록 실패 - {data.get('coin')} | 오류: {e}")
@@ -1980,9 +2058,10 @@ def log_trade_decision(data: dict):
 def save_real_trade_feedback(trade_id: int, coin: str, signal_pattern: str, 
                             success_rate: float, avg_profit: float, total_trades: int, 
                             confidence: float, learning_episode: int, feedback_type: str):
-    """실전 매매 피드백 저장 (trading_system.db)"""
+    """실전 매매 피드백 저장 (trading_system.db, 쓰기 모드 안정성 강화)"""
     try:
-        with sqlite3.connect(TRADING_SYSTEM_DB_PATH) as conn:
+        from trade.core.database import get_db_connection
+        with get_db_connection(TRADING_SYSTEM_DB_PATH, read_only=False) as conn:
             conn.execute("""
                 INSERT INTO real_trade_feedback (
                     trade_id, coin, signal_pattern, success_rate, avg_profit, 
@@ -1990,16 +2069,18 @@ def save_real_trade_feedback(trade_id: int, coin: str, signal_pattern: str,
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (trade_id, coin, signal_pattern, success_rate, avg_profit, 
                   total_trades, confidence, learning_episode, feedback_type))
+            conn.commit()
     except Exception as e:
         logging.error(f"[DB 저장 오류] real_trade_feedback 기록 실패 - {coin} | 오류: {e}")
 
 def log_signal_based_trade(signal_data: dict):
     """
-    시그널 기반 매매 정보를 별도로 기록 (통합 DB)
+    시그널 기반 매매 정보를 별도로 기록 (통합 DB, 쓰기 모드 안정성 강화)
     - 시그널 정보와 실전 매매 정보를 연결하는 브릿지 역할
     """
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        from trade.core.database import get_db_connection
+        with get_db_connection(DB_PATH, read_only=False) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS signal_trade_executions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2061,11 +2142,11 @@ def get_signal_history(coin: str, hours: int = 24) -> list:
                     SELECT timestamp, action, signal_score, confidence, reason, current_price as price
                     FROM signals
                     WHERE coin = ? AND interval = 'combined' AND timestamp > ?
-                ORDER BY timestamp DESC
-            """
-            cutoff_time = int((datetime.now() - timedelta(hours=hours)).timestamp())
-            df = pd.read_sql(query, conn, params=(coin, cutoff_time))
-                
+                    ORDER BY timestamp DESC
+                """
+                cutoff_time = int((datetime.now() - timedelta(hours=hours)).timestamp())
+                df = pd.read_sql(query, conn, params=(coin, cutoff_time))
+            
             return df.to_dict('records')
     except Exception as e:
         logging.error(f"시그널 히스토리 조회 오류 ({coin}): {e}")
@@ -2166,21 +2247,23 @@ def print_signal_trade_summary():
 
 # 🆕 실전매매와 동일한 시그널 기반 Executor 로직 (갈아타기 제외)
 def run_signal_based_executor():
-    """🆕🆕 개선된 실전매매 실행 (판단/실행 분리 + 우선순위 기반)
+    """🆕🆕 개선된 실전매매 실행 (판단/실행 분리 + 우선순위 기반)"""
     
-    [개선된 흐름]
-    - STEP 1: 현재 상태 수집 (지갑, 예수금, 보유 코인)
-    - STEP 2: 전체 판단 (실행 X) - 매도/홀딩/갈아타기/신규매수 판단만
-    - STEP 3: 우선순위 기반 실행
-        1순위: 손절 (즉시 실행)
-        2순위: 갈아타기 (매도→매수 원자적)
-        3순위: 일반 매도/익절
-        4순위: 신규 매수 (예수금 확인 후)
-    - STEP 4: 결과 검증
-    """
+    # 🔥 [Critical] 기준 시각 설정 (DB 최신 캔들 기준)
+    try:
+        from trade.core.database import get_latest_candle_timestamp
+        db_now = get_latest_candle_timestamp()
+    except:
+        db_now = int(time.time())
     
-    # ═══════════════════════════════════════════════════════════════
-    # 🚀 [STEP 1] 현재 상태 수집
+    # 🆕 [전략 시스템] 전략 피드백 테이블 초기화
+    if STRATEGY_SYSTEM_AVAILABLE:
+        try:
+            create_strategy_feedback_table(TRADING_SYSTEM_DB_PATH)
+        except Exception as e:
+            print(f"⚠️ 전략 피드백 테이블 초기화 오류 (무시됨): {e}")
+    
+    print(f"🕒 실전매매 기준 시각 (DB): {db_now} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(db_now))})")
     # ═══════════════════════════════════════════════════════════════
     print("=" * 60)
     print("🚀 [STEP 1] 현재 상태 수집")
@@ -2208,9 +2291,13 @@ def run_signal_based_executor():
     hold_decisions = []         # 홀딩 유지
     buy_candidates = []         # 4순위: 신규 매수
     
-    # 🆕 가상매매 결정 로드 (Thompson 점수 참조용)
-    virtual_decisions = load_virtual_trade_decisions(max_age_minutes=30)
+    # 🆕 가상매매 결정 로드 (최신 캔들 시각 기준 30분 이내)
+    virtual_decisions = load_virtual_trade_decisions(max_age_minutes=30, reference_ts=db_now)
     print(f"📥 가상매매 학습 데이터: {len(virtual_decisions)}개")
+    
+    # 🆕 거래량 상위 40% 코인 미리 로드 (갈아타기 필터링용)
+    top_volume_coins = load_target_coins()
+    print(f"📊 거래량 필터: 상위 {len(top_volume_coins)}개 코인만 매수 가능")
     
     # ─────────────────────────────────────────────────────────────────
     # [2-1] 보유 코인 판단: 매도/홀딩/갈아타기
@@ -2221,7 +2308,25 @@ def run_signal_based_executor():
     market_context = get_market_context()
     market_regime = market_context.get('regime', 'Neutral')
     market_score = market_context.get('score', 0.5)
-    print(f"📊 시장 레짐: {market_regime} (점수: {market_score:.2f})")
+    
+    # 🆕 레짐 변화 감지 및 전략 재평가
+    regime_changed = False
+    recommended_strategies = []
+    try:
+        from trade.core.strategies import get_regime_detector
+        detector = get_regime_detector()
+        should_reevaluate, reason = detector.should_reevaluate_strategies(market_regime)
+        stability, stability_desc = detector.get_regime_stability()
+        
+        if should_reevaluate:
+            regime_changed = True
+            recommended_strategies = detector.get_recommended_strategies_for_regime(market_regime)
+            print(f"🔄 {reason}")
+            print(f"   📋 현재 레짐에 추천 전략: {', '.join(recommended_strategies[:3])}")
+        
+        print(f"📊 시장 레짐: {market_regime} (점수: {market_score:.2f}, 안정성: {stability:.1f})")
+    except Exception as e:
+        print(f"📊 시장 레짐: {market_regime} (점수: {market_score:.2f})")
     
     for coin in wallet_coins:
         coin_info = wallet_info.get(coin, {})
@@ -2258,6 +2363,11 @@ def run_signal_based_executor():
             reason = signal_data['signal_info'].get('reason', 'signal_based')
             current_price = wallet_current_price if wallet_current_price > 0 else signal_data['market_data']['price']
             pure_action = signal_data['signal_info'].get('action', 'hold')
+            
+            # 🆕 파동 및 통합 방향 정보 추출
+            wave_info = signal_data.get('wave_info', {})
+            wave_phase = wave_info.get('wave_phase', 'unknown')
+            integrated_direction = wave_info.get('integrated_direction', 'neutral')
         
         # 수익률 계산
         profit_loss_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 and current_price > 0 else 0.0
@@ -2265,6 +2375,14 @@ def run_signal_based_executor():
         # 보유 시간 조회
         holding_seconds = get_holding_duration(coin)
         holding_hours = holding_seconds / 3600
+        
+        # 🆕 [전략 시스템] 전략 전환 확인
+        if STRATEGY_SYSTEM_AVAILABLE:
+            switched, new_strategy, switch_reason = check_strategy_switch_real(
+                coin, profit_loss_pct, holding_hours
+            )
+            if switched:
+                print(f"   📋 전략 전환 이유: {switch_reason}")
         
         # 🆕 수익률 스냅샷 기록 (추세 분석용)
         trend_analysis = None
@@ -2285,22 +2403,64 @@ def run_signal_based_executor():
             except Exception as e:
                 print(f"⚠️ {coin} 추세 분석 오류: {e}")
         
-        # 로그 출력
-        holding_info = f"진입가 {format_price(entry_price)}원, 수익률 {profit_loss_pct:+.2f}%, 보유 {holding_hours:.1f}h" if entry_price > 0 else "보유 중"
-        print(f"📊 {get_korean_name(coin)}: {holding_info}")
-        print(f"   📈 시그널: {pure_action} (점수: {signal_score:.3f})")
-        print(f"   📥 참고: Thompson {virtual_thompson:.2f}")
+        # 🆕 추세 분석 결과 (데이터 준비)
+        trend_summary = f"({trend_analysis.trend_type.value})" if trend_analysis and trend_analysis.history_count >= 3 else ""
         
-        # 🆕 추세 분석 결과 출력
-        if trend_analysis and trend_analysis.history_count >= 3:
-            print(f"   📉 추세: {trend_analysis.trend_type.value} ({trend_analysis.reason})")
-            if trend_analysis.should_sell_early:
-                print(f"   ⚠️ 조기 매도 권장!")
-            elif trend_analysis.should_hold_strong:
-                print(f"   💪 강한 홀딩 권장!")
+        # 최종 액션 판단 (알파 가디언 + 공통 전략 엔진)
+        # 🆕 알파 가디언 판단을 먼저 수행하여 로그 출력 보장
+        ai_action = 'hold'
+        ai_score = 0.0
+        ai_reason = '알파 가디언 분석 완료'
         
-        # 최종 액션 판단 (학습 기반 + 트레일링스탑 + 익절/손절 + 추세 분석)
-        final_action = combine_signal_with_holding(
+        if real_time_ai_decision_engine:
+            try:
+                signal_data_for_ai = {
+                    'coin': coin,
+                    'action': pure_action,
+                    'signal_score': signal_score,
+                    'confidence': abs(signal_score),
+                    'risk_level': 'high' if abs(signal_score) > 0.7 else 'medium' if abs(signal_score) > 0.4 else 'low',
+                    'wave_phase': wave_phase,
+                    'integrated_direction': integrated_direction
+                }
+                market_context = get_market_context()
+                
+                ai_res = real_time_ai_decision_engine.make_trading_decision(
+                    signal_data=signal_data_for_ai,
+                    current_price=current_price,
+                    market_context=market_context,
+                    # 🆕 Thompson 기반 패턴 성과 조회 (정밀 분석용)
+                    coin_performance=thompson_sampler.get_decision_engine_stats(coin)
+                )
+                
+                # 🆕 딕셔너리 형태로 반환되므로 처리
+                if isinstance(ai_res, dict):
+                    ai_action = ai_res.get('decision', 'hold')
+                    ai_score = ai_res.get('final_score', 0.0)
+                    ai_reason = ai_res.get('reason', '알파 가디언 분석 완료')
+                else:
+                    ai_action = ai_res if isinstance(ai_res, str) else 'hold'
+                    ai_score = 0.0
+                    ai_reason = '알파 가디언 분석 완료'
+            except Exception as e:
+                print(f"   ⚠️ 알파 가디언 판단 오류 ({coin}): {e}")
+                ai_action = 'hold'
+                ai_score = 0.0
+                ai_reason = f'알파 가디언 분석 오류: {str(e)[:50]}'
+        else:
+            ai_action = 'hold'
+            ai_score = 0.0
+            ai_reason = '알파 가디언 비활성화됨'
+        
+        # 🆕 호가 해상도 필터를 위한 틱 사이즈 로드
+        from trade.trade_manager import get_bithumb_tick_size
+        tick_size = get_bithumb_tick_size(current_price)
+
+        # 🆕 전략 정보 조회 (전략별 청산 규칙 적용용)
+        strategy_info = get_position_strategy_info(coin)
+        current_strategy = strategy_info.get('current_strategy', 'trend')
+        
+        final_action, action_reason = combine_signal_with_holding(
             coin=coin,
             pure_action=pure_action,
             signal_score=signal_score,
@@ -2309,8 +2469,38 @@ def run_signal_based_executor():
             max_profit_pct=max(profit_loss_pct, 0.0) if trend_analysis is None else trend_analysis.max_profit_pct,
             entry_volatility=0.02,
             holding_hours=holding_hours,
-            trend_analysis=trend_analysis  # 🆕 추세 분석 결과 전달
+            trend_analysis=trend_analysis,
+            ai_decision=ai_action,  # 🆕 알파 가디언 판단 결과 전달
+            tick_size=tick_size,
+            current_price=current_price,
+            current_strategy=current_strategy  # 🆕 전략별 청산 규칙 적용
         )
+
+        # 🆕 통합 상세 로그 (가상매매와 포맷 통일) - 코인명 + 최종판단 먼저 출력
+        print(f"📊 {get_korean_name(coin)}: 최종판단={final_action.upper()} (점수: {signal_score:.3f})")
+        
+        # 🆕 액션 사유 출력 (전략별 청산 등 상세 사유)
+        if action_reason:
+            print(f"   {action_reason}")
+        
+        # 🆕 알파 가디언 판단 로그를 요약 바로 아래 출력 (가독성 개선)
+        print(f"   🛡️ [알파 가디언] 판단: {ai_action.upper()} (점수: {ai_score:.3f})")
+        print(f"   💬 근거: {ai_reason}")
+        
+        print(f"   📈 보유정보: {format_price(entry_price)}원 → {format_price(current_price)}원 ({profit_loss_pct:+.2f}%, {holding_hours:.1f}h)")
+        
+        # 가상매매 참조 데이터 표시
+        if virtual_thompson > 0 or virtual_decision_ref != 'N/A':
+            target_status = ""
+            if target_price_ref > 0:
+                dist_pct = ((target_price_ref - current_price) / current_price) * 100
+                target_status = f", 목표까지 {dist_pct:+.2f}%"
+            print(f"   📥 가상참조: {virtual_decision_ref.upper()}, Thompson {virtual_thompson:.2f}{target_status}")
+
+        if trend_analysis and trend_analysis.history_count >= 3:
+            print(f"   📉 추세분석: {trend_analysis.trend_type.value} ({trend_analysis.reason})")
+            if trend_analysis.should_sell_early: print(f"   ⚠️ 조기 매도 권장!")
+            if trend_analysis.should_hold_strong: print(f"   💪 강한 홀딩 권장!")
         
         # 공통 결정 데이터
         decision_data = {
@@ -2324,56 +2514,108 @@ def run_signal_based_executor():
                 'pure_action': pure_action,
                 'profit_loss_pct': profit_loss_pct,
             'holding_hours': holding_hours,
-            'decision_timestamp': int(time.time())
+            'decision_timestamp': int(time.time()),
+            'wave_phase': wave_phase,
+            'integrated_direction': integrated_direction
         }
         
         # ═══ 분류 ═══
         # 1순위: 손절 (stop_loss)
         if final_action == 'stop_loss':
-            print(f"   🔴 판단: 손절 (1순위)")
             stop_loss_decisions.append(decision_data)
         
         # 2순위: 갈아타기 조건 체크
         elif final_action in ['hold'] and profit_loss_pct < 3.0:
-            # 갈아타기 조건 체크 (횡보/손실장기화/목표미달)
+            # 🆕 전략 정보 조회 (횡보 정책 적용용)
+            strategy_info = get_position_strategy_info(coin)
+            current_strategy = strategy_info.get('current_strategy', 'trend')
+            
+            # 🆕 개선된 갈아타기 조건 체크 (시장 점수 및 추세 반영 + 전략별 횡보 정책 + 레짐)
             should_switch, switch_reason, switch_type = check_switch_condition(
                 coin=coin,
                 profit_pct=profit_loss_pct,
                 holding_hours=holding_hours,
                 target_price=target_price_ref,
-                current_price=current_price
+                current_price=current_price,
+                market_score=market_score,
+                trend_analysis=trend_analysis,
+                strategy_type=current_strategy,  # 🆕 전략별 횡보 정책 적용
+                market_regime=market_regime      # 🆕 레짐 반영
             )
             
             if should_switch:
-                # 대안 코인 찾기
+                # 🆕 대안 코인 찾기 (학습 결과 중심)
                 target = find_best_switch_target(
                     virtual_decisions=virtual_decisions,
                     wallet_coins=wallet_coins,
                     current_coin=coin,
-                    min_signal_score=0.25
+                    min_signal_score=0.25,
+                    top_volume_coins=top_volume_coins
                 )
                 
                 if target:
-                    print(f"   🔄 판단: 갈아타기 (2순위) → {get_korean_name(target['coin'])}")
+                    # 🛡️ 알파 가디언 갈아타기 판단 (대상 코인 매수 승인 여부)
+                    to_coin = target['coin']
+                    target_signal_score = target.get('signal_score', 0.0)
+                    target_confidence = virtual_decisions.get(to_coin, {}).get('confidence', 0.5)
+                    target_current_price = target.get('current_price', 0.0)
+                    
+                    # 🛡️ 알파 가디언 갈아타기 판단 (참고용으로만 사용)
+                    if real_time_ai_decision_engine:
+                        signal_data_for_ai = {
+                            'coin': to_coin,
+                            'action': 'buy',
+                            'signal_score': target_signal_score,
+                            'confidence': target_confidence,
+                            'risk_level': 'high' if abs(target_signal_score) > 0.7 else 'medium' if abs(target_signal_score) > 0.4 else 'low'
+                        }
+                        
+                        ai_res = real_time_ai_decision_engine.make_trading_decision(
+                            signal_data=signal_data_for_ai,
+                            current_price=target_current_price,
+                            market_context=market_context,
+                            coin_performance=thompson_sampler.get_decision_engine_stats(to_coin)
+                        )
+                        
+                        if isinstance(ai_res, dict):
+                            ai_action = ai_res.get('decision', 'hold')
+                            ai_score = ai_res.get('final_score', 0.0)
+                            ai_reason = ai_res.get('reason', '알파 가디언 분석 완료')
+                        else:
+                            ai_action = str(ai_res)
+                            ai_score = 0.0
+                            ai_reason = '알파 가디언 분석 완료'
+                        
+                        # 💡 [Alpha Guardian] 갈아타기 결정에서도 AI는 참고용으로만 사용
+                        if ai_action != 'buy':
+                            print(f"   🛡️ [알파 가디언 (참고용)] 갈아타기 거부 ({ai_action.upper()}, 점수: {ai_score:.3f}) - {ai_reason}")
+                        else:
+                            print(f"   🛡️ [알파 가디언 (참고용)] 갈아타기 승인 (점수: {ai_score:.3f}) - {ai_reason}")
+                        
+                        target['ai_action'] = ai_action
+                        target['ai_score'] = ai_score
+                        target['ai_reason'] = ai_reason
+                    else:
+                        target['ai_action'] = 'buy'
+                        target['ai_score'] = 0.0
+                        target['ai_reason'] = '알파 가디언 비활성화됨'
+                    
+                    print(f"   🔄 갈아타기 대상 감지 → {get_korean_name(target['coin'])}")
                     decision_data['switch_reason'] = switch_reason
                     decision_data['switch_type'] = switch_type
                     decision_data['target'] = target
                     switch_decisions.append(decision_data)
                 else:
-                    print(f"   ⏸️ 판단: 갈아타기 조건 충족하나 대안 없음 → 홀딩")
                     hold_decisions.append(decision_data)
             else:
-                print(f"   🟡 판단: 홀딩")
                 hold_decisions.append(decision_data)
-        
+    
         # 3순위: 일반 매도/익절
         elif final_action in ['sell', 'take_profit', 'partial_sell']:
-            print(f"   🟢 판단: {final_action} (3순위)")
             sell_decisions.append(decision_data)
         
         # 홀딩
         else:
-            print(f"   🟡 판단: 홀딩")
             hold_decisions.append(decision_data)
 
     # ─────────────────────────────────────────────────────────────────
@@ -2393,57 +2635,64 @@ def run_signal_based_executor():
     is_extreme_bearish = 'extreme_bearish' in regime_lower
     is_bullish = 'bullish' in regime_lower or market_trend == 'bullish'
     
-    # 기본 임계값
-    BASE_MIN_SIGNAL_SCORE = 0.20
-    BASE_MIN_SIGNAL_SCORE_ADDITIONAL = 0.35
-    BASE_MIN_THOMPSON_SCORE = 0.45
+    # 기본 임계값 (보수성 완화를 위해 하향 조정)
+    BASE_MIN_SIGNAL_SCORE = 0.05
+    BASE_MIN_SIGNAL_SCORE_ADDITIONAL = 0.15
+    BASE_MIN_THOMPSON_SCORE = 0.10
+    
+    # 🆕 [이중 신뢰도 동적 가중치] 전역 수준 기본 계산 (개별 코인별로 재계산됨)
+    signal_weight, learning_weight, maturity_desc = get_dynamic_weights(for_buy=True)
+    print(f"   📊 동적 가중치: {maturity_desc} (시그널 {signal_weight:.0%} / 학습 {learning_weight:.0%})")
+    
+    # 🆕 학습 성숙도가 높으면 Thompson(학습) 기준을 약간 낮춤 (경험 신뢰)
+    thompson_maturity_adj = learning_weight * -0.03  # 최대 -2.1% (성숙시)
     
     # 시장 상황에 따른 임계값 조정
     if is_extreme_bearish:
         # 극심한 하락장: 매우 엄격한 기준 (매수 거의 차단)
-        MIN_SIGNAL_SCORE = BASE_MIN_SIGNAL_SCORE + 0.15  # 0.35
-        MIN_SIGNAL_SCORE_ADDITIONAL = BASE_MIN_SIGNAL_SCORE_ADDITIONAL + 0.15  # 0.50
-        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE + 0.15  # 0.60
+        MIN_SIGNAL_SCORE = BASE_MIN_SIGNAL_SCORE + 0.10  # 0.15
+        MIN_SIGNAL_SCORE_ADDITIONAL = BASE_MIN_SIGNAL_SCORE_ADDITIONAL + 0.15  # 0.30
+        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE + 0.15 + thompson_maturity_adj
         print(f"   ⚠️ 극심한 하락장 감지: 매수 기준 강화 (시그널: {MIN_SIGNAL_SCORE:.2f}, Thompson: {MIN_THOMPSON_SCORE:.2f})")
     elif is_bearish:
         # 하락장: 엄격한 기준
-        MIN_SIGNAL_SCORE = BASE_MIN_SIGNAL_SCORE + 0.08  # 0.28
-        MIN_SIGNAL_SCORE_ADDITIONAL = BASE_MIN_SIGNAL_SCORE_ADDITIONAL + 0.08  # 0.43
-        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE + 0.08  # 0.53
+        MIN_SIGNAL_SCORE = BASE_MIN_SIGNAL_SCORE + 0.05  # 0.10
+        MIN_SIGNAL_SCORE_ADDITIONAL = BASE_MIN_SIGNAL_SCORE_ADDITIONAL + 0.08  # 0.23
+        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE + 0.08 + thompson_maturity_adj
         print(f"   ⚠️ 하락장 감지: 매수 기준 강화 (시그널: {MIN_SIGNAL_SCORE:.2f}, Thompson: {MIN_THOMPSON_SCORE:.2f})")
     elif is_bullish:
         # 상승장: 완화된 기준 (더 쉽게 매수)
-        MIN_SIGNAL_SCORE = BASE_MIN_SIGNAL_SCORE - 0.05  # 0.15
-        MIN_SIGNAL_SCORE_ADDITIONAL = BASE_MIN_SIGNAL_SCORE_ADDITIONAL - 0.05  # 0.30
-        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE - 0.05  # 0.40
+        MIN_SIGNAL_SCORE = BASE_MIN_SIGNAL_SCORE - 0.02  # 0.03
+        MIN_SIGNAL_SCORE_ADDITIONAL = BASE_MIN_SIGNAL_SCORE_ADDITIONAL - 0.05  # 0.10
+        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE - 0.05 + thompson_maturity_adj
         print(f"   ✅ 상승장 감지: 매수 기준 완화 (시그널: {MIN_SIGNAL_SCORE:.2f}, Thompson: {MIN_THOMPSON_SCORE:.2f})")
     else:
         # 중립장: 기본 기준
         MIN_SIGNAL_SCORE = BASE_MIN_SIGNAL_SCORE
         MIN_SIGNAL_SCORE_ADDITIONAL = BASE_MIN_SIGNAL_SCORE_ADDITIONAL
-        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE
+        MIN_THOMPSON_SCORE = BASE_MIN_THOMPSON_SCORE + thompson_maturity_adj
         print(f"   ➡️ 중립장: 기본 기준 (시그널: {MIN_SIGNAL_SCORE:.2f}, Thompson: {MIN_THOMPSON_SCORE:.2f})")
     
     # 🎯 예수금에 따라 최대 매수 가능 개수 계산
     available_balance_for_calc = get_available_balance()
     MIN_BALANCE_REQUIRED = 1_000_000  # 최소 예수금 (100만원 이하면 매수 안함)
-    MAX_BALANCE_FOR_SINGLE = 5_000_000  # 단일 매수 최대 금액: 500만원
+    MAX_BALANCE_FOR_SINGLE = 2_000_000  # 단일 매수 최대 금액: 200만원
     
-    # 예수금이 100만원 초과이고 500만원 이하면 1개 매수 가능 (예수금 전액 사용)
-    # 예수금이 500만원 초과면 500만원씩 여러 개 매수 가능
+    # 예수금이 100만원 초과이고 200만원 이하면 1개 매수 가능 (예수금 전액 사용)
+    # 예수금이 200만원 초과면 200만원씩 여러 개 매수 가능
     if available_balance_for_calc > MIN_BALANCE_REQUIRED:
         if available_balance_for_calc <= MAX_BALANCE_FOR_SINGLE:
-            # 100만원 초과 ~ 500만원 이하: 1개 매수 (예수금 전액 사용)
+            # 100만원 초과 ~ 200만원 이하: 1개 매수 (예수금 전액 사용)
             MAX_SIGNAL_CANDIDATES = 1
         else:
-            # 500만원 초과: 500만원씩 여러 개 매수 가능
+            # 200만원 초과: 200만원씩 여러 개 매수 가능
             max_buy_count = int(available_balance_for_calc / MAX_BALANCE_FOR_SINGLE)
             # 최대 10개로 제한 (너무 많이 매수하는 것 방지)
             MAX_SIGNAL_CANDIDATES = min(max_buy_count, 10)
     else:
         MAX_SIGNAL_CANDIDATES = 0  # 예수금 부족 (100만원 이하)
     
-    top_volume_coins = load_target_coins()
+    # top_volume_coins는 이미 위에서 로드됨 (중복 로드 방지)
     print(f"📊 분석 대상: {len(top_volume_coins)}개 (거래량 상위 40%)")
     if available_balance_for_calc > MIN_BALANCE_REQUIRED:
         if available_balance_for_calc <= MAX_BALANCE_FOR_SINGLE:
@@ -2479,6 +2728,11 @@ def run_signal_based_executor():
         current_price = signal_data['market_data'].get('price', 0)
         pure_action = signal_data['signal_info'].get('action', 'hold')
         target_price = signal_data['signal_info'].get('target_price', 0)
+        
+        # 🆕 파동 및 통합 방향 정보 추출
+        wave_info = signal_data.get('wave_info', {})
+        wave_phase = wave_info.get('wave_phase', 'unknown')
+        integrated_direction = wave_info.get('integrated_direction', 'neutral')
                 
         # 가상매매 참조 (Thompson 점수)
         virtual_ref = virtual_decisions.get(coin, {})
@@ -2512,12 +2766,50 @@ def run_signal_based_executor():
             # 5. 🆕 극심한 하락장에서는 추매 차단
             if is_extreme_bearish:
                 # 극심한 하락장에서는 추매도 차단 (현금 보유 우선)
-                            continue
+                continue
                             
             if (signal_score >= MIN_SIGNAL_SCORE_ADDITIONAL and 
                 current_profit_pct >= 0.5 and 
                 holding_hours >= 1.0 and 
                 thompson_score >= MIN_THOMPSON_SCORE):
+                
+                # 🛡️ 알파 가디언 추매 판단 (참고용으로만 사용)
+                if real_time_ai_decision_engine:
+                    signal_data_for_ai = {
+                        'coin': coin,
+                        'action': pure_action,
+                        'signal_score': signal_score,
+                        'confidence': confidence,
+                        'risk_level': 'high' if abs(signal_score) > 0.7 else 'medium' if abs(signal_score) > 0.4 else 'low',
+                        'wave_phase': wave_phase,
+                        'integrated_direction': integrated_direction
+                    }
+                    
+                    ai_res = real_time_ai_decision_engine.make_trading_decision(
+                        signal_data=signal_data_for_ai,
+                        current_price=wallet_current_price,
+                        market_context=market_context,
+                        coin_performance=thompson_sampler.get_decision_engine_stats(coin)
+                    )
+                    
+                    if isinstance(ai_res, dict):
+                        ai_action = ai_res.get('decision', 'hold')
+                        ai_score = ai_res.get('final_score', 0.0)
+                        ai_reason = ai_res.get('reason', '알파 가디언 분석 완료')
+                    else:
+                        ai_action = str(ai_res)
+                        ai_score = 0.0
+                        ai_reason = '알파 가디언 분석 완료'
+                    
+                    # 💡 [Alpha Guardian] 추매 결정에서도 AI는 참고용으로만 사용
+                    if ai_action != 'buy':
+                        print(f"   🛡️ [알파 가디언 (참고용)] 추매 거부 ({ai_action.upper()}, 점수: {ai_score:.3f}) - {ai_reason}")
+                    else:
+                        print(f"   🛡️ [알파 가디언 (참고용)] 추매 승인 (점수: {ai_score:.3f}) - {ai_reason}")
+                else:
+                    ai_action = 'buy'
+                    ai_score = 0.0
+                    ai_reason = '알파 가디언 비활성화됨'
                 
                 buy_candidates.append({
                         'coin': coin,
@@ -2533,6 +2825,9 @@ def run_signal_based_executor():
                     'expected_profit_pct': expected_profit,
                     'thompson_score': thompson_score,
                     'regime_name': regime_name,
+                    'ai_action': ai_action,  # 🆕 알파 가디언 판단 추가
+                    'ai_score': ai_score,  # 🆕 알파 가디언 점수 추가
+                    'ai_reason': ai_reason,  # 🆕 알파 가디언 근거 추가
                     'decision_timestamp': int(time.time())
                 })
                 print(f"   🔵 {get_korean_name(coin)}: 추매 후보 (점수: {signal_score:.3f}, 현수익: {current_profit_pct:+.2f}%)")
@@ -2541,20 +2836,122 @@ def run_signal_based_executor():
         # ═══════════════════════════════════════════════════════════════
         # 신규 매수 조건 체크 (시장 상황 반영)
         # ═══════════════════════════════════════════════════════════════
+        # 🆕 [이중 신뢰도] 개별 코인별 신뢰도 계산
+        # 시그널 신뢰도: 시그널 강도 + 신뢰도
+        sig_strength = min(1.0, abs(signal_score) * 2.0)
+        signal_conf = (sig_strength + confidence) / 2.0
+        
+        # 패턴 학습 신뢰도: Thompson 점수 기반
+        pattern_learning_conf = min(1.0, thompson_score + 0.3)
+        
+        # 인터벌 방향 일치도: integrated_direction 기반
+        direction_score = 0.7 if integrated_direction in ['up', 'strong_up'] else (0.3 if integrated_direction in ['down', 'strong_down'] else 0.5)
+        interval_align = direction_score
+        
+        # 개별 코인별 동적 가중치 계산
+        coin_signal_w, coin_learning_w, coin_weight_desc = get_dynamic_weights(
+            for_buy=True,
+            signal_confidence=signal_conf,
+            pattern_confidence=pattern_learning_conf,
+            interval_alignment=interval_align
+        )
+        
         # 🎯 시장 상황이 극심한 하락장이면 추가 필터링
         if is_extreme_bearish:
             # 극심한 하락장에서는 기대수익률도 더 높게 요구
             if expected_profit < 3.0:  # 기본 0% → 3% 이상 요구
                 continue
         
-        if signal_score < MIN_SIGNAL_SCORE:
+        # 🆕 이중 신뢰도 기반 임계값 조정
+        # 양쪽 신뢰도 모두 높으면 더 적극적 매매 (임계값 완화)
+        both_confident = signal_conf > 0.6 and pattern_learning_conf > 0.6
+        adjusted_min_signal = MIN_SIGNAL_SCORE - 0.02 if both_confident else MIN_SIGNAL_SCORE
+        adjusted_min_thompson = MIN_THOMPSON_SCORE - 0.03 if both_confident else MIN_THOMPSON_SCORE
+        
+        if signal_score < adjusted_min_signal:
             continue
-        if thompson_score < MIN_THOMPSON_SCORE:
+        if thompson_score < adjusted_min_thompson:
             continue
         if expected_profit < 0:
             continue
         if current_price <= 0:
             continue
+        
+        # 🛡️ 알파 가디언 매수 판단
+        if real_time_ai_decision_engine:
+            # 🆕 파동 및 방향 정보 추출
+            wave_info = signal_data.get('wave_info', {})
+            wave_phase = wave_info.get('wave_phase', 'unknown')
+            integrated_direction = wave_info.get('integrated_direction', 'neutral')
+
+            signal_data_for_ai = {
+                'coin': coin,
+                'action': pure_action,
+                'signal_score': signal_score,
+                'confidence': confidence,
+                'risk_level': 'high' if abs(signal_score) > 0.7 else 'medium' if abs(signal_score) > 0.4 else 'low',
+                'wave_phase': wave_phase,
+                'integrated_direction': integrated_direction
+            }
+            
+            ai_res = real_time_ai_decision_engine.make_trading_decision(
+                signal_data=signal_data_for_ai,
+                current_price=current_price,
+                market_context=market_context,
+                coin_performance=thompson_sampler.get_decision_engine_stats(coin)
+            )
+            
+            # 🆕 딕셔너리 형태로 반환되므로 처리
+            if isinstance(ai_res, dict):
+                ai_action = ai_res.get('decision', 'hold')
+                ai_score = ai_res.get('final_score', 0.0)
+                ai_reason = ai_res.get('reason', '알파 가디언 분석 완료')
+            else:
+                ai_action = ai_res
+                ai_score = 0.0
+                ai_reason = '알파 가디언 분석 완료'
+            
+            # 🆕 알파 가디언이 매수를 승인하지 않더라도 로그만 남기고 계속 진행
+            # 🔧 코인 정보 포함하여 로그 출력
+            if ai_action != 'buy':
+                print(f"   🟢 {get_korean_name(coin)}: 시그널 {signal_score:.3f}, Thompson {thompson_score:.2f}, 기대수익 {expected_profit:.2f}%")
+                print(f"      🛡️ [알파 가디언] {ai_action.upper()} (점수: {ai_score:.3f}) - {ai_reason}")
+            else:
+                print(f"   🟢 {get_korean_name(coin)}: 시그널 {signal_score:.3f}, Thompson {thompson_score:.2f}, 기대수익 {expected_profit:.2f}%")
+                print(f"      🛡️ [알파 가디언] BUY 승인 (점수: {ai_score:.3f})")
+        else:
+            ai_action = 'buy'
+            ai_score = 0.0
+            ai_reason = '알파 가디언 비활성화됨'
+            # 🔧 알파 가디언 비활성화 시에도 코인 정보 출력
+            print(f"   🟢 {get_korean_name(coin)}: 시그널 {signal_score:.3f}, Thompson {thompson_score:.2f}, 기대수익 {expected_profit:.2f}%")
+        
+        # 🆕 [전략 시스템] 전략 선택
+        strategy_type = 'trend'  # 기본 전략
+        strategy_match = 0.5
+        if STRATEGY_SYSTEM_AVAILABLE:
+            # 시그널에서 추천 전략 추출
+            signal_info = signal_data.get('signal_info', {})
+            if signal_info.get('recommended_strategy'):
+                strategy_type = signal_info['recommended_strategy']
+                strategy_match = signal_info.get('strategy_match', 0.5)
+            elif signal_info.get('strategy_scores'):
+                # 직접 전략 점수에서 최적 전략 선택
+                strategy_scores_raw = signal_info['strategy_scores']
+                if isinstance(strategy_scores_raw, str):
+                    strategy_scores_raw = deserialize_strategy_scores(strategy_scores_raw)
+                if strategy_scores_raw:
+                    best_strat = max(strategy_scores_raw.items(), key=lambda x: x[1] if isinstance(x[1], (int, float)) else x[1].get('match', 0))
+                    strategy_type = best_strat[0]
+                    strategy_match = best_strat[1] if isinstance(best_strat[1], (int, float)) else best_strat[1].get('match', 0.5)
+            
+            # 전략별 학습 데이터 기반 신뢰도 조회
+            strat_rate, strat_conf = get_strategy_success_rate(
+                db_path=TRADING_SYSTEM_DB_PATH,
+                strategy_type=strategy_type,
+                market_condition=regime_name
+            )
+            print(f"      🎯 [{strategy_type.upper()}] 전략 선택 (적합도: {strategy_match:.2f}, 학습 성공률: {strat_rate:.2f})")
         
         buy_candidates.append({
             'coin': coin,
@@ -2569,7 +2966,12 @@ def run_signal_based_executor():
             'expected_profit_pct': expected_profit,
             'thompson_score': thompson_score,
             'regime_name': regime_name,
-            'decision_timestamp': int(time.time())
+            'ai_action': ai_action,  # 🆕 알파 가디언 판단 추가
+            'ai_score': ai_score,  # 🆕 알파 가디언 점수 추가
+            'ai_reason': ai_reason,  # 🆕 알파 가디언 근거 추가
+            'decision_timestamp': int(time.time()),
+            'strategy_type': strategy_type,  # 🆕 매매 전략
+            'strategy_match': strategy_match  # 🆕 전략 적합도
         })
     
     # 시그널 점수 기준 정렬 후 상위 N개
@@ -2638,10 +3040,10 @@ def run_signal_based_executor():
             if to_coin in executed_buy_coins:
                 print(f"   ⏭️ {get_korean_name(to_coin)} 이미 매수됨 - 스킵")
                 continue
-                         
+            
             print(f"   🔄 {get_korean_name(from_coin)} → {get_korean_name(to_coin)}")
             print(f"      사유: {sw.get('switch_reason', 'unknown')}")
-                             
+            
             # 매도 실행
             sell_trade_data = {
                 'coin': from_coin,
@@ -2693,13 +3095,53 @@ def run_signal_based_executor():
                 
                 # 매수 실행
                 available_balance = get_available_balance()
-                # 예수금이 500만원 이하면 예수금 전액 사용, 500만원 초과면 500만원 사용
+                # 예수금이 200만원 이하면 예수금 전액 사용, 200만원 초과면 200만원 사용
                 if available_balance <= MAX_BALANCE_FOR_SINGLE:
                     buy_amount = available_balance * 0.995
                 else:
                     buy_amount = MAX_BALANCE_FOR_SINGLE * 0.995
                 
                 if buy_amount > MIN_BALANCE_REQUIRED:
+                    # 🛡️ 알파 가디언 갈아타기 매수 최종 확인 (매도 성공 후 재확인)
+                    if real_time_ai_decision_engine:
+                        target_signal_score = target.get('signal_score', 0.0)
+                        target_confidence = virtual_decisions.get(to_coin, {}).get('confidence', 0.5)
+                        target_current_price = target.get('current_price', 0.0)
+                        
+                        signal_data_for_ai = {
+                            'coin': to_coin,
+                            'action': 'buy',
+                            'signal_score': target_signal_score,
+                            'confidence': target_confidence,
+                            'risk_level': 'high' if abs(target_signal_score) > 0.7 else 'medium' if abs(target_signal_score) > 0.4 else 'low'
+                        }
+                        
+                        ai_res = real_time_ai_decision_engine.make_trading_decision(
+                            signal_data=signal_data_for_ai,
+                            current_price=target_current_price,
+                            market_context=market_context,
+                            # 🆕 Thompson 기반 패턴 성과 조회 (정밀 분석용)
+                            coin_performance=thompson_sampler.get_decision_engine_stats(to_coin)
+                        )
+                        
+                        # 🆕 딕셔너리 형태로 반환되므로 처리
+                        if isinstance(ai_res, dict):
+                            ai_action = ai_res.get('decision', 'hold')
+                            ai_score = ai_res.get('final_score', 0.0)
+                            ai_reason = ai_res.get('reason', '알파 가디언 분석 완료')
+                        else:
+                            ai_action = ai_res
+                            ai_score = 0.0
+                            ai_reason = '알파 가디언 분석 완료'
+                        
+                        # 🆕 알파 가디언 판단 로그 출력 (참고용)
+                        if ai_action != 'buy':
+                            print(f"      🛡️ [알파 가디언 (참고용)] 갈아타기 매수 보류 권고 ({ai_action.upper()}, 점수: {ai_score:.3f}) - {ai_reason}")
+                        else:
+                            print(f"      🛡️ [알파 가디언 (참고용)] 갈아타기 매수 승인 (점수: {ai_score:.3f}) - {ai_reason}")
+                        
+                        # 🚀 [결정] 알파 가디언 판단과 무관하게 갈아타기 매수 실행 (결정권 박탈)
+                    
                     buy_trade_data = {
                         'coin': to_coin,
                         'action': 'buy',
@@ -2721,7 +3163,23 @@ def run_signal_based_executor():
                     
                     if buy_success:
                         print(f"      ✅ {get_korean_name(to_coin)} 매수 완료")
-                        record_position_buy_time(to_coin, target.get('current_price', 0))
+                        # 🆕 전략 정보 포함
+                        entry_strategy = target.get('recommended_strategy', 'trend')
+                        strategy_match = target.get('strategy_match', 0.5)
+                        
+                        # 🧬 진화 레벨 조회
+                        evolution_level = 1
+                        evolved_params = ''
+                        if EVOLUTION_SYSTEM_AVAILABLE:
+                            try:
+                                regime = get_market_context().get('regime', 'neutral')
+                                evolution_level = get_strategy_level(entry_strategy, regime)
+                            except:
+                                pass
+                        
+                        record_position_buy_time(to_coin, target.get('current_price', 0), 
+                                                entry_strategy, strategy_match,
+                                                evolution_level, evolved_params)
                         executed_buy_coins.add(to_coin)
                         daily_switch_count += 1
                         
@@ -2769,9 +3227,8 @@ def run_signal_based_executor():
         sell_results = execute_enhanced_signal_trades(sell_decisions, [])
         executed_trades.extend(sell_results)
         
-        for dec in sell_decisions:
-            remove_position_time(dec['coin'])
-            print(f"   ✅ {get_korean_name(dec['coin'])} 매도 완료 ({dec['action']}, 수익률: {dec['profit_loss_pct']:+.2f}%)")
+        # 🆕 개별 매도 결과는 execute_enhanced_signal_trades 내부에서 상세히 출력함
+        # 불필요한 중복 로그 제거 및 실제 체결 여부와 무관한 '매도 완료' 출력 방지
     
     # ─────────────────────────────────────────────────────────────────
     # [3-4] 4순위: 신규 매수 + 추가 매수 실행
@@ -2810,12 +3267,12 @@ def run_signal_based_executor():
                     buy_type = "추매" if is_additional else "신규매수"
                     
                     # 매수 금액 계산:
-                    # - 예수금이 500만원 이하면 예수금 전액 사용
-                    # - 예수금이 500만원 초과면 500만원씩 사용
+                    # - 예수금이 200만원 이하면 예수금 전액 사용
+                    # - 예수금이 200만원 초과면 200만원씩 사용
                     if virtual_balance <= MAX_BALANCE_FOR_SINGLE:
                         buy_amount = virtual_balance * 0.995  # 예수금 전액 사용
                     else:
-                        buy_amount = MAX_BALANCE_FOR_SINGLE * 0.995  # 500만원씩
+                        buy_amount = MAX_BALANCE_FOR_SINGLE * 0.995  # 200만원씩
                     
                     if virtual_balance <= MIN_BALANCE_REQUIRED:
                         print(f"   ⚠️ 예수금 부족 (남은 예수금: {virtual_balance:,.0f}원 <= {MIN_BALANCE_REQUIRED:,.0f}원) - 중단")
@@ -2868,19 +3325,26 @@ def run_signal_based_executor():
                             'profit': 0.0
                         }
                         
-                        real_time_learning_feedback.record_trade_result(coin, trade_result)
-                        real_time_action_tracker.record_action_result('buy', 0.0, False, 0.0, coin)
+                        # 🆕 실전 매매 실시간 학습 (진행 중인 거래 위험 감지)
+                        # buy 시점에는 profit이 0이므로 learn_from_trade 생략 (필요 시 learn_from_ongoing_drawdown 사용)
                         
-                        trade_id = f"{coin}_{int(time.time())}"
-                        context = {
-                            'action': 'buy',
-                            'signal_score': candidate['signal_score'],
-                            'confidence': candidate['confidence'],
-                                'regime_name': candidate.get('regime_name', 'Neutral'),
-                                'thompson_score': candidate.get('thompson_score', 0.0),
-                                'buy_type': buy_type
-                        }
-                        real_time_context_recorder.record_trade_context(trade_id, context)
+                        # 🆕 시그널-매매 연결 (인과관계 정밀 추적)
+                        # candidate['signal'] 이 SignalInfo 객체라고 가정 (아니라면 candidate 활용)
+                        sig_info = candidate.get('signal')
+                        if not sig_info:
+                            sig_info = SignalInfo(
+                                coin,                                      # coin
+                                candidate.get('interval', 'combined'),     # interval
+                                SignalAction.BUY,                          # action
+                                float(candidate['signal_score']),          # signal_score
+                                float(candidate.get('confidence', 0.5)),   # confidence
+                                candidate.get('reason', 'Signal_Buy'),     # reason
+                                int(time.time())                           # timestamp
+                            )
+                            # 선택적 필드 설정
+                            sig_info.price = float(candidate.get('price', 0.0))
+                        
+                        SignalTradeConnector().connect_signal_to_trade(sig_info, trade_result)
                         
                         # 추매의 경우 현재 수익률 정보 포함
                         if is_additional:
@@ -2916,7 +3380,23 @@ def run_signal_based_executor():
                         
                         # 🆕 추가 매수의 경우 보유 시간 기록 업데이트 불필요
                         if not is_additional:
-                            record_position_buy_time(coin, candidate['price'])
+                            # 🆕 전략 정보 포함
+                            entry_strategy = candidate.get('recommended_strategy', 'trend')
+                            strategy_match = candidate.get('strategy_match', 0.5)
+                            
+                            # 🧬 진화 레벨 조회
+                            evolution_level = 1
+                            evolved_params = ''
+                            if EVOLUTION_SYSTEM_AVAILABLE:
+                                try:
+                                    regime = get_market_context().get('regime', 'neutral')
+                                    evolution_level = get_strategy_level(entry_strategy, regime)
+                                except:
+                                    pass
+                            
+                            record_position_buy_time(coin, candidate['price'], 
+                                                    entry_strategy, strategy_match,
+                                                    evolution_level, evolved_params)
                         
                         executed_buy_coins.add(coin)
                         
@@ -2957,11 +3437,12 @@ def run_signal_based_executor():
     print(f"   🟢 매도/익절: {len(sell_decisions)}건")
     print(f"   🔵 신규매수: {executed_new_buys}건 / 추매: {executed_additional_buys}건")
     
-    # 성과 추적
-    for action in ['buy', 'sell', 'hold']:
-        perf = real_time_action_tracker.get_action_performance(action)
-        if perf['total_trades'] > 0:
-            print(f"   📈 {action.upper()}: {perf['total_trades']}회, 승률: {perf['success_rate']:.1%}")
+    # 🆕 Thompson Sampling 기반 성과 출력
+    for action in ['buy', 'sell']:
+        # 코인별 통합 성과 (ALL 코인 기준)
+        stats = thompson_sampler.get_decision_engine_stats('ALL') # 또는 특정 패턴
+        if stats['total_trades'] > 0:
+            print(f"   📈 {action.upper()} 학습 지식: {stats['total_trades']}회 완료, 기대승률: {stats['success_rate']:.1%}")
     
     # 🆕 24시간 빗썸 거래내역 출력
     try:
@@ -2976,272 +3457,130 @@ def run_signal_based_executor():
 def combine_signal_with_holding(coin: str, pure_action: str, signal_score: float, profit_loss_pct: float, 
                                  signal_pattern: str = 'unknown', max_profit_pct: float = None,
                                  entry_volatility: float = 0.02, holding_hours: float = 0,
-                                 trend_analysis = None) -> str:
-    """🆕 순수 시그널과 보유 정보를 조합하여 최종 액션 결정 (학습 기반 매매 기법 적용 + 시장 상황 반영 + 추세 분석)"""
+                                 trend_analysis = None, ai_decision: str = 'hold',
+                                 tick_size: float = 0.0, current_price: float = 0.0,
+                                 signal_continuity: float = 0.5, dynamic_influence: float = 0.5,
+                                 current_strategy: str = 'trend') -> Tuple[str, str]:
+    """🆕 통합된 계층적 의사결정 전략 적용 (수익 보호 우선 + 전략별 청산 규칙)
+    
+    🔥 공통 원칙 (trade/core/executor/strategy.py 참조):
+    - 시그널의 action(BUY/SELL)이 아니라 signal_score와 보유 정보를 종합 판단
+    - should_sell_holding_position() 공통 함수 사용
+    - 🆕 전략별 청산 규칙 (STRATEGY_EXIT_RULES) 적용
+    
+    Args:
+        ai_decision: 알파 가디언 판단 결과 (함수 호출 전에 이미 판단됨)
+        tick_size: 호가 단위
+        current_price: 현재가
+        signal_continuity: 이전 시그널과의 방향성 일치도 (0~1)
+        dynamic_influence: 시그널 품질 기반 동적 영향도 (0~1)
+        current_strategy: 🆕 현재 적용 중인 전략 (전략별 청산 규칙 적용)
+    
+    Returns:
+        Tuple[str, str]: (action, reason) - 액션과 상세 사유
+    """
     try:
-        # max_profit_pct가 없으면 현재 수익률 사용
+        # 1. 최고 수익률 관리
         if max_profit_pct is None:
             max_profit_pct = max(profit_loss_pct, 0.0)
         
-        # 🎯 시장 상황 조회 (매도 결정에 반영)
-        market_context = get_market_context()
-        market_regime = market_context.get('regime', 'Neutral')
-        market_trend = market_context.get('trend', 'neutral')
+        # 🆕 [전략별 청산 규칙] 전략 시스템 로드
+        strategy_exit_rules = None
+        try:
+            from trade.core.strategies import STRATEGY_EXIT_RULES
+            strategy_exit_rules = STRATEGY_EXIT_RULES.get(current_strategy, STRATEGY_EXIT_RULES.get('trend'))
+        except ImportError:
+            pass
         
-        # 🎯 시장 상황에 따른 매도 조정 계수 계산
-        regime_lower = market_regime.lower() if market_regime else 'neutral'
-        is_bearish = 'bearish' in regime_lower or market_trend == 'bearish'
-        is_extreme_bearish = 'extreme_bearish' in regime_lower
-        is_bullish = 'bullish' in regime_lower or market_trend == 'bullish'
-        
-        # 매도 조정 계수 (하락장일수록 더 적극적으로 매도)
-        if is_extreme_bearish:
-            market_adjustment = 0.7  # 30% 완화 (더 쉽게 매도)
-        elif is_bearish:
-            market_adjustment = 0.85  # 15% 완화
-        elif is_bullish:
-            market_adjustment = 1.2  # 20% 강화 (더 확실한 신호에서만)
-        else:
-            market_adjustment = 1.0  # 중립
-        
-        # ═══════════════════════════════════════════════════════════════
-        # 🆕 [추세 분석 기반] 조기 매도/강한 홀딩 판단 (적극적 활용)
-        # ═══════════════════════════════════════════════════════════════
-        trend_sell_signal = False  # 추세 기반 매도 신호 플래그
-        trend_sell_reason = ""
-        trend_hold_signal = False  # 추세 기반 홀딩 신호 플래그
-        trend_hold_reason = ""
-        trend_pattern_adjustment = 0.0  # 학습된 추세 패턴 기반 조정값
-        
-        if trend_analysis is not None and trend_analysis.confidence >= 0.5:
-            trend_type = trend_analysis.trend_type.value
+        # 🆕 [전략별 손익절 체크] 기본 청산 체크 전에 전략 규칙 우선 적용
+        if strategy_exit_rules:
+            # 전략별 익절 체크
+            if profit_loss_pct >= strategy_exit_rules.take_profit_pct:
+                reason = f"✅ 전략({current_strategy}) 익절 도달 ({profit_loss_pct:.1f}% >= {strategy_exit_rules.take_profit_pct}%)"
+                return 'take_profit', reason
             
-            # 🆕 조기 매도 권장: should_sell_early가 True이면 무조건 매도 신호
-            if trend_analysis.should_sell_early:
-                trend_sell_signal = True
-                trend_sell_reason = trend_analysis.reason
-                print(f"   ⚠️ {coin} 추세 경고: {trend_sell_reason} (추세: {trend_type})")
-                
-                # 🆕 학습된 추세 패턴 조회 (Thompson Sampling)
-                thompson_learner = get_thompson_learner()
-                if thompson_learner is not None:
-                    try:
-                        trajectory_pattern = f"trajectory_{trend_type}"
-                        pattern_stats = thompson_learner.get_pattern_stats(trajectory_pattern)
-                        
-                        if pattern_stats:
-                            success_rate = pattern_stats.get('success_rate', 0.5)
-                            avg_profit = pattern_stats.get('avg_profit', 0.0)
-                            
-                            # 성공률이 낮거나 평균 수익이 음수면 더 적극적으로 매도
-                            if success_rate < 0.4 or avg_profit < -2.0:
-                                trend_pattern_adjustment = 0.25  # 임계값을 0.25 더 완화
-                                print(f"   📚 {coin} 학습된 추세 패턴: {trajectory_pattern} (성공률: {success_rate:.2f}, 평균수익: {avg_profit:.2f}%) → 더 적극적 매도")
-                    except Exception as e:
-                        # 학습 데이터 조회 실패 시 무시 (로깅은 선택적)
-                        import time
-                        if int(time.time()) % 3600 == 0:  # 1시간에 한번만 로그
-                            print(f"   ⚠️ {coin} 추세 패턴 조회 오류: {e}")
+            # 전략별 손절 체크
+            if profit_loss_pct <= -strategy_exit_rules.stop_loss_pct:
+                reason = f"🛑 전략({current_strategy}) 손절 도달 ({profit_loss_pct:.1f}% <= -{strategy_exit_rules.stop_loss_pct}%)"
+                return 'stop_loss', reason
             
-            # 🆕 강한 홀딩 권장: 상승 추세 지속 또는 횡보 저점
-            if trend_analysis.should_hold_strong:
-                trend_hold_signal = True
-                trend_hold_reason = trend_analysis.reason
-                
-                # 상승 추세에서는 매도 신호 무시하고 홀딩
-                if trend_type in ['strong_up', 'up', 'recovering']:
-                    print(f"💪 {coin} 추세 우선 홀딩 (상승 추세 지속: {trend_hold_reason})")
-                    return 'hold'
-                
-                # 🆕 횡보 저점 근처: 홀딩 유지 (추매 기회)
-                elif trend_type == 'sideways' and '저점' in trend_hold_reason:
-                    print(f"💪 {coin} 횡보 저점 근처 - 홀딩 유지 (추매 기회: {trend_hold_reason})")
-                    return 'hold'
-        
-        # ═══════════════════════════════════════════════════════════════
-        # 🔒 [최우선] 안전장치 (절대 변경 불가 - 하드코딩)
-        # ═══════════════════════════════════════════════════════════════
-        if profit_loss_pct >= 50.0:
-            print(f"🔒 {coin} 안전장치 익절 (+50% 도달)")
-            return 'take_profit'
-        
-        if profit_loss_pct <= -10.0:
-            print(f"🔒 {coin} 안전장치 손절 (-10% 도달)")
-            return 'stop_loss'
-        
-        # ═══════════════════════════════════════════════════════════════
-        # 🎓 [학습 기반] 청산 판단 (virtual_trade_learner에서 학습한 기법 적용 + 시장 상황 반영)
-        # ═══════════════════════════════════════════════════════════════
-        if LEARNED_EXIT_AVAILABLE:
-            try:
-                # 🎓 학습 기반 익절 체크 (시장 상황 조정 적용)
-                should_tp, tp_reason = should_take_profit(
-                    profit_pct=profit_loss_pct,
-                    max_profit_pct=max_profit_pct,
-                    signal_pattern=signal_pattern,
-                    entry_volatility=entry_volatility,
-                    market_adjustment=market_adjustment
-                )
-                if should_tp:
-                    print(f"🎓 {coin} 학습 기반 익절 ({tp_reason}, 조정: {market_adjustment:.2f}x)")
-                    if 'trailing' in tp_reason:
-                        return 'partial_sell'  # 트레일링 스탑은 부분 매도
-                    return 'take_profit'
-                
-                # 🎓 학습 기반 손절 체크 (시장 상황 조정 적용)
-                should_sl, sl_reason = should_stop_loss(
-                    profit_pct=profit_loss_pct,
-                    signal_pattern=signal_pattern,
-                    entry_volatility=entry_volatility,
-                    holding_hours=holding_hours,
-                    market_adjustment=market_adjustment
-                )
-                if should_sl:
-                    print(f"🎓 {coin} 학습 기반 손절 ({sl_reason}, 조정: {market_adjustment:.2f}x)")
-                    return 'stop_loss'
-                    
-            except Exception as e:
-                # 학습 기반 청산 오류 시 기본 로직으로 fallback
-                print(f"⚠️ 학습 기반 청산 판단 오류: {e}")
-        
-        # ═══════════════════════════════════════════════════════════════
-        # [기존 로직] AI 기반 매매 판단 (학습 기반 청산이 아닌 경우)
-        # ═══════════════════════════════════════════════════════════════
-
-        # 🆕 추세 정보를 시그널 점수에 직접 반영 (수익률 고려)
-        adjusted_signal_score = signal_score
-        
-        if trend_analysis is not None and trend_analysis.confidence >= 0.5:
-            # 조기 매도 권장 시 시그널 점수를 더 부정적으로 조정
-            if trend_analysis.should_sell_early:
-                # 🆕 횡보 고점 근처: 더 적극적으로 매도 (고점에서 이익 실현)
-                if trend_type == 'sideways' and '고점' in trend_analysis.reason:
-                    # 횡보 고점에서는 수익 보호보다 이익 실현 우선
-                    adjustment_factor = 1.2  # 20% 강화 (더 적극적 매도)
-                    if adjusted_signal_score > 0:
-                        adjusted_signal_score -= 0.25  # 양수 시그널을 더 약화
-                    else:
-                        adjusted_signal_score -= 0.2  # 음수 시그널을 더 강화
-                    print(f"   📉 {coin} 횡보 고점 근처 - 적극 매도 고려: {signal_score:.3f} → {adjusted_signal_score:.3f} ({trend_analysis.reason})")
-                else:
-                    # 일반 조기 매도: 수익률이 높을수록 더 신중하게 조정 (수익 보호)
-                    adjustment_factor = 1.0
-                    if profit_loss_pct > 5.0:  # 수익이 5% 이상이면 조정 완화
-                        adjustment_factor = 0.7  # 30% 완화
-                    elif profit_loss_pct > 0:  # 수익이 있으면 조정 완화
-                        adjustment_factor = 0.85  # 15% 완화
-                    
-                    # 시그널 점수가 양수면 더 부정적으로, 음수면 더 강하게
-                    if adjusted_signal_score > 0:
-                        adjusted_signal_score -= 0.2 * adjustment_factor  # 양수 시그널을 약화
-                    else:
-                        adjusted_signal_score -= 0.15 * adjustment_factor  # 음수 시그널을 강화
-                    print(f"   📉 {coin} 추세 기반 시그널 점수 조정: {signal_score:.3f} → {adjusted_signal_score:.3f} (수익률: {profit_loss_pct:.2f}%, 조정계수: {adjustment_factor:.2f})")
+            # 전략별 최대 보유 시간 체크
+            if holding_hours >= strategy_exit_rules.max_holding_hours:
+                reason = f"⏰ 전략({current_strategy}) 보유 시간 초과 ({holding_hours:.0f}h >= {strategy_exit_rules.max_holding_hours}h)"
+                return 'sell', reason
             
-            # 강한 홀딩 권장 시 시그널 점수를 더 긍정적으로 조정
-            elif trend_analysis.should_hold_strong:
-                # 시그널 점수가 음수면 더 긍정적으로, 양수면 더 강하게
-                if adjusted_signal_score < 0:
-                    adjusted_signal_score += 0.2  # 음수 시그널을 약화
-                else:
-                    adjusted_signal_score += 0.1  # 양수 시그널을 강화
-                print(f"   📈 {coin} 추세 기반 시그널 점수 조정: {signal_score:.3f} → {adjusted_signal_score:.3f}")
+            # 🆕 전략별 트레일링 스탑 체크
+            if strategy_exit_rules.trailing_stop and max_profit_pct >= strategy_exit_rules.trailing_trigger_pct:
+                trailing_stop_price = max_profit_pct - strategy_exit_rules.trailing_distance_pct
+                if profit_loss_pct <= trailing_stop_price:
+                    reason = f"📉 전략({current_strategy}) 트레일링 스탑 ({profit_loss_pct:.1f}% <= 최고 {max_profit_pct:.1f}% - {strategy_exit_rules.trailing_distance_pct}%)"
+                    return 'sell', reason
         
-        # 🆕 실전 매매 특화 의사결정 엔진 사용 (조정된 시그널 점수 사용)
-            signal_data = {
-                'action': pure_action,
-                'signal_score': adjusted_signal_score,  # 🆕 조정된 시그널 점수 사용
-            'confidence': abs(adjusted_signal_score),  # 신뢰도는 조정된 시그널 점수의 절댓값
-            'risk_level': 'high' if abs(adjusted_signal_score) > 0.7 else 'medium' if abs(adjusted_signal_score) > 0.4 else 'low'
-        }
-        
-        # 🆕 코인별 성과 데이터 로드 (실제로는 DB에서 로드)
-        coin_performance = real_time_learning_feedback.get_coin_learning_data(coin)
-        
-        # 🆕 AI 의사결정 엔진으로 최종 액션 결정
-        ai_decision = real_time_ai_decision_engine.make_trading_decision(
-            signal_data, 0.0, market_context, coin_performance
+        # 🔥 [공통 기준 적용] should_sell_holding_position 호출
+        # 시그널 action이 아니라 signal_score + 보유 정보로 판단
+        from trade.core.executor.strategy import should_sell_holding_position
+        should_sell, sell_reason = should_sell_holding_position(
+            signal_score=signal_score,
+            profit_loss_pct=profit_loss_pct,
+            max_profit_pct=max_profit_pct,
+            holding_hours=holding_hours,
+            tick_size=tick_size,
+            current_price=current_price,
+            trend_analysis=trend_analysis,
+            signal_continuity=signal_continuity,  # 🆕 연속성 전달
+            dynamic_influence=dynamic_influence   # 🆕 영향도 전달
         )
         
-        # 🎯 🆕 [학습 기반 매도] 패턴별 최적 매도 시그널 점수 임계값 조회
-        learned_threshold = None
+        if should_sell:
+            # 손절/익절 구분
+            if '손절' in sell_reason or '-10%' in sell_reason:
+                return 'stop_loss', f"🚨 {sell_reason}"
+            elif '익절' in sell_reason or '+50%' in sell_reason:
+                return 'take_profit', f"🚨 {sell_reason}"
+            return 'sell', f"🚨 {sell_reason}"
         
+        # 🆕 market_adjustment 제거: 알파 가디언이 시장 상황별 meta_bias로 자동 학습하므로
+        market_adjustment = 1.0
+        
+        # 💡 [Alpha Guardian] AI 판단은 참고용으로만 사용하며 결정권은 박탈
+        ai_action = 'hold' # AI 판단을 의사결정 엔진에 전달하지 않음
+
+        # 4. 학습된 매도 임계값 조회
+        learned_threshold = None
         if LEARNED_EXIT_AVAILABLE and signal_pattern != 'unknown':
-            # 학습된 최적 임계값 조회 (성공률 50% 이상, 샘플 3회 이상)
             learned_threshold = get_learned_sell_threshold(
                 signal_pattern=signal_pattern,
                 profit_loss_pct=profit_loss_pct,
+                max_profit_pct=max_profit_pct,
                 min_success_rate=0.5,
                 min_samples=3
             )
-        
-        # 🎯 시장 상황에 따른 매도 시그널 임계값 조정
-        BASE_SELL_THRESHOLDS = [-0.5, -0.3, -0.2, -0.1]
-        adjusted_sell_thresholds = [t * market_adjustment for t in BASE_SELL_THRESHOLDS]
-        
-        # 🆕 추세 경고가 있으면 매도 임계값을 더 보수적으로 조정
-        trend_adjustment = 0.0
-        if trend_sell_signal:
-            # 기본 조정값 + 학습된 패턴 기반 추가 조정
-            trend_adjustment = 0.15 + trend_pattern_adjustment  # 기본 0.15 + 패턴 기반 추가
-            print(f"   ⚠️ {coin} 추세 경고 반영: 매도 임계값 {trend_adjustment:.2f} 완화 (기본: 0.15, 패턴: {trend_pattern_adjustment:.2f})")
-        
-        # 🆕 🆕 [학습 기반 매도] 학습된 임계값이 있으면 우선 사용 (조정된 시그널 점수 사용)
-        if learned_threshold is not None:
-            # 학습된 임계값에 시장 상황 조정 + 추세 경고 반영
-            adjusted_learned_threshold = (learned_threshold + trend_adjustment) * market_adjustment
-            if adjusted_signal_score < adjusted_learned_threshold:  # 🆕 조정된 시그널 점수 사용
-                print(f"📚 {coin}: 학습 기반 매도 (패턴: {signal_pattern}, "
-                      f"임계값: {learned_threshold:.2f} → 조정: {adjusted_learned_threshold:.2f}, "
-                      f"현재: {adjusted_signal_score:.2f} (원본: {signal_score:.2f}), 추세경고: {trend_sell_reason})")
-                return 'sell'
-        else:
-            # 학습 데이터가 없으면 기본 임계값 사용 (추세 경고 반영)
-            adjusted_sell_thresholds = [t + trend_adjustment for t in adjusted_sell_thresholds]
-            # 🆕 AI 기반 매도 조건 (조정된 시그널 점수 + AI 결정 + 시장 상황 반영 + 추세 경고)
-            if adjusted_signal_score < adjusted_sell_thresholds[0] or ai_decision == 'sell':  # 강한 매도 시그널
-                if trend_sell_signal:
-                    print(f"📉 {coin}: 매도 (시그널: {adjusted_signal_score:.2f} (원본: {signal_score:.2f}), 추세경고: {trend_sell_reason})")
-                return 'sell'
-            elif adjusted_signal_score < adjusted_sell_thresholds[1] or ai_decision == 'sell':  # 매도 시그널
-                if trend_sell_signal:
-                    print(f"📉 {coin}: 매도 (시그널: {adjusted_signal_score:.2f} (원본: {signal_score:.2f}), 추세경고: {trend_sell_reason})")
-                return 'sell'
-            elif adjusted_signal_score < adjusted_sell_thresholds[2]:
-                if trend_sell_signal:
-                    print(f"📉 {coin}: 매도 (시그널: {adjusted_signal_score:.2f} (원본: {signal_score:.2f}), 추세경고: {trend_sell_reason})")
-                return 'sell'
-            elif adjusted_signal_score < adjusted_sell_thresholds[3]:
-                if trend_sell_signal:
-                    print(f"📉 {coin}: 매도 (시그널: {adjusted_signal_score:.2f} (원본: {signal_score:.2f}), 추세경고: {trend_sell_reason})")
-                return 'sell'
-        
-        # 🆕 AI 기반 매수 조건 (조정된 시그널 점수 + AI 결정)
-        if adjusted_signal_score > 0.5 or ai_decision == 'buy':  # 강한 매수 시그널
-            return 'buy'
-        elif adjusted_signal_score > 0.3 or ai_decision == 'buy':  # 매수 시그널
-            return 'buy'
-        elif adjusted_signal_score > 0.2:
-            return 'buy'
-        elif adjusted_signal_score > 0.1:
-            return 'buy'
-        
-        # 🎯 중립 구간 (홀딩) - AI 결정도 고려
-            return 'hold' if ai_decision == 'hold' else ai_decision
+
+        # 5. 공통 전략 엔진 호출 (최종 의사결정)
+        final_action = decide_final_action(
+            coin=coin,
+            signal_score=signal_score,
+            profit_loss_pct=profit_loss_pct,
+            max_profit_pct=max_profit_pct,
+            signal_pattern=signal_pattern,
+            market_adjustment=market_adjustment,
+            holding_hours=holding_hours,
+            trend_analysis=trend_analysis,
+            learned_threshold=learned_threshold,
+            ai_decision='hold', # 💡 AI 결정 무시
+            tick_size=tick_size,
+            current_price=current_price,
+            signal_continuity=signal_continuity,  # 🆕 연속성 전달
+            dynamic_influence=dynamic_influence   # 🆕 영향도 전달
+        )
             
+        return final_action, ""  # 기본 액션은 사유 없음
+
     except Exception as e:
-        print(f"⚠️ 시그널-보유 결합 오류: {e}")
-        # 🆕 오류 시 안전한 기본값 반환 (기존 로직 유지)
-        if profit_loss_pct >= 50.0:
-            return 'take_profit'
-        if profit_loss_pct <= -10.0:
-            return 'stop_loss'
-        if signal_score < -0.3:
-            return 'sell'
-        elif signal_score > 0.3:
-            return 'buy'
-        else:
-            return 'hold'
+        print(f"⚠️ 의사결정 결합 오류 ({coin}): {e}")
+        import traceback
+        traceback.print_exc()
+        return pure_action, f"오류: {e}"
 
 # 🚀 멀티 타임프레임 실전매매 최적화 시스템
 def get_multi_timeframe_execution_priority(coin: str) -> Dict[str, Any]:
@@ -3340,12 +3679,13 @@ def calculate_execution_priority(interval_signals: Dict[str, Dict]) -> str:
         
         avg_signal_score = total_weighted_score / total_weight
         
-        # 🎯 우선순위 결정
-        if avg_signal_score > 0.4:
+        # 🎯 우선순위 결정 (중앙 관리 임계값 사용)
+        t = get_thresholds()
+        if avg_signal_score > t.priority_high:
             return 'high'
-        elif avg_signal_score > 0.2:
+        elif avg_signal_score > t.priority_medium:
             return 'medium'
-        elif avg_signal_score > -0.2:
+        elif avg_signal_score > t.priority_low:
             return 'low'
         else:
             return 'very_low'
@@ -3727,7 +4067,7 @@ def execute_enhanced_signal_trades(sell_decisions, hold_decisions):
             profit_loss_pct = decision['profit_loss_pct']
             
             # 🆕 코인별 성과 데이터 로드
-            coin_performance = real_time_learning_feedback.get_coin_learning_data(coin)
+            coin_performance = thompson_sampler.get_decision_engine_stats(coin)
             
             # 🆕 AI 의사결정 엔진으로 최종 검증
             signal_data = {
@@ -3735,7 +4075,9 @@ def execute_enhanced_signal_trades(sell_decisions, hold_decisions):
                 'action': 'sell',
                 'signal_score': signal_score,
                 'confidence': confidence,
-                'risk_level': 'high' if abs(signal_score) > 0.7 else 'medium' if abs(signal_score) > 0.4 else 'low'
+                'risk_level': 'high' if abs(signal_score) > 0.7 else 'medium' if abs(signal_score) > 0.4 else 'low',
+                'wave_phase': decision.get('wave_phase', 'unknown'),
+                'integrated_direction': decision.get('integrated_direction', 'neutral')
             }
             
             # 🆕 진짜 시장 상황 분석 (Core 모듈 연동)
@@ -3747,22 +4089,63 @@ def execute_enhanced_signal_trades(sell_decisions, hold_decisions):
                 'timestamp': int(time.time())
             }
             
-            ai_decision = real_time_ai_decision_engine.make_trading_decision(
-                signal_data, current_price, market_context, coin_performance
-            )
+            # 🛡️ 알파 가디언 판단 (매도 시점)
+            if real_time_ai_decision_engine:
+                ai_res = real_time_ai_decision_engine.make_trading_decision(
+                    signal_data=signal_data,
+                    current_price=current_price,
+                    market_context=market_context,
+                    coin_performance=coin_performance
+                )
+                # 🆕 딕셔너리 형태로 반환되므로 처리
+                if isinstance(ai_res, dict):
+                    ai_action = ai_res.get('decision', 'hold')
+                    ai_score = ai_res.get('final_score', 0.0)
+                    ai_reason = ai_res.get('reason', '알파 가디언 분석 완료')
+                else:
+                    ai_action = ai_res
+                    ai_score = 0.0
+                    ai_reason = '알파 가디언 분석 완료'
+            else:
+                ai_action = 'hold'
+                ai_score = 0.0
+                ai_reason = '알파 가디언 비활성화됨'
             
-            # 🔒 [핵심 수정] 손절(stop_loss)은 AI 의사결정 무시하고 무조건 실행!
+            # 🆕 알파 가디언 판단 로그 (매도 시점)
+            print(f"   🛡️ [알파 가디언 매도 판단] {ai_action.upper()} (점수: {ai_score:.3f})")
+            print(f"   💬 근거: {ai_reason}")
+            
+            # 🔒 [핵심 수정] 손절(stop_loss) 및 익절(take_profit)은 AI 의사결정 무시하고 무조건 실행!
             is_stop_loss = decision['action'] == 'stop_loss'
-            is_forced_sell = decision['action'] in ['stop_loss', 'take_profit']  # 익절도 강제
+            is_take_profit = decision['action'] == 'take_profit'
             
-            # 🆕 AI가 매도를 승인하거나, 손절/익절이면 무조건 실행
-            if ai_decision == 'sell' or decision['action'] == 'partial_sell' or is_forced_sell:
+            # 🆕 매도 실행 조건 확인
+            should_execute_sell = False
+            
+            if is_stop_loss or is_take_profit:
+                # 손절/익절은 무조건 실행 (AI 판단 무시)
+                should_execute_sell = True
                 if is_stop_loss:
                     print(f"🔒 {get_korean_name(coin)}: 손절 강제 실행! (AI 의사결정 무시)")
-                elif is_forced_sell:
+                elif is_take_profit:
                     print(f"🔒 {get_korean_name(coin)}: 익절 강제 실행!")
+            elif decision['action'] == 'partial_sell':
+                # 부분 매도는 항상 실행
+                should_execute_sell = True
+                print(f"✅ {get_korean_name(coin)}: 부분 매도 실행 (알파 가디언: {ai_action.upper()})")
+            elif decision['action'] == 'sell':
+                # 🆕 일반 매도는 알파 가디언 판단을 참고만 함 (결정권 박탈)
+                should_execute_sell = True
+                if ai_action == 'sell':
+                    print(f"✅ {get_korean_name(coin)}: 알파 가디언 승인 매도 - {decision.get('reason', 'N/A')}")
                 else:
-                    print(f"✅ {get_korean_name(coin)}: AI 승인 매도 준비 - {decision['reason']}")
+                    print(f"⚠️ {get_korean_name(coin)}: 알파 가디언 매도 보류 권고했지만 전략 엔진 판단으로 매도 ({decision.get('reason', 'N/A')})")
+            else:
+                # 🆕 'hold' 등의 경우. 시그널이 아주 나쁘면 매도 보완 로직은 combine_signal_with_holding에서 처리됨.
+                pass
+            
+            # 🆕 매도 실행
+            if should_execute_sell:
                 
                 # 🎯 분할 매도 로직 적용 (부분 익절 시 50% 매도)
                 if decision['action'] == 'partial_sell':
@@ -3835,24 +4218,20 @@ def execute_enhanced_signal_trades(sell_decisions, hold_decisions):
                 
                 executed_trades.append(trade_result)
                 
-                # 🆕 학습 피드백에 거래 결과 기록
-                real_time_learning_feedback.record_trade_result(coin, trade_result)
+                # 🆕 실전 매매 실시간 학습 (매도 시 지식 업데이트)
+                real_time_learner.learn_from_trade(coin, profit_loss_pct)
                 
-                # 🆕 액션별 성과 추적
+                # Thompson Sampling 지식 즉시 업데이트 (수익/손실 패턴 학습)
+                # 매도 품질 평가(Evaluator)와 연계 가능
                 success_trade = profit_loss_pct > 0
-                real_time_action_tracker.record_action_result('sell', profit_loss_pct, success_trade, 0.0, coin)
+                thompson_sampler.update_distribution(
+                    pattern=coin, # 정밀 패턴 추출 가능 시 교체 추천
+                    success=success_trade,
+                    profit_pct=profit_loss_pct
+                )
                 
-                # 🆕 컨텍스트 기록
-                trade_id = f"{coin}_{int(time.time())}"
-                context = {
-                    'action': 'sell',
-                    'signal_score': ctx['signal_score'],
-                    'confidence': ctx['confidence'],
-                    'market_context': ctx['market_context'],
-                    'coin_performance': ctx['coin_performance'],
-                    'profit_loss_pct': profit_loss_pct
-                }
-                real_time_context_recorder.record_trade_context(trade_id, context)
+                # 🆕 시그널-매매 연결 (인과관계 추적)
+                # SignalTradeConnector().connect_signal_to_trade(sig_info, trade_result)
                 
                 # 🆕 [복구] DB에 매매 결정 기록 (real_trade_history)
                 log_trade_decision({

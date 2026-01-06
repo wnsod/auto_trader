@@ -492,9 +492,11 @@ class ScoringMixin:
             # 🔥 1순위: interval_profiles 기반 인터벌별 가중치 (최우선)
             if interval:
                 try:
-                    from rl_pipeline.core.interval_profiles import get_interval_role
+                    # 🆕 rl_pipeline 의존성 제거 - trade.core.data_utils 사용
+                    from trade.core.data_utils import get_interval_role
                     
-                    interval_role = get_interval_role(interval)
+                    interval_info = get_interval_role(interval)
+                    interval_role = interval_info.get('role', '') if interval_info else ''
                     
                     if interval_role:
                         # 인터벌별 역할에 따른 가중치 차별화
@@ -559,17 +561,23 @@ class ScoringMixin:
             # 🔥 3순위: DB에서 코인별 동적 가중치 로드
             if coin:
                 try:
-                    from rl_pipeline.db.reads import get_coin_global_weights
+                    # 🆕 rl_pipeline 의존성 제거 - trade.core.data_utils 사용
+                    from trade.core.data_utils import get_coin_global_weights
 
                     weights_data = get_coin_global_weights(coin)
 
-                    if weights_data and weights_data.get('updated_at'):
-                        coin_weight = weights_data['coin_weight']
-                        global_weight = weights_data['global_weight']
+                    if weights_data and weights_data.get('technical'):
+                        # 가중치를 코인/글로벌 비율로 변환
+                        coin_weight = weights_data.get('technical', 0.5) + weights_data.get('wave', 0.2)
+                        global_weight = weights_data.get('rl', 0.15) + weights_data.get('ai', 0.15)
+                        # 정규화
+                        total = coin_weight + global_weight
+                        if total > 0:
+                            coin_weight /= total
+                            global_weight /= total
 
                         if self.debug_mode:
-                            quality_score = weights_data.get('data_quality_score', 0.0)
-                            print(f"🎯 [{coin}] DB 가중치: 개별={coin_weight:.2f}, 글로벌={global_weight:.2f}, 품질={quality_score:.2f}")
+                            print(f"🎯 [{coin}] DB 가중치: 개별={coin_weight:.2f}, 글로벌={global_weight:.2f}")
 
                         return coin_weight, global_weight
                     else:
@@ -678,33 +686,65 @@ class ScoringMixin:
             if interval in self.global_strategies_cache and len(self.global_strategies_cache[interval]) > 0:
                 strategies = self.global_strategies_cache[interval]
                 
-                # 최고 등급 전략 선택
-                best_strategy = None
-                best_score = -1.0
+                # 🎯 DB 공인 레짐 사용 (최우선)
+                current_regime = candle.get('regime') or candle.get('regime_label')
                 
-                for strategy in strategies:
-                    # 등급 기반 점수 계산
-                    grade = strategy.get('quality_grade', 'A')
+                if not current_regime or pd.isna(current_regime):
+                    current_rsi = candle.get('rsi', 50.0)
+                    if current_rsi > 75: current_regime = 'extreme_bullish'
+                    elif current_rsi > 65: current_regime = 'bullish'
+                    elif current_rsi > 55: current_regime = 'sideways_bullish'
+                    elif current_rsi < 25: current_regime = 'extreme_bearish'
+                    elif current_rsi < 35: current_regime = 'bearish'
+                    elif current_rsi < 45: current_regime = 'sideways_bearish'
+                    else: current_regime = 'neutral'
+                
+                current_regime = str(current_regime).lower()
+
+                # 🎯 최적 전략 선택 (7대 레짐 매칭 및 중간값 합성 전략 우선)
+                best_strategy = None
+                max_priority = -1.0
+                
+                for s in strategies:
+                    priority = 0.0
+                    
+                    # 레짐 매칭 (정밀 매칭 15점, 인접 방향성 5점, 중립 2점)
+                    s_regime = str(s.get('regime', 'neutral')).lower()
+                    if s_regime == current_regime:
+                        priority += 15.0
+                    elif (current_regime.endswith('bullish') and 'bullish' in s_regime) or \
+                         (current_regime.endswith('bearish') and 'bearish' in s_regime):
+                        priority += 5.0
+                    elif s_regime == 'neutral':
+                        priority += 2.0
+                    
+                    # 등급 점수 가중치
+                    grade = s.get('quality_grade', 'A')
                     grade_score = grade_scores.get(grade, 3.0)
+                    priority += grade_score
                     
-                    # 성과 기반 점수
-                    profit = strategy.get('profit', 0.0)
-                    win_rate = strategy.get('win_rate', 0.5)
-                    profit_factor = strategy.get('profit_factor', 1.0)
-                    
-                    # 종합 점수 계산
-                    strategy_score = (
-                        grade_score * 0.3 +  # 등급 30%
-                        min(profit * 10, 3.0) * 0.3 +  # 수익 30%
-                        win_rate * 0.2 +  # 승률 20%
-                        min(profit_factor, 3.0) * 0.2  # Profit Factor 20%
-                    )
-                    
-                    if strategy_score > best_score:
-                        best_score = strategy_score
-                        best_strategy = strategy
+                    # 합성 전략 가중치
+                    if s.get('strategy_type') == 'universal_median':
+                        priority += 5.0
+                        
+                    # 성과 지표 가중치 (미세 조정)
+                    profit = s.get('profit', 0.0)
+                    win_rate = s.get('win_rate', 0.5)
+                    priority += (min(profit * 10, 3.0) * 0.1 + win_rate * 0.1)
+
+                    if priority > max_priority:
+                        max_priority = priority
+                        best_strategy = s
+                    elif priority == max_priority and best_strategy:
+                        if s.get('profit_factor', 0) > best_strategy.get('profit_factor', 0):
+                            best_strategy = s
                 
                 if best_strategy:
+                    # 전략 점수 계산 기반 마련 (best_score 정규화용)
+                    grade = best_strategy.get('quality_grade', 'A')
+                    grade_score = grade_scores.get(grade, 3.0)
+                    best_score = (grade_score / 6.0) * 0.8 + 0.2 # 최소 0.2~1.0 보장
+                    
                     # 전략 파라미터로 점수 계산
                     params = best_strategy.get('params', {})
                     
@@ -726,20 +766,63 @@ class ScoringMixin:
             
             # 🔥 2단계: 실시간 글로벌 전략 로드 시도
             try:
-                import sys
-                import os
-                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+                # 🆕 rl_pipeline 의존성 제거 - trade.core.data_utils 사용
+                from trade.core.data_utils import load_global_strategies_from_db
                 
-                from rl_pipeline.db.learning_results import load_global_strategies_from_db
-                
-                global_strategies = load_global_strategies_from_db(interval=interval)
+                all_strategies = load_global_strategies_from_db()
+                global_strategies = all_strategies.get(interval, [])
                 if global_strategies:
                     # 캐시에 저장
                     self.global_strategies_cache[interval] = global_strategies
                     
-                    # 가장 좋은 전략 선택 (위와 동일 로직)
-                    best_strategy = max(global_strategies, 
-                                       key=lambda s: grade_scores.get(s.get('quality_grade', 'A'), 3.0))
+                    # 🎯 DB 공인 레짐 사용 (최우선)
+                    current_regime = candle.get('regime') or candle.get('regime_label')
+                    
+                    if not current_regime or pd.isna(current_regime):
+                        current_rsi = candle.get('rsi', 50.0)
+                        if current_rsi > 75: current_regime = 'extreme_bullish'
+                        elif current_rsi > 65: current_regime = 'bullish'
+                        elif current_rsi > 55: current_regime = 'sideways_bullish'
+                        elif current_rsi < 25: current_regime = 'extreme_bearish'
+                        elif current_rsi < 35: current_regime = 'bearish'
+                        elif current_rsi < 45: current_regime = 'sideways_bearish'
+                        else: current_regime = 'neutral'
+                    
+                    current_regime = str(current_regime).lower()
+
+                    # 🎯 최적 전략 선택 (7대 레짐 매칭 및 중간값 합성 전략 우선)
+                    best_strategy = None
+                    max_priority = -1.0
+                    
+                    for s in global_strategies:
+                        priority = 0.0
+                        # 레짐 매칭 (정밀 매칭 15점, 인접 방향성 5점, 중립 2점)
+                        s_regime = str(s.get('regime', 'neutral')).lower()
+                        if s_regime == current_regime:
+                            priority += 15.0
+                        elif (current_regime.endswith('bullish') and 'bullish' in s_regime) or \
+                             (current_regime.endswith('bearish') and 'bearish' in s_regime):
+                            priority += 5.0
+                        elif s_regime == 'neutral':
+                            priority += 2.0
+                        
+                        # 등급 가중치
+                        grade = s.get('quality_grade', 'A')
+                        priority += grade_scores.get(grade, 3.0)
+                        
+                        # 합성 전략 가중치
+                        if s.get('strategy_type') == 'universal_median':
+                            priority += 5.0
+
+                        if priority > max_priority:
+                            max_priority = priority
+                            best_strategy = s
+                        elif priority == max_priority and best_strategy:
+                            if s.get('profit_factor', 0) > best_strategy.get('profit_factor', 0):
+                                best_strategy = s
+
+                    if not best_strategy:
+                        best_strategy = global_strategies[0]
                     
                     params = best_strategy.get('params', {})
                     market_adaptation = self._evaluate_market_adaptation(candle, {
@@ -933,7 +1016,10 @@ class ScoringMixin:
         """글로벌 전략 기반 점수 계산 (learning_engine.py 연동 강화)"""
         try:
             # 🆕 학습 엔진의 글로벌 전략 결과 활용
-            global_score = self._strategy_calculator.get_global_strategy_score(coin, interval, candle)
+            if self._strategy_calculator:
+                global_score = self._strategy_calculator.get_global_strategy_score(coin, interval, candle)
+            else:
+                global_score = 0.5
             
             # 🆕 심화 통합 분석 결과 활용
             deep_analysis_bonus = self._get_deep_analysis_bonus(coin, interval, candle)
@@ -951,13 +1037,22 @@ class ScoringMixin:
             
         except Exception as e:
             logger.error(f"❌ 글로벌 전략 점수 계산 실패: {e}")
-            return self._strategy_calculator.get_global_strategy_score(coin, interval, candle)
+            if self._strategy_calculator:
+                return self._strategy_calculator.get_global_strategy_score(coin, interval, candle)
+            return 0.5
     
     def _get_rl_pipeline_learned_score(self, coin: str, interval: str, candle: pd.Series) -> float:
         """RL Pipeline 학습 결과 활용 (learning_engine.py 연동 강화)"""
         try:
             # 🆕 기본 RL 파이프라인 점수
-            base_score = self._strategy_calculator.get_rl_pipeline_score(coin, interval, candle)
+            if self._strategy_calculator:
+                if hasattr(self._strategy_calculator, 'get_rl_pipeline_score'):
+                    base_score = self._strategy_calculator.get_rl_pipeline_score(coin, interval, candle)
+                else:
+                    # StrategyScoreCalculator의 메인 점수 계산 메서드 활용
+                    base_score = self._strategy_calculator.calculate_strategy_score(coin, interval, candle)
+            else:
+                base_score = 0.5
             
             # 🆕 심화 통합 분석 결과 활용
             deep_analysis_bonus = self._get_deep_analysis_bonus(coin, interval, candle)
@@ -972,7 +1067,11 @@ class ScoringMixin:
             
         except Exception as e:
             logger.error(f"❌ RL 파이프라인 점수 계산 실패: {e}")
-            return self._strategy_calculator.get_rl_pipeline_score(coin, interval, candle)
+            if self._strategy_calculator:
+                if hasattr(self._strategy_calculator, 'get_rl_pipeline_score'):
+                    return self._strategy_calculator.get_rl_pipeline_score(coin, interval, candle)
+                return self._strategy_calculator.calculate_strategy_score(coin, interval, candle)
+            return 0.5
     
     def _get_deep_analysis_bonus(self, coin: str, interval: str, candle: pd.Series) -> float:
         """심화 통합 분석 결과 기반 보너스 점수"""
@@ -1179,26 +1278,50 @@ class ScoringMixin:
             print(f"⚠️ 범용 RL 점수 조회 오류: {e}")
             return 0.0
     
-    def get_learning_based_signal_score_threshold(self) -> float:
-        """학습 기반 시그널 점수 임계값 반환"""
-        if not self.use_learning_based_thresholds or self.learning_feedback is None:
+    def get_learning_based_signal_score_threshold(self, coin: str = None, interval: str = None) -> float:
+        """학습 및 캔들 신뢰도 기반 시그널 점수 임계값 반환"""
+        try:
+            # 🆕 설계 반영: 코인이 지정된 경우 캔들 기반 동적 임계값 우선 사용 (자율 주행)
+            if coin and interval:
+                # 1. 캔들 대조 신뢰도 가져오기 (DBLoaderMixin에서 구현됨)
+                reliability = 0.5
+                if hasattr(self, 'get_candle_based_reliability'):
+                    reliability = self.get_candle_based_reliability(coin, interval)
+                
+                # 2. 신뢰도에 따른 임계값 매핑 (Inverse Mapping)
+                # 신뢰도가 높을수록(예측이 잘 맞을수록) 문턱값을 낮춤 (공격적)
+                # 신뢰도가 낮을수록(예측이 자꾸 틀릴수록) 문턱값을 높임 (보수적)
+                
+                # Reliability 0.8+ -> 0.15 (매우 공격적)
+                # Reliability 0.6  -> 0.22
+                # Reliability 0.5  -> 0.30 (표준)
+                # Reliability 0.3  -> 0.38
+                # Reliability 0.1- -> 0.45 (매우 보수적)
+                
+                if reliability >= 0.8: return 0.15
+                if reliability >= 0.6: return 0.22
+                if reliability >= 0.45: return 0.30
+                if reliability >= 0.3: return 0.38
+                return 0.45
+
+            # Fallback: 기존 로직
+            if not self.use_learning_based_thresholds or self.learning_feedback is None:
+                return self.min_signal_score
+            
+            # 학습 피드백에 따른 동적 조정
+            win_rate = self.learning_feedback.get('win_rate', 0.5)
+            total_trades = self.learning_feedback.get('total_trades', 0)
+            
+            if total_trades < 10:
+                return self.min_signal_score
+            
+            if win_rate < 0.4:
+                return min(0.4, self.min_signal_score + 0.1)
+            elif win_rate > 0.6:
+                return max(0.15, self.min_signal_score - 0.05)
             return self.min_signal_score
-        
-        # 학습 피드백에 따른 동적 조정
-        win_rate = self.learning_feedback.get('win_rate', 0.5)
-        total_trades = self.learning_feedback.get('total_trades', 0)
-        
-        # 최소 10개 거래가 있어야 신뢰할 수 있음
-        if total_trades < 10:
-            return self.min_signal_score
-        
-        # 승률에 따른 조정
-        if win_rate < 0.4:  # 성과 나쁨 → 더 엄격하게
-            return min(0.15, self.min_signal_score + 0.05)
-        elif win_rate > 0.6:  # 성과 좋음 → 적당히 완화
-            return max(0.03, self.min_signal_score - 0.02)
-        else:  # 중간 성과
-            return self.min_signal_score
+        except Exception:
+            return 0.30 # 기본값
     
     def _get_integrated_analysis_score(self, coin: str, interval: str, candle: pd.Series, market_condition: str) -> float:
         """🔥 RL Pipeline 통합 분석 점수 계산 (저장된 분석 결과 활용)"""
@@ -1217,15 +1340,29 @@ class ScoringMixin:
                     age_hours = (datetime.now() - created_at).total_seconds() / 3600
                     
                     if age_hours < 1.0:  # 1시간 이내면 사용
-                        final_score = analysis_result.get('final_signal_score', 0.5)
-                        signal_confidence = analysis_result.get('signal_confidence', 0.5)
-                        
-                        # 신뢰도 기반 보정
+                        # 🔍 신뢰도/품질 필터링 강화 (저품질 데이터는 중립으로)
+                        final_score = analysis_result.get('final_signal_score', analysis_result.get('ensemble_score', 0.5))
+                        signal_confidence = analysis_result.get('signal_confidence', analysis_result.get('ensemble_confidence', 0.5))
+
+                        # 🔧 신뢰도 낮거나 점수가 극단적으로 낮으면 중립 처리 (기준 완화)
+                        # - 기존: 신뢰도 < 0.55 또는 점수 <= 0.35 → 거의 모든 점수가 0.5로 중립화
+                        # - 변경: 신뢰도 < 0.30 또는 점수 <= 0.10 → 극단적 저품질만 필터링
+                        if signal_confidence < 0.30 or final_score <= 0.10:
+                            if self.debug_mode:
+                                logger.debug(f"⚠️ 통합 분석 결과 무시 (신뢰도 {signal_confidence:.2f}, 점수 {final_score:.3f}) -> 0.5로 중립화")
+                            return 0.5
+
                         confidence_weight = min(1.0, signal_confidence)
                         adjusted_score = 0.5 + (final_score - 0.5) * confidence_weight
-                        
+
+                        # 🔧 유효 신호가 아니면 중립화 (기준 완화: 0.1 → 0.02)
+                        # - 기존: 0.4~0.6 범위 모두 중립화 → 유의미한 신호 무시
+                        # - 변경: 0.48~0.52 범위만 중립화 → 실제 중립 신호만 필터링
+                        if abs(adjusted_score - 0.5) < 0.02:
+                            return 0.5
+
                         if self.debug_mode:
-                            logger.debug(f"🔥 저장된 분석 결과 사용: {cache_key} (점수: {final_score:.3f}, 신뢰도: {signal_confidence:.3f})")
+                            logger.debug(f"🔥 저장된 분석 결과 사용: {cache_key} (점수: {final_score:.3f}, 신뢰도: {signal_confidence:.3f}, 보정 후 {adjusted_score:.3f})")
                         
                         return adjusted_score
                 except Exception as e:
@@ -1234,25 +1371,35 @@ class ScoringMixin:
             
             # 🔥 2단계: 실시간 로드 시도 (캐시 미스 시)
             try:
-                import sys
-                import os
-                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+                # 🚀 트레이딩 엔진 전용 DB 유틸리티 사용 (rl_pipeline 의존성 제거)
+                try:
+                    from trade.core.database import get_learning_data
+                except ImportError:
+                    from core.database import get_learning_data
                 
-                from rl_pipeline.db.learning_results import load_integrated_analysis_results
-                
-                analysis_result = load_integrated_analysis_results(coin, interval)
+                analysis_result = get_learning_data(coin, interval, 'integrated_analysis_results')
                 if analysis_result:
                     # 캐시에 저장
                     self.integrated_analysis_cache[cache_key] = analysis_result
                     
-                    final_score = analysis_result.get('final_signal_score', 0.5)
-                    signal_confidence = analysis_result.get('signal_confidence', 0.5)
+                    final_score = analysis_result.get('final_signal_score', analysis_result.get('ensemble_score', 0.5))
+                    signal_confidence = analysis_result.get('signal_confidence', analysis_result.get('ensemble_confidence', 0.5))
+
+                    # 🔧 신뢰도/점수 품질 필터링 (기준 완화)
+                    if signal_confidence < 0.30 or final_score <= 0.10:
+                        if self.debug_mode:
+                            logger.debug(f"⚠️ 통합 분석 결과 무시 (신뢰도 {signal_confidence:.2f}, 점수 {final_score:.3f}) -> 0.5로 중립화")
+                        return 0.5
                     
                     confidence_weight = min(1.0, signal_confidence)
                     adjusted_score = 0.5 + (final_score - 0.5) * confidence_weight
+
+                    # 🔧 유효 신호 판단 기준 완화 (0.1 → 0.02)
+                    if abs(adjusted_score - 0.5) < 0.02:
+                        return 0.5
                     
                     if self.debug_mode:
-                        logger.debug(f"🔥 실시간 분석 결과 로드: {cache_key} (점수: {final_score:.3f})")
+                        logger.debug(f"🔥 실시간 분석 결과 로드: {cache_key} (점수: {final_score:.3f}, 신뢰도: {signal_confidence:.3f}, 보정 후 {adjusted_score:.3f})")
                     
                     return adjusted_score
             except Exception as e:
@@ -1287,9 +1434,16 @@ class ScoringMixin:
                     else:
                         pass  # 정상 진행
                         
-                    with sqlite3.connect(learning_db_path) as conn:
+                    # 🚀 [Fix] 직접적인 sqlite3.connect 대신 엔진 공용 DB 유틸리티 사용 (잠금 방지)
+                    from trade.core.database import get_db_connection
+                    with get_db_connection(learning_db_path, read_only=True) as conn:
                         cursor = conn.cursor()
                         
+                        # 테이블 존재 여부 확인 (에러 방지)
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_summary_for_signals'")
+                        if not cursor.fetchone():
+                            return 0.5
+                            
                         cursor.execute("""
                             SELECT top_strategy_id, top_strategy_params, top_profit, top_win_rate,
                                    top_quality_grade, avg_profit, avg_win_rate
@@ -1420,7 +1574,7 @@ class ScoringMixin:
                     if self.debug_mode:
                         logger.debug(f"⚠️ 전략 로드 실패: {e}")
                 
-                # 통합 분석 실행 (전략이 있는 경우만)
+                    # 통합 분석 실행 (전략이 있는 경우만)
                 if strategies:
                     signal_result = self.integrated_analyzer.analyze_coin_strategies(
                         coin=coin,
@@ -1430,7 +1584,13 @@ class ScoringMixin:
                         candle_data=candle_df
                     )
                     
-                    return signal_result.final_signal_score
+                    # 🚀 [Fix] 폴백 경로에도 품질 필터 적용
+                    final_score = signal_result.final_signal_score
+                    if final_score <= 0.35:
+                        if self.debug_mode:
+                            print(f"  [Fallback Filter] Neutralizing low score {final_score:.3f} for {coin}/{interval}")
+                        return 0.5
+                    return final_score
             
             # 최종 폴백: 중립 점수
             return 0.5

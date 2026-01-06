@@ -7,11 +7,74 @@ import logging
 import sqlite3
 import json
 import os
+import time
+import random
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 🔒 파일 락 유틸리티 (Docker 볼륨 마운트 환경에서 동시 접근 방지)
+# ============================================================================
+
+def _get_lock_path(db_path: str) -> str:
+    """락 파일 경로 반환"""
+    return f"{db_path}.process_lock"
+
+def _acquire_file_lock(db_path: str, timeout: int = 60) -> bool:
+    """파일 락 획득 (간단한 파일 존재 여부 기반)"""
+    lock_path = _get_lock_path(db_path)
+    start_time = time.time()
+    pid = os.getpid()
+    
+    while time.time() - start_time < timeout:
+        try:
+            # 락 파일이 있으면 대기
+            if os.path.exists(lock_path):
+                # 락 파일이 오래됐으면 (60초 이상) 강제 삭제
+                try:
+                    lock_age = time.time() - os.path.getmtime(lock_path)
+                    if lock_age > 60:
+                        os.remove(lock_path)
+                        logger.debug(f"🔓 오래된 락 파일 삭제: {lock_path}")
+                except:
+                    pass
+                
+                # 잠시 대기 후 재시도
+                time.sleep(0.5 + random.random())
+                continue
+            
+            # 락 파일 생성 시도
+            with open(lock_path, 'w') as f:
+                f.write(f"{pid}:{time.time()}")
+            
+            # 경쟁 조건 방지: 잠시 대기 후 자신의 락인지 확인
+            time.sleep(0.1)
+            try:
+                with open(lock_path, 'r') as f:
+                    content = f.read()
+                    if content.startswith(f"{pid}:"):
+                        return True
+            except:
+                pass
+            
+        except Exception as e:
+            logger.debug(f"⚠️ 락 획득 중 오류: {e}")
+            time.sleep(0.5)
+    
+    logger.warning(f"⚠️ 락 획득 타임아웃 ({timeout}초): {db_path}")
+    return False
+
+def _release_file_lock(db_path: str):
+    """파일 락 해제"""
+    lock_path = _get_lock_path(db_path)
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception as e:
+        logger.debug(f"⚠️ 락 해제 중 오류: {e}")
 
 # DB 경로 - learning_results.db는 이제 learning_strategies.db로 통합됨
 # config에서 LEARNING_RESULTS_DB_PATH = STRATEGIES_DB로 설정됨
@@ -52,7 +115,7 @@ LEARNING_RESULTS_DB_PATH = _get_initial_db_path()
 
 @contextmanager
 def get_learning_db_connection(db_path: str = None):
-    """learning_results.db 연결 관리"""
+    """learning_results.db 연결 관리 (파일 락 포함)"""
     if db_path is None:
         db_path = get_learning_results_db_path()
     
@@ -72,21 +135,63 @@ def get_learning_db_connection(db_path: str = None):
         except Exception as e:
             logger.warning(f"⚠️ DB 디렉토리 생성 실패 ({db_dir}): {e}")
     
+    # 🔒 파일 락 획득 (동시 접근 방지)
+    lock_acquired = _acquire_file_lock(db_path, timeout=120)
+    if not lock_acquired:
+        logger.warning(f"⚠️ 파일 락 획득 실패, 락 없이 진행: {db_path}")
+    
     conn = None
+    max_retries = 5
+    last_error = None
+    
     try:
-        conn = sqlite3.connect(db_path, timeout=60.0)
-        conn.execute("PRAGMA busy_timeout=60000")
-        conn.row_factory = sqlite3.Row
-        yield conn
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        # 🔥 실제 경로를 에러 메시지에 포함
-        logger.error(f"❌ learning_results DB 연결 실패 ({db_path}): {e}")
-        raise
+        # 연결 시도 (재시도 로직)
+        for attempt in range(max_retries):
+            try:
+                conn = sqlite3.connect(db_path, timeout=180.0, isolation_level=None)
+                # 🔥 WAL 모드 사용 (동시 접근 지원)
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                except:
+                    conn.execute("PRAGMA journal_mode=DELETE")
+                conn.execute("PRAGMA mmap_size=0")
+                conn.execute("PRAGMA busy_timeout=180000")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA wal_autocheckpoint=100")
+                conn.row_factory = sqlite3.Row
+                break
+            except Exception as e:
+                last_error = e
+                if conn:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    conn = None
+                
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"⚠️ learning_results DB 연결 재시도 ({attempt + 1}/{max_retries}): {db_path}")
+                    time.sleep(wait_time)
+        
+        # 모든 재시도 실패 시
+        if conn is None:
+            logger.error(f"❌ learning_results DB 연결 실패 ({db_path}): {last_error}")
+            _release_file_lock(db_path)  # 락 해제
+            raise last_error if last_error else Exception(f"DB 연결 실패: {db_path}")
+        
+        try:
+            yield conn
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
     finally:
-        if conn:
-            conn.close()
+        # 🔓 파일 락 해제 (항상 실행)
+        _release_file_lock(db_path)
 
 def create_learning_results_tables(db_path: str = None) -> bool:
     """learning_strategies.db에 learning_results 테이블 생성 (통합됨)
@@ -1522,7 +1627,7 @@ def load_global_strategies_from_db(interval: str = None, db_path: str = None) ->
                 cursor.execute("""
                     SELECT id, symbol, interval, strategy_type, params, name, description,
                            profit, profit_factor, win_rate, trades_count, quality_grade,
-                           market_condition, created_at, updated_at, meta
+                           market_condition, regime, created_at, updated_at, meta
                     FROM global_strategies
                     WHERE interval = ?
                     ORDER BY created_at DESC
@@ -1531,7 +1636,7 @@ def load_global_strategies_from_db(interval: str = None, db_path: str = None) ->
                 cursor.execute("""
                     SELECT id, symbol, interval, strategy_type, params, name, description,
                            profit, profit_factor, win_rate, trades_count, quality_grade,
-                           market_condition, created_at, updated_at, meta
+                           market_condition, regime, created_at, updated_at, meta
                     FROM global_strategies
                     ORDER BY created_at DESC
                 """)
@@ -1553,9 +1658,10 @@ def load_global_strategies_from_db(interval: str = None, db_path: str = None) ->
                         'trades_count': row[10] or 0,
                         'quality_grade': row[11] or 'A',
                         'market_condition': row[12] or 'neutral',
-                        'created_at': row[13],
-                        'updated_at': row[14],
-                        'meta': json.loads(row[15]) if row[15] else {}
+                        'regime': row[13] or 'neutral',
+                        'created_at': row[14],
+                        'updated_at': row[15],
+                        'meta': json.loads(row[16]) if row[16] else {}
                     }
                     strategies.append(strategy)
                 except Exception as e:

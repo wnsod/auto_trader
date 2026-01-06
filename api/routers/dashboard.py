@@ -27,7 +27,20 @@ router = APIRouter(
 )
 
 # LLM Store 초기화
-llm_store = ConversationStore()
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+LLM_DB_PATH = os.path.join(BASE_DIR, "llm_factory", "store", "conversation.db")
+print(f"DEBUG: LLM_DB_PATH = {LLM_DB_PATH}")
+llm_store = ConversationStore(db_path=LLM_DB_PATH)
+
+# --- LLM 대화 응답 모델 ---
+class LLMMessage(BaseModel):
+    timestamp: str
+    sender: str
+    message: str
+    mood: Optional[str] = "neutral"  # happy, sad, thinking, neutral
+
+class LLMConversationsResponse(BaseModel):
+    messages: List[LLMMessage]
 
 # DB 경로 매핑
 DB_PATHS = {
@@ -124,6 +137,10 @@ class TradeLog(BaseModel):
     profit_amt: Optional[str] = None
     holding_time: Optional[str] = None
     confidence_level: Optional[str] = None # 🆕 확신도 레벨 (High/Medium/Low)
+    ai_score: Optional[float] = None
+    fractal_score: Optional[float] = None
+    mtf_score: Optional[float] = None
+    cross_score: Optional[float] = None
 
 class PositionItem(BaseModel):
     symbol: str
@@ -137,6 +154,11 @@ class PositionItem(BaseModel):
     target_price: Optional[str] = None 
     stop_loss_price: Optional[str] = None
     max_profit_pct: Optional[float] = None
+    ai_score: Optional[float] = None
+    ai_reason: Optional[str] = None
+    fractal_score: Optional[float] = None
+    mtf_score: Optional[float] = None
+    cross_score: Optional[float] = None
 
 class MarketStats(BaseModel):
     total_pnl: str
@@ -157,6 +179,7 @@ class GlobalStatus(BaseModel):
     market_regime: str = "Neutral"
     scanning_coins: str = ""
     news_headlines: List[str] = []
+    guardian_opinion: Optional[str] = None # 🆕 알파 가디언의 한마디 (Raw 데이터)
 
 # --- Helper Functions ---
 def get_market_info(market_id: str):
@@ -171,6 +194,108 @@ def get_market_info(market_id: str):
     return info.get(market_id, (market_id, "Unknown", "system"))
 
 # --- Endpoints ---
+
+@router.get("/latest-decisions")
+def get_latest_guardian_decisions(limit: int = 10):
+    """🆕 알파 가디언의 최신 가상매매 결정 및 분석 근거 조회 (LLM용)"""
+    db_path = DB_PATHS.get("crypto")
+    db = get_db_connection(db_path) if db_path else None
+    results = []
+    
+    if db:
+        try:
+            # 🆕 신규 컬럼(ai_score, ai_reason) 존재 여부 확인 후 조회
+            cursor = db.cursor()
+            cursor.execute("PRAGMA table_info(virtual_trade_decisions)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            query = "SELECT coin, decision, signal_score, timestamp, reason"
+            if 'ai_score' in columns: query += ", ai_score"
+            if 'ai_reason' in columns: query += ", ai_reason"
+            query += " FROM virtual_trade_decisions ORDER BY timestamp DESC LIMIT ?"
+            
+            cur = db.execute(query, (limit,))
+            for row in cur.fetchall():
+                res = {
+                    "coin": row['coin'],
+                    "kor_name": get_korean_name(row['coin']),
+                    "decision": row['decision'],
+                    "timestamp": row['timestamp'],
+                    "system_reason": row['reason']
+                }
+                if 'ai_score' in columns: res["ai_score"] = row['ai_score']
+                if 'ai_reason' in columns: res["ai_reason"] = row['ai_reason']
+                results.append(res)
+        except Exception as e:
+            logger.error(f"Error fetching latest decisions: {e}")
+        finally:
+            db.close()
+    return results
+
+@router.get("/llm-conversations", response_model=LLMConversationsResponse)
+def get_llm_conversations(limit: int = 20):
+    """🆕 LLM 에이전트들의 대화 로그 조회 (System Intelligence 패널용)"""
+    messages = []
+    
+    try:
+        # 최근 메시지 조회 (모든 에이전트)
+        recent_msgs = llm_store.get_recent_messages(limit=limit)
+        
+        # 발신자별 이름 및 이모지 매핑
+        sender_map = {
+            "agent_coin": ("Crypto Cat", "thinking"),
+            "agent_news": ("News Analyst", "neutral"),
+            "agent_kr_stock": ("Tiger Cat", "neutral"),
+            "agent_us_stock": ("Eagle Cat", "neutral"),
+            "orchestrator": ("Orchestrator", "neutral"),
+        }
+        
+        for msg in reversed(recent_msgs):  # 시간순 정렬
+            try:
+                sender_key = msg.get('sender', 'system')
+                sender_info = sender_map.get(sender_key, (sender_key, "neutral"))
+                
+                # 메시지 내용 파싱
+                content = json.loads(msg.get('content', '{}'))
+                summary = content.get('summary', '')
+                
+                # summary가 없으면 다른 필드에서 추출
+                if not summary:
+                    if 'regime' in content:
+                        summary = f"시장 레짐: {content['regime']}, 리스크: {content.get('risk_level', 'unknown')}"
+                    elif 'impact_score' in content:
+                        score = content['impact_score']
+                        summary = f"뉴스 영향도: {score:+.1f} - {content.get('original_headline', '')[:30]}..."
+                    else:
+                        summary = str(content)[:50]
+                
+                # 감정/분위기 결정
+                mood = sender_info[1]
+                if 'risk_level' in content:
+                    if content['risk_level'] == 'high':
+                        mood = "sad"
+                    elif content['risk_level'] == 'low':
+                        mood = "happy"
+                
+                # 타임스탬프 포맷
+                ts = msg.get('timestamp', '')
+                if 'T' in ts:
+                    ts = ts.split('T')[1][:5]  # HH:MM만 추출
+                
+                messages.append(LLMMessage(
+                    timestamp=ts,
+                    sender=sender_info[0],
+                    message=summary,
+                    mood=mood
+                ))
+            except Exception as e:
+                logger.warning(f"Message parsing error: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"LLM Conversations Error: {e}")
+    
+    return LLMConversationsResponse(messages=messages)
 
 @router.get("/coin-names", response_model=Dict[str, str])
 def get_coin_names():
@@ -284,15 +409,41 @@ def get_market_character(market_id: str):
                 if row: market_regime = row['value']
             except: pass
 
-            if is_active:
-                # History 요약 (간단히 승률 계산용 데이터 필요하지만 여기선 생략하거나 간단히 처리)
-                # 실제로는 PositionsResponse와 중복 쿼리가 발생할 수 있지만, 분리된 API의 특성상 감수
-                emotion, dialogue = persona_engine.determine_reaction(
-                    positions=positions, # 간단한 딕셔너리 리스트로 전달 호환성 체크 필요
-                    history=[], 
-                    thinking_log=thinking_log,
-                    market_regime=market_regime
-                )
+            # 🆕 LLM 에이전트 결과 우선 반영 (직접 DB 조회)
+            try:
+                # DB 경로 직접 지정 (BASE_DIR은 상단에 정의됨)
+                llm_db_path = os.path.join(BASE_DIR, "llm_factory", "store", "conversation.db")
+                
+                agent_name = f"agent_{market_id}"
+                if market_id == 'crypto': agent_name = 'agent_coin'
+                elif market_id == 'kr_stock': agent_name = 'agent_kr_stock'
+                elif market_id == 'us_stock': agent_name = 'agent_us_stock'
+                
+                if os.path.exists(llm_db_path):
+                    with sqlite3.connect(llm_db_path) as llm_conn:
+                        llm_conn.row_factory = sqlite3.Row
+                        llm_cur = llm_conn.execute(
+                            "SELECT content FROM messages WHERE sender = ? ORDER BY id DESC LIMIT 1", 
+                            (agent_name,)
+                        )
+                        llm_row = llm_cur.fetchone()
+                        
+                        # DEBUG PRINT
+                        print(f"DEBUG: Path={llm_db_path}, Agent={agent_name}, Row={llm_row}")
+                        
+                        if llm_row:
+                            print(f"DEBUG: Content={llm_row['content']}")
+                            content = json.loads(llm_row['content'])
+                            if content.get('summary'):
+                                dialogue = content['summary']
+                                # 리스크/레짐에 따른 감정
+                                if content.get('risk_level') == 'high': emotion = "sad"
+                                elif content.get('regime', '').lower() in ['bull', 'risk-on']: emotion = "happy"
+                                else: emotion = "neutral"
+                                is_active = True
+            except Exception as e:
+                # logger.warning(f"LLM Direct Query Error: {e}")
+                pass
         except Exception as e:
             # print(f"[{market_id}] Character Error: {e}")
             pass
@@ -334,10 +485,10 @@ def get_market_logs(market_id: str):
             
             # 1. Trade History (Closed)
             try:
-                # 🆕 signal_pattern, entry_confidence 조회 추가
+                # 🆕 ai_reason, ai_score, fractal_score, mtf_score, cross_score 조회 추가
                 cur = db.execute("""
                     SELECT created_at, action, coin, profit_loss_pct, entry_price, exit_price, entry_timestamp, exit_timestamp, 
-                           signal_pattern, entry_confidence
+                           signal_pattern, entry_confidence, ai_reason, ai_score, fractal_score, mtf_score, cross_score
                     FROM virtual_trade_history 
                     ORDER BY created_at DESC LIMIT 10
                 """)
@@ -353,6 +504,7 @@ def get_market_logs(market_id: str):
                     # 🆕 패턴/확신도 파싱 및 고급 스토리 생성
                     pattern = row.get('signal_pattern', 'unknown')
                     confidence = row.get('entry_confidence', 0.0)
+                    ai_reason = row.get('ai_reason', '')
                     
                     # 확신도 레벨 변환
                     conf_level = "Low"
@@ -363,8 +515,12 @@ def get_market_logs(market_id: str):
                         # [Trade Log] 매수 진입 - 스토리 생성
                         clean_msg = raw_action.replace('buy', '').replace('|', '').strip()
                         
-                        # 요약 메시지 생성 (패턴 기반 - 전문적 표현)
-                        summary = "AI 매수 시그널 포착"
+                        # 요약 메시지 생성 (AI 분석 사유 최우선 활용)
+                        summary = ai_reason if ai_reason else "AI 매수 시그널 포착"
+                        
+                        # ai_reason이 너무 길면 줄임
+                        if len(summary) > 50:
+                            summary = summary[:47] + "..."
                         
                         # 패턴 매핑 (고도화)
                         pattern_map = {
@@ -396,7 +552,11 @@ def get_market_logs(market_id: str):
                                 symbol=row['coin'],
                                 action_type="buy",
                                 roi=None,
-                                confidence_level=conf_level
+                                confidence_level=conf_level,
+                                ai_score=row.get('ai_score', 0.0),
+                                fractal_score=row.get('fractal_score', 0.5),
+                                mtf_score=row.get('mtf_score', 0.5),
+                                cross_score=row.get('cross_score', 0.5)
                             )
                         })
                     else:
@@ -445,7 +605,11 @@ def get_market_logs(market_id: str):
                                 entry_price=str(entry_pr) if 'entry_pr' in locals() else "", 
                                 exit_price=str(exit_pr) if 'exit_pr' in locals() else "",
                                 holding_time=holding_str,
-                                confidence_level=conf_level
+                                confidence_level=conf_level,
+                                ai_score=row.get('ai_score', 0.0),
+                                fractal_score=row.get('fractal_score', 0.5),
+                                mtf_score=row.get('mtf_score', 0.5),
+                                cross_score=row.get('cross_score', 0.5)
                             )
                         })
             except: pass
@@ -534,10 +698,10 @@ def get_market_positions(market_id: str):
             except: pass
 
             # Positions
-            # 🆕 target_price, stop_loss_price, max_profit_pct 추가 조회
+            # 🆕 target_price, stop_loss_price, max_profit_pct, fractal_score, mtf_score, cross_score 추가 조회
             cur = db.execute("""
                 SELECT coin, profit_loss_pct, entry_price, current_price, entry_timestamp, holding_duration,
-                       target_price, stop_loss_price, max_profit_pct
+                       target_price, stop_loss_price, max_profit_pct, fractal_score, mtf_score, cross_score, ai_score, ai_reason
                 FROM virtual_positions 
                 ORDER BY profit_loss_pct DESC
             """)
@@ -569,7 +733,12 @@ def get_market_positions(market_id: str):
                     status=status,
                     target_price=str(tp) if tp else None,
                     stop_loss_price=str(sl) if sl else None,
-                    max_profit_pct=row.get('max_profit_pct', 0.0)
+                    max_profit_pct=row.get('max_profit_pct', 0.0),
+                    ai_score=row.get('ai_score', 0.0),
+                    ai_reason=row.get('ai_reason', ''),
+                    fractal_score=row.get('fractal_score', 0.5),
+                    mtf_score=row.get('mtf_score', 0.5),
+                    cross_score=row.get('cross_score', 0.5)
                 ))
             
             # Update Active Count
@@ -580,27 +749,74 @@ def get_market_positions(market_id: str):
                     active_count=f"Act {len(positions)}", total_trades="-"
                 )
 
-            # History (Recent Closed)
+            # History (24시간 이내 매매 내역)
             try:
-                hist_cur = db.execute("""
-                    SELECT coin, entry_price, exit_price, entry_time, exit_time, pnl, roi, holding_time 
-                    FROM virtual_trade_history 
-                    ORDER BY exit_time DESC LIMIT 20
-                """)
+                from datetime import datetime, timedelta
+                # 24시간 전 타임스탬프 (초 단위)
+                twenty_four_hours_ago_ts = int((datetime.now() - timedelta(hours=24)).timestamp())
+                # 24시간 전 시간 문자열 (YYYY-MM-DD HH:MM:SS 형식)
+                twenty_four_hours_ago_str = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+                
+                # 먼저 테이블 구조 확인 (PRAGMA로 컬럼 확인)
+                table_info = db.execute("PRAGMA table_info(virtual_trade_history)").fetchall()
+                columns = [col[1] for col in table_info]
+                has_exit_timestamp = 'exit_timestamp' in columns
+                
+                if has_exit_timestamp:
+                    # exit_timestamp가 숫자(타임스탬프)인 경우
+                    # 🆕 fractal_score, mtf_score, cross_score, ai_score, ai_reason 추가 조회
+                    hist_cur = db.execute("""
+                        SELECT coin, entry_price, exit_price, entry_time, exit_time, pnl, roi, holding_time, exit_timestamp,
+                               fractal_score, mtf_score, cross_score, ai_score, ai_reason
+                        FROM virtual_trade_history 
+                        WHERE exit_timestamp >= ?
+                        ORDER BY exit_timestamp DESC LIMIT 50
+                    """, (twenty_four_hours_ago_ts,))
+                else:
+                    # exit_time이 문자열인 경우
+                    # 🆕 fractal_score, mtf_score, cross_score, ai_score, ai_reason 추가 조회
+                    hist_cur = db.execute("""
+                        SELECT coin, entry_price, exit_price, entry_time, exit_time, pnl, roi, holding_time,
+                               fractal_score, mtf_score, cross_score, ai_score, ai_reason
+                        FROM virtual_trade_history 
+                        WHERE exit_time >= ?
+                        ORDER BY exit_time DESC LIMIT 50
+                    """, (twenty_four_hours_ago_str,))
+                
                 for row in hist_cur.fetchall():
                     roi_val = row['roi']
                     entry_time_str = str(row['entry_time'])
+                    exit_time_str = str(row['exit_time'])
+                    
+                    # 시간 포맷팅
+                    if ' ' in entry_time_str:
+                        entry_time_display = entry_time_str.split(' ')[1][:5]
+                    elif 'T' in entry_time_str:
+                        entry_time_display = entry_time_str.split('T')[1][:5]
+                    else:
+                        entry_time_display = entry_time_str[:5] if len(entry_time_str) >= 5 else entry_time_str
+                    
                     history.append(PositionItem(
                         symbol=row['coin'],
                         kor_name=get_korean_name(row['coin']),
                         roi=round(roi_val, 2) if roi_val is not None else 0.0,
                         entry_price=f"{row['entry_price']:.4f}",
                         current_price=f"{row['exit_price']:.4f}",
-                        entry_time=entry_time_str.split(' ')[1][:5] if ' ' in entry_time_str else entry_time_str[:5],
-                        holding_time=row['holding_time'],
-                        status="closed"
+                        entry_time=entry_time_display,
+                        holding_time=row['holding_time'] if row.get('holding_time') else "-",
+                        status="closed",
+                        ai_score=row.get('ai_score', 0.0),
+                        ai_reason=row.get('ai_reason', ''),
+                        fractal_score=row.get('fractal_score', 0.5),
+                        mtf_score=row.get('mtf_score', 0.5),
+                        cross_score=row.get('cross_score', 0.5)
                     ))
-            except: pass
+            except Exception as e:
+                # 디버깅용 에러 출력
+                import traceback
+                print(f"[{market_id}] History fetch error: {e}")
+                print(f"[{market_id}] Traceback: {traceback.format_exc()}")
+                pass
             
         except Exception as e:
             # print(f"[{market_id}] Positions Error: {e}")

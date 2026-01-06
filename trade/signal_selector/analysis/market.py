@@ -177,47 +177,38 @@ class MarketAnalysisMixin:
         return weights
 
     def get_volatility_based_thresholds(self, coin: str) -> dict:
-        """🆕 변동성 그룹에 따른 동적 액션 임계값 반환
+        """🆕 변동성 그룹 및 자율 신뢰도 기반 동적 액션 임계값 반환"""
+        try:
+            # 1. 자율 주행 엔진에서 베이스 문턱값 가져오기 (캔들 신뢰도 연동)
+            base_threshold = 0.30
+            if hasattr(self, 'get_learning_based_signal_score_threshold'):
+                # 통합 시그널 판단을 위한 베이스 문턱값 조회
+                base_threshold = self.get_learning_based_signal_score_threshold(coin, 'combined')
 
-        변동성별 전략:
-        - LOW (BTC): 엄격한 임계값 (강한 신호만 반응)
-        - MEDIUM (ETH, BNB): 중간 임계값
-        - HIGH (ADA, SOL): 완화된 임계값 (빠른 반응)
-        - VERY_HIGH (DOGE): 매우 완화된 임계값 (즉각 반응)
-        """
-        vol_group = self.get_coin_volatility_group(coin)
+            vol_group = self.get_coin_volatility_group(coin)
 
-        if vol_group == 'LOW':
-            # LOW 변동성: 엄격한 임계값 (BTC - 안정적이므로 강한 신호만)
+            # 2. 변동성 그룹별 조정 계수 적용
+            if vol_group == 'LOW':
+                multiplier = 1.5  # BTC 등은 더 확실한 신호 필요
+            elif vol_group == 'MEDIUM':
+                multiplier = 1.0  # ETH 등은 표준
+            elif vol_group == 'HIGH':
+                multiplier = 0.7  # SOL 등은 더 공격적으로
+            else:  # VERY_HIGH
+                multiplier = 0.5  # 밈코인 등은 즉각 반응
+
+            # 최종 임계값 산출 (최소 0.1, 최대 0.6 범위 제한)
+            adj_threshold = max(0.1, min(0.6, base_threshold * multiplier))
+            
             return {
-                'strong_buy': 0.6,
-                'weak_buy': 0.3,
-                'weak_sell': -0.3,
-                'strong_sell': -0.6
+                'strong_buy': adj_threshold * 2.0,
+                'weak_buy': adj_threshold,
+                'weak_sell': -adj_threshold,
+                'strong_sell': -adj_threshold * 2.0
             }
-        elif vol_group == 'MEDIUM':
-            # MEDIUM 변동성: 중간 임계값 (ETH, BNB - 균형)
+        except Exception:
             return {
-                'strong_buy': 0.5,
-                'weak_buy': 0.2,
-                'weak_sell': -0.2,
-                'strong_sell': -0.5
-            }
-        elif vol_group == 'HIGH':
-            # HIGH 변동성: 완화된 임계값 (ADA, SOL, AVAX - 빠른 반응)
-            return {
-                'strong_buy': 0.4,
-                'weak_buy': 0.15,
-                'weak_sell': -0.15,
-                'strong_sell': -0.4
-            }
-        else:  # VERY_HIGH
-            # VERY_HIGH 변동성: 매우 완화된 임계값 (DOGE - 즉각 반응)
-            return {
-                'strong_buy': 0.3,
-                'weak_buy': 0.1,
-                'weak_sell': -0.1,
-                'strong_sell': -0.3
+                'strong_buy': 0.5, 'weak_buy': 0.25, 'weak_sell': -0.25, 'strong_sell': -0.5
             }
 
     def _detect_simple_market_condition(self, coin: str, interval: str) -> str:
@@ -427,8 +418,9 @@ class MarketAnalysisMixin:
     def _get_market_context(self, coin: str, interval: str) -> dict:
         """🆕 시장 상황 분석"""
         try:
-            # 기준 코인(환경/DB) 시장 상황 분석
-            btc_signal = self.get_cached_data(f"signal_BTC_{interval}", max_age=300)
+            # [엔진화] 하드코딩된 BTC 대신 환경변수 또는 DB의 대장 코인 시그널 사용
+            leader_coin = os.getenv('MARKET_LEADER', 'BTC')
+            btc_signal = self.get_cached_data(f"signal_{leader_coin}_{interval}", max_age=300)
             
             if btc_signal:
                 signal_score = btc_signal.signal_score
@@ -664,55 +656,34 @@ class MarketAnalysisMixin:
 
     # 🆕 개선된 다이버전스 계산 함수 추가
     def detect_current_market_condition(self, coin: str, interval: str) -> str:
-        """실시간 시장 상황 감지"""
+        """🆕 설계 반영: 캔들 DB에서 공인된 BTC 7단계 레짐 정보를 직접 로드 (계산 로직 통합)"""
         try:
-            # 최근 캔들 데이터 로드
-            df = self.get_cached_data(f"{coin}_{interval}_candles", max_age=300)
-            if df is None or df.empty:
-                return "unknown"
+            # 🎯 DB에서 최신 공인 레짐 로드 시도
+            regime = 'neutral'
             
-            # 최근 20개 캔들 기준으로 분석
-            recent_df = df.tail(20)
+            try:
+                with sqlite3.connect(CANDLES_DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    # [엔진화] 하드코딩된 BTC 대신, DB에서 가장 최신 레짐 데이터가 있는 대표 코인을 찾음
+                    cursor.execute("""
+                        SELECT regime_label, symbol FROM candles 
+                        WHERE regime_label IS NOT NULL
+                        ORDER BY timestamp DESC, volume DESC LIMIT 1
+                    """)
+                    row = cursor.fetchone()
+                    if row:
+                        regime = str(row[0] or 'neutral').lower().replace(' ', '_')
+            except Exception:
+                # DB 조회 실패 시 analyzer 폴백
+                if hasattr(self, 'market_regime_manager'):
+                    info = self.market_regime_manager.analyze_market_regime()
+                    regime = info.get('regime', 'neutral').lower().replace(' ', '_')
             
-            # 가격 변화율 계산
-            price_changes = recent_df['close'].pct_change().dropna()
-            
-            # 이동평균 계산
-            ma_short = recent_df['close'].rolling(window=5).mean()
-            ma_long = recent_df['close'].rolling(window=20).mean()
-            
-            # RSI 계산
-            delta = recent_df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            current_rsi = rsi.iloc[-1]
-            
-            # 변동성 계산
-            volatility = price_changes.std()
-            
-            # 시장 상황 판단
-            avg_change = price_changes.mean()
-            price_trend = recent_df['close'].iloc[-1] - recent_df['close'].iloc[0]
-            
-            # 🎯 시장 상황 분류 로직
-            if price_trend > 0.05 and avg_change > 0.002:  # 5% 이상 상승 + 평균 상승
-                return "bull_market"  # 상승장
-            elif price_trend < -0.05 and avg_change < -0.002:  # 5% 이상 하락 + 평균 하락
-                return "bear_market"  # 하락장
-            elif abs(price_trend) < 0.02 and volatility > 0.02:  # 2% 이내 변동 + 높은 변동성
-                return "sideways_market"  # 횡보장
-            elif current_rsi > 70:
-                return "overbought"  # 과매수
-            elif current_rsi < 30:
-                return "oversold"  # 과매도
-            else:
-                return "neutral"  # 중립
+            return regime
                 
         except Exception as e:
-            print(f"⚠️ 시장 상황 감지 오류 ({coin}/{interval}): {e}")
-            return "unknown"
+            # print(f"⚠️ 시장 상황 감지 오류: {e}")
+            return "neutral"
     
     def select_market_adaptive_strategy(self, coin: str, interval: str, market_condition: str) -> Optional[Dict]:
         """시장 상황에 맞는 전략 선택"""

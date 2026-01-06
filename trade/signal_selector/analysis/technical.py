@@ -1120,19 +1120,25 @@ class TechnicalAnalysisMixin:
             return 0.0
     
     def _extract_signal_pattern(self, signal: SignalInfo) -> str:
-        """🆕 시그널 패턴 추출"""
+        """🆕 시그널 패턴 추출 (None-Safe)"""
         try:
-            # RSI 범주화
-            rsi_level = self._discretize_rsi(signal.rsi)
+            # RSI 범주화 (안전한 값 처리)
+            rsi = getattr(signal, 'rsi', 50.0)
+            if rsi is None: rsi = 50.0
+            rsi_level = self._discretize_rsi(float(rsi))
             
             # Direction 범주화
-            direction = signal.integrated_direction if signal.integrated_direction else 'neutral'
+            direction = getattr(signal, 'integrated_direction', 'neutral')
+            if not direction: direction = 'neutral'
             
             # BB Position 범주화
-            bb_position = signal.bb_position if signal.bb_position else 'unknown'
+            bb_position = getattr(signal, 'bb_position', 'unknown')
+            if not bb_position: bb_position = 'unknown'
             
-            # Volume 범주화
-            volume_level = self._discretize_volume(signal.volume_ratio)
+            # Volume 범주화 (안전한 값 처리)
+            vol = getattr(signal, 'volume_ratio', 1.0)
+            if vol is None: vol = 1.0
+            volume_level = self._discretize_volume(float(vol))
             
             # 패턴 조합
             pattern = f"{rsi_level}_{direction}_{bb_position}_{volume_level}"
@@ -1144,17 +1150,22 @@ class TechnicalAnalysisMixin:
             return 'unknown_pattern'
     
     def _discretize_rsi(self, rsi: float) -> str:
-        """RSI 값을 이산화"""
-        if rsi < 30:
-            return 'oversold'
-        elif rsi < 45:
-            return 'low'
-        elif rsi < 55:
+        """RSI 값을 이산화 (None-Safe)"""
+        if rsi is None: return 'neutral'
+        try:
+            rsi = float(rsi)
+            if rsi < 30:
+                return 'oversold'
+            elif rsi < 45:
+                return 'low'
+            elif rsi < 55:
+                return 'neutral'
+            elif rsi < 70:
+                return 'high'
+            else:
+                return 'overbought'
+        except:
             return 'neutral'
-        elif rsi < 70:
-            return 'high'
-        else:
-            return 'overbought'
     
     def extract_signal_pattern_from_state(self, state_key: str) -> str:
         """상태 키에서 시그널 패턴 추출 (Virtual Trading Learner와 동일한 방식)"""

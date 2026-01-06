@@ -11,6 +11,13 @@ import os
 from datetime import datetime
 from typing import Dict, Optional
 
+# 🆕 중앙 DB 연결 유틸리티 임포트
+try:
+    from trade.core.database import get_db_connection
+except ImportError:
+    def get_db_connection(path, read_only=False):
+        return sqlite3.connect(path, timeout=30.0)
+
 class MarketAnalyzer:
     """시장 분석기 - 시장 상황 실시간 분석 (Centralized)"""
     def __init__(self, db_path: str = None, candle_db_path: str = None):
@@ -53,7 +60,7 @@ class MarketAnalyzer:
             if self._top_coins_cache['coins'] and (current_time - self._top_coins_cache['ts'] < 300):
                 return self._top_coins_cache['coins']
             
-            with sqlite3.connect(self.candle_db_path) as conn:
+            with get_db_connection(self.candle_db_path, read_only=True) as conn:
                 # 1. 전체 코인 수 조회
                 total_query = """
                     SELECT COUNT(DISTINCT symbol) as cnt FROM candles
@@ -94,7 +101,7 @@ class MarketAnalyzer:
             # 🆕 거래량 상위 40% 코인만 분석 (비율 기반, 유동적)
             top_coins = self._get_top_volume_coins()
             
-            with sqlite3.connect(self.db_path) as conn:
+            with get_db_connection(self.db_path, read_only=True) as conn:
                 current_time = int(datetime.now().timestamp())
                 
                 # 1. 현재 DB에 존재하는 모든 인터벌 조회
@@ -291,4 +298,62 @@ class MarketAnalyzer:
         except Exception as e:
             print(f"⚠️ 시장 컨텍스트 분석 오류: {e}")
             return {'trend': 'neutral', 'volatility': 0.02}
+
+    def get_coin_volatility_group(self, coin: str) -> str:
+        """🆕 코인의 변동성 그룹 반환 (Low/Medium/High/Very High)
+        
+        rl_pipeline 의존성 제거 - 자체 간단 분류 사용
+        """
+        try:
+            # 주요 코인 변동성 그룹 매핑 (경험적 분류)
+            LOW_VOLATILITY = {'BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'SOL', 'DOT'}
+            MEDIUM_VOLATILITY = {'AVAX', 'LINK', 'MATIC', 'NEAR', 'ATOM', 'LTC', 'ETC'}
+            HIGH_VOLATILITY = {'DOGE', 'SHIB', 'PEPE', 'BONK', 'WIF', 'FLOKI'}
+            
+            coin_upper = coin.upper()
+            if coin_upper in LOW_VOLATILITY:
+                return 'LOW'
+            elif coin_upper in MEDIUM_VOLATILITY:
+                return 'MEDIUM'
+            elif coin_upper in HIGH_VOLATILITY:
+                return 'HIGH'
+            else:
+                # 알 수 없는 코인은 기본 MEDIUM
+                return 'MEDIUM'
+        except Exception as e:
+            pass
+        return 'MEDIUM'
+
+    def get_volatility_based_thresholds(self, coin: str) -> dict:
+        """🆕 변동성 그룹 기반 동적 액션 임계값 반환"""
+        try:
+            # 기본 임계값 (실전/가상 매매 공통 기준)
+            base_threshold = 0.25
+            
+            vol_group = self.get_coin_volatility_group(coin)
+
+            # 변동성 그룹별 조정 계수 (변동성이 클수록 낮은 점수에도 진입)
+            if vol_group == 'LOW':
+                multiplier = 1.5  # BTC 등은 더 확실한 신호 필요
+            elif vol_group == 'MEDIUM':
+                multiplier = 1.0  # ETH 등은 표준
+            elif vol_group == 'HIGH':
+                multiplier = 0.7  # SOL 등은 더 공격적으로
+            elif vol_group == 'VERY_HIGH':
+                multiplier = 0.5  # 밈코인 등은 즉각 반응
+            else:
+                multiplier = 1.0
+
+            adj_threshold = max(0.1, min(0.6, base_threshold * multiplier))
+            
+            return {
+                'strong_buy': adj_threshold * 2.0,
+                'weak_buy': adj_threshold,
+                'weak_sell': -adj_threshold,
+                'strong_sell': -adj_threshold * 2.0
+            }
+        except Exception:
+            return {
+                'strong_buy': 0.5, 'weak_buy': 0.25, 'weak_sell': -0.25, 'strong_sell': -0.5
+            }
 

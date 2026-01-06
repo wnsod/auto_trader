@@ -3603,6 +3603,12 @@ class IntegratedPipelineOrchestrator:
                     'signal_confidence': 0.0
                 })
             
+            # 🔥 인터벌 가중치 DB 저장 (Signal Selector에서 사용)
+            try:
+                self._save_coin_interval_weights(coin, intervals_completed, v1_result if 'v1_result' in dir() else None)
+            except Exception as weight_err:
+                logger.debug(f"⚠️ [{coin}] 인터벌 가중치 저장 실패(무시): {weight_err}")
+            
             execution_time = (datetime.now() - start_time).total_seconds()
             
             # 분석 결과에서 값 추출
@@ -4873,6 +4879,94 @@ class IntegratedPipelineOrchestrator:
                 'stop_loss_pct': 0.02,
                 'take_profit_pct': 0.05,
             }
+    
+    def _save_coin_interval_weights(self, coin: str, intervals: List[str], v1_result: dict = None) -> bool:
+        """
+        🔥 코인별 인터벌 가중치를 DB에 저장 (Signal Selector에서 사용)
+        
+        Args:
+            coin: 코인 심볼
+            intervals: 완료된 인터벌 리스트
+            v1_result: 통합 분석 결과 (선택적)
+        """
+        try:
+            # 1. 인터벌 가중치 계산
+            interval_weights = {}
+            
+            # interval_profiles 가중치 우선 사용
+            if interval_profiles:
+                try:
+                    profile_weights = interval_profiles.get_integration_weights()
+                    if profile_weights:
+                        # 사용 가능한 인터벌에 대해서만 가중치 적용
+                        total_weight = sum(profile_weights.get(iv, 0) for iv in intervals)
+                        if total_weight > 0:
+                            for interval in intervals:
+                                if interval in profile_weights:
+                                    interval_weights[interval] = profile_weights[interval] / total_weight
+                                else:
+                                    interval_weights[interval] = 0.0
+                except Exception as e:
+                    logger.debug(f"interval_profiles 가중치 로드 실패: {e}")
+            
+            # 폴백: v1_result에서 추출 또는 균등 가중치
+            if not interval_weights:
+                if v1_result and 'interval_weights' in v1_result:
+                    interval_weights = v1_result['interval_weights']
+                elif v1_result and 'interval_scores' in v1_result:
+                    # interval_scores 기반으로 가중치 계산
+                    scores = v1_result['interval_scores']
+                    total_score = sum(scores.values())
+                    if total_score > 0:
+                        interval_weights = {iv: score / total_score for iv, score in scores.items()}
+                else:
+                    # 균등 가중치
+                    if intervals:
+                        interval_weights = {iv: 1.0 / len(intervals) for iv in intervals}
+            
+            if not interval_weights:
+                logger.debug(f"[{coin}] 인터벌 가중치 계산 실패 - 저장 건너뜀")
+                return False
+            
+            # 2. DB에 저장 (analysis_ratios 테이블)
+            from rl_pipeline.db.writes import save_coin_analysis_ratios
+            
+            # 레짐 결정 (v1_result에서 추출 또는 기본값)
+            regime = 'neutral'
+            if v1_result:
+                if 'direction' in v1_result:
+                    direction = v1_result['direction']
+                    if direction == 'LONG':
+                        regime = 'bullish'
+                    elif direction == 'SHORT':
+                        regime = 'bearish'
+            
+            # 소숫점 정리 (3자리)
+            formatted_weights = {k: float(round(v, 3)) for k, v in interval_weights.items()}
+            
+            ratios_data = {
+                "fractal_ratios": {},
+                "multi_timeframe_ratios": {},
+                "indicator_cross_ratios": {},
+                "symbol_specific_ratios": {},
+                "volatility_ratios": {},
+                "volume_ratios": {},
+                "optimal_modules": {},
+                "interval_weights": formatted_weights,  # 🔥 핵심 데이터
+                "performance_score": v1_result.get('confidence', 0.0) if v1_result else 0.0,
+                "accuracy_score": v1_result.get('size', 0.0) if v1_result else 0.0,
+            }
+            
+            # interval="all"로 저장하여 멀티 인터벌 가중치임을 표시
+            result = save_coin_analysis_ratios(coin, "all", regime, ratios_data)
+            
+            if result:
+                logger.info(f"✅ [{coin}] 인터벌 가중치 저장 완료: {formatted_weights}")
+            return bool(result)
+            
+        except Exception as e:
+            logger.warning(f"⚠️ [{coin}] 인터벌 가중치 저장 실패: {e}")
+            return False
     
     def _create_default_analysis_result(self, coin: str, interval: str) -> Any:
         """기본 분석 결과 생성 - 더 현실적인 결과"""

@@ -27,7 +27,8 @@ import pandas as pd
 # 로거 설정
 logger = logging.getLogger(__name__)
 
-# signal_selector 내부 모듈
+# signal_selector 내부 모듈 - 순환 참조 방지를 위해 지연 임포트 사용
+# 필요한 타입 정의만 상단에 유지하거나 상단 임포트 최소화
 try:
     from signal_selector.core.types import SignalInfo, SignalAction
     from signal_selector.config import (
@@ -43,11 +44,9 @@ try:
         get_optimized_db_connection, safe_db_write, safe_db_read,
         OptimizedCache, DatabasePool
     )
-    from signal_selector.evaluators import (
-        OffPolicyEvaluator, ConfidenceCalibrator, MetaCorrector
-    )
+    # ⚠️ evaluators 임포트를 여기서 제거 (순환 참조의 주범)
 except ImportError:
-    # 직접 실행 시 경로 추가
+    # 직접 실행 시 경로 추가 로직은 유지하되 임포트 최소화
     _current = os.path.dirname(os.path.abspath(__file__))
     _signal_selector = os.path.dirname(_current)
     _trade = os.path.dirname(_signal_selector)
@@ -66,35 +65,11 @@ except ImportError:
         get_optimized_db_connection, safe_db_write, safe_db_read,
         OptimizedCache, DatabasePool
     )
-    from signal_selector.evaluators import (
-        OffPolicyEvaluator, ConfidenceCalibrator, MetaCorrector
-    )
 
-# 헬퍼 클래스 import (core에서만 필요)
-try:
-    from signal_selector.helpers import (
-        ContextualBandit, RegimeChangeDetector, ExponentialDecayWeight,
-        BayesianSmoothing, ActionSpecificScorer, ContextFeatureExtractor,
-        OutlierGuardrail, EvolutionEngine, ContextMemory, RealTimeLearner,
-        SignalTradeConnector
-    )
-except ImportError:
-    pass  # 헬퍼가 필요없는 Mixin에서는 무시
+# 헬퍼 클래스 임포트 제거 (메소드 내부로 이동)
+# ThompsonSamplingLearner 임포트 제거 (메소드 내부로 이동)
 
-# 🆕 ThompsonSamplingLearner 안전한 로드 (직접 import)
-try:
-    from trade.virtual_trade_learner import ThompsonSamplingLearner
-except ImportError:
-    try:
-        from virtual_trade_learner import ThompsonSamplingLearner
-    except ImportError:
-        ThompsonSamplingLearner = None
-
-# StrategyScoreCalculator import
-try:
-    from signal_selector.scoring import StrategyScoreCalculator
-except ImportError:
-    StrategyScoreCalculator = None
+# StrategyScoreCalculator import는 순환 참조 방지를 위해 __init__ 내부에서 수행합니다.
 
 
 class CoreMixin:
@@ -152,57 +127,70 @@ class CoreMixin:
             self._load_cross_coin_context()
         
         # 🆕 3단계 성능 업그레이드 시스템 초기화
-        self.off_policy_evaluator = OffPolicyEvaluator()
-        self.confidence_calibrator = ConfidenceCalibrator()
-        self.meta_corrector = MetaCorrector()
+        try:
+            from signal_selector.evaluators import OffPolicyEvaluator, ConfidenceCalibrator, MetaCorrector
+            self.off_policy_evaluator = OffPolicyEvaluator()
+            self.confidence_calibrator = ConfidenceCalibrator()
+            self.meta_corrector = MetaCorrector()
+        except ImportError:
+            self.off_policy_evaluator, self.confidence_calibrator, self.meta_corrector = None, None, None
         
         # 🆕 2단계 성능 업그레이드 시스템 초기화
-        self.contextual_bandit = ContextualBandit(exploration_factor=1.0)
-        self.regime_detector = RegimeChangeDetector()
+        try:
+            from signal_selector.helpers import (
+                ContextualBandit, RegimeChangeDetector, ExponentialDecayWeight,
+                BayesianSmoothing, ActionSpecificScorer, ContextFeatureExtractor,
+                OutlierGuardrail, EvolutionEngine, ContextMemory, RealTimeLearner,
+                SignalTradeConnector
+            )
+            self.contextual_bandit = ContextualBandit(exploration_factor=1.0)
+            self.regime_detector = RegimeChangeDetector()
+            
+            # 🆕 성능 업그레이드 시스템 초기화
+            self.exponential_decay = ExponentialDecayWeight(decay_rate=0.1)
+            self.bayesian_smoothing = BayesianSmoothing(alpha=1.0, beta=1.0, kappa=1.0)
+            self.action_scorer = ActionSpecificScorer()
+            self.context_extractor = ContextFeatureExtractor()
+            self.outlier_guardrail = OutlierGuardrail(percentile_cut=0.05)
+            
+            # 🆕 진화형 AI 시스템 초기화
+            self.evolution_engine = EvolutionEngine()
+            self.context_memory = ContextMemory()
+            self.real_time_learner = RealTimeLearner()
+            
+            # 🆕 시그널-매매 연결 시스템
+            self.signal_trade_connector = SignalTradeConnector()
+        except ImportError:
+            # 필수 헬퍼 클래스들에 대해 기본값 또는 None 처리
+            pass
         
-        # 🆕 성능 업그레이드 시스템 초기화
-        self.exponential_decay = ExponentialDecayWeight(decay_rate=0.1)
-        self.bayesian_smoothing = BayesianSmoothing(alpha=1.0, beta=1.0, kappa=1.0)
-        self.action_scorer = ActionSpecificScorer()
-        self.context_extractor = ContextFeatureExtractor()
-        self.outlier_guardrail = OutlierGuardrail(percentile_cut=0.05)
-        
-        # 🆕 진화형 AI 시스템 초기화
-        self.evolution_engine = EvolutionEngine()
-        self.context_memory = ContextMemory()
         self.strategy_weights = {}
         self.pattern_performance = {}
-        self.real_time_learner = RealTimeLearner()
         
         # 🆕 Thompson Sampling 학습기 (Closed Loop Learning)
-        if ThompsonSamplingLearner:
-            try:
-                self.thompson_sampler = ThompsonSamplingLearner(db_path=STRATEGIES_DB_PATH)
-            except Exception as e:
-                print(f"⚠️ ThompsonSamplingLearner 초기화 실패: {e}")
-                self.thompson_sampler = None
-        else:
+        try:
+            from trade.core.thompson import ThompsonSamplingLearner
+            self.thompson_sampler = ThompsonSamplingLearner(db_path=STRATEGIES_DB_PATH)
+        except Exception as e:
+            print(f"⚠️ ThompsonSamplingLearner 초기화 실패: {e}")
             self.thompson_sampler = None
         
-        # 🆕 시그널-매매 연결 시스템
-        self.signal_trade_connector = SignalTradeConnector()
-        
         print("🚀 진화형 AI 시그널 셀렉터 초기화 완료")
-        self.min_signal_score = 0.03  # 더 민감하게 (0.05 → 0.03)
+        self.min_signal_score = 0.02  # 0.03 -> 0.02 (보수성 완화)
         
         # 🆕 학습 기반 임계값 설정
         self.use_learning_based_thresholds = True
         self.learning_feedback = None
-        self.min_confidence = 0.5  # 최소 신뢰도 임계값
+        self.min_confidence = 0.2  # 0.5 -> 0.2 (시그널 희석 고려하여 완화)
         
-        # 🆕 RL Pipeline 통합 분석기 추가
+        # 🆕 통합 분석기 추가 (rl_pipeline 의존성 제거)
         self.integrated_analyzer = None
         try:
-            from rl_pipeline.analysis.integrated_analyzer import IntegratedAnalyzer
-            self.integrated_analyzer = IntegratedAnalyzer()
+            from trade.core.data_utils import get_integrated_analyzer
+            self.integrated_analyzer = get_integrated_analyzer()
             print("✅ RL Pipeline 통합 분석기 로드 완료")
         except Exception as e:
-            print(f"⚠️ RL Pipeline 통합 분석기 로드 실패: {e}")
+            print(f"⚠️ 통합 분석기 로드 실패: {e}")
             self.integrated_analyzer = None
         
         # 🆕 새로운 학습 결과 데이터 캐시
@@ -216,6 +204,9 @@ class CoreMixin:
         # 🔥 Absolute Zero 분석 결과 캐시
         self.integrated_analysis_cache = {}  # {coin-interval: analysis_result}
         self.global_strategies_cache = {}  # {interval: [strategies]}
+        self._supervisor_cache = {}  # 🆕 MetaCognitiveSupervisor 캐시 (속도 최적화)
+        import threading
+        self._cache_lock = threading.Lock()  # 🆕 캐시 접근용 락
         self._load_absolute_zero_analysis_results()
         
         # 🆕 AI 모델 초기화
@@ -262,7 +253,12 @@ class CoreMixin:
                 self.synergy_learning_available = False
         
         # 🆕 전략 점수 계산기 초기화 (리팩토링)
-        self._strategy_calculator = StrategyScoreCalculator()
+        try:
+            from signal_selector.scoring import StrategyScoreCalculator
+            self._strategy_calculator = StrategyScoreCalculator()
+        except Exception as e:
+            print(f"⚠️ StrategyScoreCalculator를 로드할 수 없습니다: {e}")
+            self._strategy_calculator = None
         
         # 데이터베이스 초기화
         self.create_signal_table()
@@ -407,19 +403,24 @@ class CoreMixin:
         
         return False
     
-    def determine_action(self, signal_score: float, confidence: float) -> SignalAction:
+    def determine_action(self, signal_score: float, confidence: float, coin: str = None, interval: str = None) -> SignalAction:
         """순수 시그널 기반 액션 결정 (보유 정보 없음)"""
         try:
-            # 🆕 학습 기반 임계값 조정
+            # 🆕 학습 기반 임계값 조정 (캔들 신뢰도 연동 포함)
             min_confidence = self.get_learning_based_confidence_threshold()
-            min_signal_score = self.get_learning_based_signal_score_threshold()
             
-            # 🆕 매수 조건 (완화된 초기 기준)
-            if signal_score > min_signal_score and confidence > min_confidence:
+            # ScoringMixin에 정의된 메서드 호출
+            if hasattr(self, 'get_learning_based_signal_score_threshold'):
+                min_signal_score = self.get_learning_based_signal_score_threshold(coin, interval)
+            else:
+                min_signal_score = self.min_signal_score
+            
+            # 🆕 매수 조건 (동적 임계값 적용)
+            if signal_score >= min_signal_score and confidence >= min_confidence:
                 return SignalAction.BUY
             
             # 🆕 매도 조건 (시그널 점수가 매우 낮을 때)
-            if signal_score < -0.3:
+            if signal_score <= -min_signal_score:
                 return SignalAction.SELL
             
             # 🆕 홀딩 조건 (중간 정도의 시그널)
@@ -463,13 +464,18 @@ class CoreMixin:
 
     
     def _discretize_volume(self, volume_ratio: float) -> str:
-        """거래량 비율을 이산화"""
-        if volume_ratio < 0.5:
-            return 'low'
-        elif volume_ratio < 1.5:
+        """거래량 비율을 이산화 (None-Safe)"""
+        if volume_ratio is None: return 'normal'
+        try:
+            val = float(volume_ratio)
+            if val < 0.5:
+                return 'low'
+            elif val < 1.5:
+                return 'normal'
+            else:
+                return 'high'
+        except:
             return 'normal'
-        else:
-            return 'high'
     
     def _ensure_advanced_columns_exist(self, conn):
         """고급지표 컬럼들이 존재하는지 확인하고 없으면 추가"""
@@ -799,15 +805,33 @@ class CoreMixin:
         else:
             self.current_coin = coin
 
-    def _determine_final_action(self, action_votes: Dict[str, int], action_scores: Dict[str, float], final_score: float) -> str:
-        """최종 액션 결정 (투표 기반 + 점수 기반)"""
+    def _determine_final_action(self, action_votes: Dict[str, int], action_scores: Dict[str, float], final_score: float, coin: str = None, interval: str = None) -> str:
+        """최종 액션 결정 (투표 기반 + 점수 기반) - 자율 임계값 적용"""
         try:
+            # 🆕 동적 임계값 가져오기 (0.30 -> 0.12로 현실화하여 BUY 기회 확대)
+            min_score = 0.12
+            if hasattr(self, 'get_learning_based_signal_score_threshold'):
+                min_score = self.get_learning_based_signal_score_threshold(coin, interval)
+                # 학습 임계값이 너무 높으면(0.3 이상) 강제로 0.15 정도로 캡핑하여 매매 기회 확보
+                min_score = min(min_score, 0.15)
+
+            # 🎯 [보수성 완화] 강력한 점수가 있을 경우 투표보다 우선시
+            # 기존 1.3배Multiplier는 현재 점수 분포에 비해 너무 가혹하므로 제거
+            if final_score >= min_score:
+                return 'buy'
+            elif final_score <= -min_score:
+                return 'sell'
+
             # 🎯 투표 기반 우선순위
             max_votes = max(action_votes.values())
             most_voted_actions = [action for action, votes in action_votes.items() if votes == max_votes]
             
             if len(most_voted_actions) == 1:
                 # 단일 최다 투표 액션
+                if most_voted_actions[0] == 'hold':
+                    # HOLD가 많더라도 점수가 임계값의 70%를 넘으면 공격적으로 BUY 검토
+                    if final_score >= min_score * 0.7: return 'buy'
+                    if final_score <= -min_score * 0.7: return 'sell'
                 return most_voted_actions[0]
             elif len(most_voted_actions) > 1:
                 # 동점인 경우 점수 기반 결정
@@ -815,9 +839,9 @@ class CoreMixin:
                 return best_action
             else:
                 # 투표가 없는 경우 점수 기반 결정
-                if final_score > 0.3:
+                if final_score >= min_score:
                     return 'buy'
-                elif final_score < -0.3:
+                elif final_score <= -min_score:
                     return 'sell'
                 else:
                     return 'hold'
